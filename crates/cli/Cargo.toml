@@ -1,0 +1,17 @@
+[package]
+name = "epubkit-cli"
+description = "Command-line front-end for epubkit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "epubkit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+epubkit-core.workspace = true
+tempfile.workspace = true

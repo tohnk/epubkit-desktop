@@ -1,0 +1,16 @@
+[package]
+name = "epubkit-core"
+description = "EPUB optimization pipeline for e-ink readers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libxml.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
