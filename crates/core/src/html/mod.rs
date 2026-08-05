@@ -6,8 +6,10 @@
 //! behind a trait so the backend can be swapped (a pure-Rust implementation,
 //! say) without touching the pipeline that calls it.
 
+mod clean;
 mod libxml_repair;
 
+pub use clean::{add_chapter_page_breaks, normalize_whitespace, strip_unnecessary_attributes};
 pub use libxml_repair::{parse_content, serialize_content, LibxmlRepair};
 
 use libxml::tree::Document;

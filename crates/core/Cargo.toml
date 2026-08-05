@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 libxml.workspace = true
+lightningcss = "1.0.0-alpha.72"
 percent-encoding.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true

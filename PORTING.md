@@ -22,10 +22,10 @@ Module names mirror the Python ones so the two can be read side by side:
 | `epub_packager.py`    | `core::package`       | ported |
 | `metadata_handler.py` | `core::metadata`      | ported |
 | `epub_structure.py`   | `core::structure`     | ported |
-| `html_cleaner.py`     | `core::html`          | repair only; CSS and attribute stripping still to do |
+| `html_cleaner.py`     | `core::html`, `core::css` | ported |
+| `text_cleaner.py`     | `core::text`          | ported |
 | —                     | `core::xml`           | new: shared libxml2 wrapper |
 | `image_processor.py`  | —                     | not started |
-| `text_cleaner.py`     | —                     | not started |
 | `epub_processor.py`   | —                     | not started |
 
 ## Build prerequisites
@@ -111,6 +111,33 @@ parser silently deletes text — a bare `&` in prose vanishes along with
 whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
+
+### Prose after `<code>` and `<pre>` is cleaned
+
+lxml stores the text *following* an element as that element's `tail`, so
+`text_cleaner` skipping `<code>` also skipped the ordinary prose that came
+after it. libxml2 keeps that text in its own sibling node, so only what is
+genuinely inside a skipped element is spared. A book with inline `<code>` will
+differ here.
+
+### CSS goes through a real parser
+
+`cssutils` is prone to dropping comments and reformatting at-rules. The port
+uses `lightningcss`, so comments, `@import` and `@media` blocks survive a
+round-trip. Rule *selection* is unchanged: only top-level style rules are
+considered for removal, a rule survives if any part of any of its selectors is
+in use, and anything with a pseudo-class, pseudo-element or attribute selector
+is kept outright.
+
+Note that `lightningcss` is pre-1.0 (currently an alpha), so its API may move
+under a future upgrade. It is confined to `core::css`.
+
+### Empty paragraphs are collapsed among siblings
+
+`normalize_whitespace` tracked runs of empty `<p>`/`<div>` in document order,
+so an empty paragraph could pair with an unrelated one elsewhere in the tree
+and be dropped. The port groups runs among siblings, which is what
+"consecutive empty paragraphs" means.
 
 ### A broken table of contents is actually repaired
 

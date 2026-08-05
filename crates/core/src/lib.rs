@@ -10,11 +10,13 @@
 //! | `html_cleaner.py`   | [`html`]       |
 //! | (lxml usage)        | [`xml`]        |
 
+pub mod css;
 pub mod error;
 pub mod html;
 pub mod metadata;
 pub mod package;
 pub mod structure;
+pub mod text;
 pub mod xml;
 
 pub use error::{Error, Result};
