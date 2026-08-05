@@ -8,9 +8,21 @@
 
 mod libxml_repair;
 
-pub use libxml_repair::LibxmlRepair;
+pub use libxml_repair::{parse_content, serialize_content, LibxmlRepair};
+
+use libxml::tree::Document;
 
 use crate::Result;
+
+/// A parsed EPUB content document, and whether it needed recovering.
+///
+/// Carrying the flag matters for serialization: a recovered document has had
+/// its XML declaration stripped along with the HTML parser's other artifacts,
+/// so one has to be written back.
+pub struct ContentDocument {
+    pub doc: Document,
+    pub recovered: bool,
+}
 
 /// The result of repairing one XHTML document.
 #[derive(Debug, Clone)]

@@ -12,7 +12,9 @@
 
 pub mod error;
 pub mod html;
+pub mod metadata;
 pub mod package;
+pub mod structure;
 pub mod xml;
 
 pub use error::{Error, Result};

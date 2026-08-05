@@ -17,16 +17,16 @@ crates/cli/     epubkit-cli  — `epubkit`, a thin driver for testing the core
 
 Module names mirror the Python ones so the two can be read side by side:
 
-| Python             | Rust                    | Status |
-|--------------------|-------------------------|--------|
-| `epub_packager.py` | `core::package`         | ported |
-| `html_cleaner.py`  | `core::html` (repair)   | repair only |
-| —                  | `core::xml`             | new: shared libxml2 wrapper |
-| `epub_structure.py`| —                       | not started |
-| `metadata_handler.py` | —                    | not started |
-| `image_processor.py`  | —                    | not started |
-| `text_cleaner.py`  | —                       | not started |
-| `epub_processor.py`| —                       | not started |
+| Python                | Rust                  | Status |
+|-----------------------|-----------------------|--------|
+| `epub_packager.py`    | `core::package`       | ported |
+| `metadata_handler.py` | `core::metadata`      | ported |
+| `epub_structure.py`   | `core::structure`     | ported |
+| `html_cleaner.py`     | `core::html`          | repair only; CSS and attribute stripping still to do |
+| —                     | `core::xml`           | new: shared libxml2 wrapper |
+| `image_processor.py`  | —                     | not started |
+| `text_cleaner.py`     | —                     | not started |
+| `epub_processor.py`   | —                     | not started |
 
 ## Build prerequisites
 
@@ -111,6 +111,18 @@ parser silently deletes text — a bare `&` in prose vanishes along with
 whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
+
+### A broken table of contents is actually repaired
+
+`fix_toc` in the reference detects NCX entries pointing at files that do not
+exist, calls `_fix_ncx_references` to repair them, writes the file and reports
+`Fixed N broken TOC references`. But `_fix_ncx_references` is `pass` — an empty
+stub with a comment saying regeneration will handle it, which at that point in
+the flow it never reaches. So the book keeps its broken TOC and the report says
+it was fixed.
+
+The port regenerates the NCX from the spine in that case, which is what the
+stub's comment intended, and reports `TocOutcome::Generated`.
 
 ### Validation collects all problems
 

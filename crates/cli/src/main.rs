@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
-use epubkit_core::package;
+use epubkit_core::{metadata, package, structure, xml};
 
 #[derive(Parser)]
 #[command(name = "epubkit", version, about = "EPUB optimizer for e-ink readers")]
@@ -65,12 +65,55 @@ fn info(path: &Path) -> Result<()> {
 
     let work = tempfile::tempdir().context("creating work directory")?;
     package::extract_epub(path, work.path()).context("extracting")?;
-    match package::find_opf_path(work.path()) {
-        Ok(opf) => println!("opf:   {opf}"),
-        Err(e) => println!("opf:   <not found: {e}>"),
+
+    let opf_rel = match package::find_opf_path(work.path()) {
+        Ok(opf) => opf,
+        Err(e) => {
+            println!("opf:   <not found: {e}>");
+            return Ok(());
+        }
+    };
+    println!("opf:   {opf_rel}");
+
+    let opf_path = work.path().join(&opf_rel);
+    let opf_dir = opf_path.parent().unwrap_or(work.path()).to_path_buf();
+    let doc = xml::parse_file(&opf_path).context("parsing the OPF")?;
+
+    let meta = metadata::extract_metadata(&doc).context("reading metadata")?;
+    println!();
+    println!("title:    {}", or_dash(&meta.title));
+    println!("author:   {}", or_dash(&meta.author));
+    println!("language: {}", or_dash(&meta.language));
+    if !meta.series.is_empty() {
+        println!("series:   {} #{}", meta.series, or_dash(&meta.series_index));
     }
+    println!("cover:    {}", or_dash(&meta.cover_href));
+    println!(
+        "filename: {}",
+        metadata::format_filename(&meta.title, &meta.author)
+    );
+
+    let files = structure::find_content_files(&opf_dir, &doc).context("reading the manifest")?;
+    println!();
+    println!(
+        "content:  {} xhtml, {} css, {} images, {} fonts, {} other",
+        files.xhtml.len(),
+        files.css.len(),
+        files.images.len(),
+        files.fonts.len(),
+        files.other.len()
+    );
+    println!("spine:    {} entries", structure::spine_hrefs(&doc)?.len());
 
     Ok(())
+}
+
+fn or_dash(value: &str) -> &str {
+    if value.is_empty() {
+        "—"
+    } else {
+        value
+    }
 }
 
 fn validate(path: &Path) -> Result<()> {

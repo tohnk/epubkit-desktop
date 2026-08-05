@@ -36,7 +36,7 @@
 use libxml::parser::Parser;
 use libxml::tree::{Document, NodeType, SaveOptions};
 
-use super::{HtmlRepair, Repaired};
+use super::{ContentDocument, HtmlRepair, Repaired};
 use crate::xml::hardened_options;
 use crate::{Error, Result};
 
@@ -91,38 +91,63 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
     }
 }
 
+/// Parse an EPUB content document, recovering if it is malformed.
+///
+/// Exposed so callers that need to *edit* a content document — rewriting image
+/// references, unwrapping SVG covers — get the same parse and the same
+/// serialization guarantees as the repair step, rather than reimplementing
+/// them and diverging.
+pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
+    // Strict first. Success means the document was already well-formed.
+    if let Ok(doc) = Parser::default().parse_string_with_options(input, hardened_options(false)) {
+        return Ok(ContentDocument {
+            doc,
+            recovered: false,
+        });
+    }
+
+    // Malformed. The HTML parser recovers without dropping text.
+    let mut doc = Parser::default_html()
+        .parse_string_with_options(input, hardened_options(true))
+        .map_err(|e| Error::Xml(format!("unrecoverable XHTML: {e}")))?;
+
+    strip_html_parser_artifacts(&mut doc);
+
+    Ok(ContentDocument {
+        doc,
+        recovered: true,
+    })
+}
+
+/// Serialize a content document back to XHTML bytes.
+pub fn serialize_content(content: &ContentDocument) -> Vec<u8> {
+    if !content.recovered {
+        return content
+            .doc
+            .to_string_with_options(save_options(false))
+            .into_bytes();
+    }
+
+    // A recovered document lost its declaration to `strip_html_parser_artifacts`;
+    // put a correct one back.
+    let body = content.doc.to_string_with_options(save_options(true));
+    let mut out = String::with_capacity(XML_DECLARATION.len() + 1 + body.len());
+    out.push_str(XML_DECLARATION);
+    out.push('\n');
+    out.push_str(body.trim_start());
+    out.into_bytes()
+}
+
 impl HtmlRepair for LibxmlRepair {
     fn name(&self) -> &'static str {
         "libxml2"
     }
 
     fn repair(&self, input: &[u8]) -> Result<Repaired> {
-        // Strict first. Success means the document was already well-formed and
-        // needs nothing but a clean reserialization.
-        if let Ok(doc) = Parser::default().parse_string_with_options(input, hardened_options(false))
-        {
-            return Ok(Repaired {
-                bytes: doc.to_string_with_options(save_options(false)).into_bytes(),
-                recovered: false,
-            });
-        }
-
-        // Malformed. The HTML parser recovers without dropping text.
-        let mut doc = Parser::default_html()
-            .parse_string_with_options(input, hardened_options(true))
-            .map_err(|e| Error::Xml(format!("unrecoverable XHTML: {e}")))?;
-
-        strip_html_parser_artifacts(&mut doc);
-
-        let body = doc.to_string_with_options(save_options(true));
-        let mut bytes = String::with_capacity(XML_DECLARATION.len() + 1 + body.len());
-        bytes.push_str(XML_DECLARATION);
-        bytes.push('\n');
-        bytes.push_str(body.trim_start());
-
+        let content = parse_content(input)?;
         Ok(Repaired {
-            bytes: bytes.into_bytes(),
-            recovered: true,
+            bytes: serialize_content(&content),
+            recovered: content.recovered,
         })
     }
 }
