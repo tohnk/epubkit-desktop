@@ -18,17 +18,20 @@
 //! # Where this deliberately differs from the Python
 //!
 //! The reference implementation serializes its recovered tree with
-//! `method='html'`, which emits *HTML*: unclosed `<meta>` tags, an HTML 4.0
-//! Transitional doctype, and the original XML declaration stranded after that
-//! doctype. The result is not well-formed XHTML, which is what an EPUB content
-//! document is required to be.
+//! `method='html'`. For malformed input made only of ordinary block and inline
+//! elements that still yields well-formed XML, so most recovered chapters
+//! round-trip fine. But HTML serialization writes void elements *unclosed* —
+//! `<br>`, `<img>`, `<hr>` rather than `<br/>`, `<img/>`, `<hr/>` — and a
+//! chapter containing any of those comes out as markup that is not well-formed
+//! XHTML, which is what an EPUB content document is required to be. Line
+//! breaks and images are common enough that this is not a corner case.
 //!
-//! This implementation serializes as XML instead, and strips the two artifacts
-//! libxml2's HTML parser injects — the synthesized HTML doctype, and the
-//! original XML declaration that the HTML parser demotes to a processing
-//! instruction — then re-emits a single correct declaration. Output is
-//! therefore well-formed where the Python's is not; expect this step to differ
-//! when diffing the two implementations on books with malformed markup.
+//! This implementation serializes as XML, so void elements stay closed. It
+//! also strips the two artifacts libxml2's HTML *parser* leaves on the tree —
+//! a synthesized HTML 4.0 doctype and the source's XML declaration demoted to
+//! a processing instruction — then re-emits one correct declaration. The
+//! Python sidesteps those two by serializing the root element rather than the
+//! whole document, which also means it emits no XML declaration at all.
 
 use libxml::parser::Parser;
 use libxml::tree::{Document, NodeType, SaveOptions};

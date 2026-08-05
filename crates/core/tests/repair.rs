@@ -173,6 +173,40 @@ fn entities_are_not_expanded_into_a_bomb() {
     // Refusing the document outright is an equally acceptable outcome.
 }
 
+/// Void elements must stay closed. This is the one place the reference
+/// implementation actually produces markup that is not well-formed XHTML: it
+/// serializes with `method='html'`, which writes `<br>`, `<img>` and `<hr>`
+/// unclosed. XML serialization keeps them self-closing.
+#[test]
+fn void_elements_stay_closed_through_recovery() {
+    let broken = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Void</title></head>
+<body>
+<p>Before<br/>after an <b>unclosed bold</p>
+<img src="pic.jpg" alt="a"/>
+<hr/>
+</body>
+</html>
+"#;
+
+    let (output, recovered) = repair(broken);
+    assert!(recovered);
+    assert!(output.contains("<br/>"), "br was unclosed:\n{output}");
+    assert!(output.contains("<hr/>"), "hr was unclosed:\n{output}");
+    assert!(
+        output.contains(r#"<img src="pic.jpg" alt="a"/>"#),
+        "img was unclosed:\n{output}"
+    );
+
+    // And the whole thing still parses strictly.
+    let (_, second_pass_recovered) = repair(output.as_bytes());
+    assert!(
+        !second_pass_recovered,
+        "output is not well-formed:\n{output}"
+    );
+}
+
 #[test]
 fn default_backend_is_libxml2() {
     assert_eq!(default_backend().name(), "libxml2");

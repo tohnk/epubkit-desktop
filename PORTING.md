@@ -70,21 +70,40 @@ repository (`b1rdmania/epubkit`, which this was forked from) disappears.
 These are deliberate. A diff harness comparing the two implementations should
 expect them rather than flag them.
 
-### XHTML repair emits XHTML; the Python emits HTML
+### XHTML repair keeps void elements closed; the Python does not
 
 `html_cleaner.repair_html` parses broken markup with lxml's `HTMLParser` and
-serializes with `method='html'`. On a malformed chapter that produces:
+serializes with `method='html'`. Most of the time that is fine — a recovered
+chapter of ordinary block and inline elements comes back as well-formed XML.
 
-- an HTML 4.0 Transitional doctype the book never had,
-- an unclosed `<meta http-equiv="Content-Type">` injected into `<head>`,
-- the original XML declaration stranded *after* the doctype.
+It breaks on void elements. HTML serialization writes them unclosed, so a
+chapter containing `<br/>`, `<img/>` or `<hr/>` is recovered as:
 
-The result is not well-formed XHTML, which is what an EPUB content document is
-required to be. The Rust port serializes as XML, strips the synthesized doctype
-and the demoted XML declaration, and emits one correct declaration — so
-recovered files come out well-formed. `crates/core/tests/repair.rs` pins this,
-including a test that feeds repaired output back through the parser and asserts
-it parses strictly.
+```html
+<p>Before<br>after an <b>unclosed bold</b></p>
+<img src="pic.jpg" alt="a">
+<hr>
+```
+
+which does not parse as XML — and an EPUB content document is required to be
+well-formed XHTML. Line breaks and images are common enough in real books that
+this affects a substantial share of malformed chapters, though not all of them.
+
+The Rust port serializes as XML, so void elements stay closed. Verify either
+side directly:
+
+```sh
+python3 -c "import sys; sys.path.insert(0,'.'); from html_cleaner import repair_html; \
+    print(repair_html(open('chapter.xhtml','rb').read()).decode())"
+cargo run -p epubkit-cli -- repair chapter.xhtml
+```
+
+Two smaller differences in the same step: the Python emits no XML declaration
+at all (it serializes the root element rather than the document), and its
+strict path uses `pretty_print=True`, which shifts block-level whitespace.
+
+`crates/core/tests/repair.rs` pins the Rust behaviour, including a test that
+feeds repaired output back through the parser and asserts it parses strictly.
 
 The choice of *parser* deliberately does match the Python: libxml2's HTML
 parser, not its XML parser in recovery mode. Recovering XHTML with the XML
