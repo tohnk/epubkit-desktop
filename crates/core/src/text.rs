@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 
 use libxml::tree::{Node, NodeType};
 use regex::{Captures, Regex};
+use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::html;
@@ -91,7 +92,8 @@ impl Default for TextCleanOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TextCleanReport {
     pub double_spaces_fixed: usize,
     pub ocr_ligatures_fixed: usize,

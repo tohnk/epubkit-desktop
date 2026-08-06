@@ -9,6 +9,7 @@
 //! once. The Python re-read and re-wrote it at almost every step, which is both
 //! slow and a way to lose an edit made earlier in the run.
 
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +76,8 @@ impl ProcessingOptions {
 }
 
 /// An account of everything the run changed, for the user and for the UI.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessingReport {
     pub original_size: u64,
     pub optimized_size: u64,

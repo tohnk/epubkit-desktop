@@ -33,6 +33,10 @@ epubkit runs this pipeline on every EPUB:
 ## Usage
 
 ```sh
+# the desktop app
+cargo run -p epubkit-desktop
+
+# or the command line
 cargo build --release
 
 # optimize a book; the output is named from its metadata

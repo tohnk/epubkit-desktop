@@ -2,7 +2,7 @@
 
 This repository is being converted from the original Python/FastAPI web app
 into a native desktop application: a Rust core, a thin CLI for validation, and
-eventually a Tauri front-end reusing the existing HTML/CSS.
+a Tauri front-end reusing the original HTML and CSS.
 
 The Python implementation has been removed now that the port is complete. It
 survives in git history at `7cf9a65`, which is the pinned reference for any
@@ -14,8 +14,9 @@ front-end will reuse, and none of it is Python.
 ## Layout
 
 ```
-crates/core/    epubkit-core — the pipeline, as a library
-crates/cli/     epubkit-cli  — `epubkit`, a thin driver for testing the core
+crates/core/     epubkit-core    — the pipeline, as a library
+crates/cli/      epubkit-cli     — `epubkit`, a thin driver for testing the core
+crates/desktop/  epubkit-desktop — the Tauri window
 ```
 
 Module names mirror the Python ones so the two can be read side by side:
@@ -44,8 +45,33 @@ apt-get install libxml2-dev
 ```
 
 macOS ships a libxml2 in the SDK. Windows needs one built (vcpkg or cmake);
-when the Tauri packaging work starts, vendoring and statically linking it is
-likely the better answer than depending on a system copy.
+for packaging, vendoring and statically linking it is likely the better answer
+than depending on a system copy.
+
+The desktop crate additionally needs a webview and GTK:
+
+```sh
+# Debian/Ubuntu
+apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+```
+
+macOS and Windows use the system webview and need nothing extra.
+
+## Running the window
+
+```sh
+cargo run -p epubkit-desktop
+```
+
+The front-end is plain HTML, CSS and one ES module under
+`crates/desktop/ui/` — no build step, no bundler, no framework. The stylesheet
+is the original web app's, carried across nearly unchanged.
+
+The page holds no processing logic and no notion of what a preset means: it
+renders whatever `settings` the core hands back and asks the core to change it,
+so the window and the CLI cannot drift apart. Commands are ordinary functions,
+so the IPC layer is covered by tests in `crates/desktop/tests/` rather than
+resting on a screenshot.
 
 ## Using the CLI
 
