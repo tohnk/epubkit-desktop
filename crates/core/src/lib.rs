@@ -16,6 +16,7 @@ pub mod html;
 pub mod image;
 pub mod metadata;
 pub mod package;
+pub mod pipeline;
 pub mod structure;
 pub mod text;
 pub mod xml;

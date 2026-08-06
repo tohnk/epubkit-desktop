@@ -12,6 +12,7 @@ jpeg-encoder = "0.7.1"
 libxml.workspace = true
 lightningcss = "1.0.0-alpha.72"
 percent-encoding.workspace = true
+tempfile.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true

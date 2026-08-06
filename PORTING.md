@@ -25,8 +25,8 @@ Module names mirror the Python ones so the two can be read side by side:
 | `html_cleaner.py`     | `core::html`, `core::css` | ported |
 | `text_cleaner.py`     | `core::text`          | ported |
 | —                     | `core::xml`           | new: shared libxml2 wrapper |
-| `image_processor.py`  | `core::image`         | ported except cover generation (needs font rendering) |
-| `epub_processor.py`   | —                     | not started |
+| `image_processor.py`  | `core::image`         | ported; cover generation deliberately omitted |
+| `epub_processor.py`   | `core::pipeline`      | ported |
 
 ## Build prerequisites
 
@@ -177,6 +177,46 @@ visible: Lanczos resampling (same algorithm — the `image` crate scales the
 filter kernel on downscale exactly as Pillow does — but `f32` coefficients
 rather than fixed-point) and error diffusion (classic Floyd–Steinberg on the
 grey channel, where Pillow diffuses against a palette in RGB).
+
+### Cover generation is omitted
+
+`generate_cover_image` drew a title/author cover for books that lack one. It is
+not ported: it needs text rendering, which needs a bundled typeface, and the
+reference's own fallback (`ImageFont.load_default()`) produces an unreadable
+bitmap-font cover on any machine without DejaVu or Helvetica. A book with no
+cover comes out with no cover.
+
+### The HTML repair pass runs earlier
+
+The reference repaired chapters *after* rewriting image references. But
+reference rewriting parses with the same recovering parser and writes the file
+back, so it silently repaired each chapter first — and the repair step then
+found nothing to do. Repair now runs before anything else touches a chapter,
+which makes the count meaningful and means every later step sees a well-formed
+tree.
+
+### The OPF is parsed once
+
+The reference re-read and re-wrote the package document at nearly every step.
+The port parses it once, applies every edit to that one document, and writes it
+once before repackaging.
+
+### Optimized books can be larger than the originals
+
+This is not a defect, and it is not specific to the port — the reference does
+the same. Dithering to four levels is high-frequency noise by construction,
+which is the worst case for a DCT codec. Measured with Pillow on a smooth
+gradient cover downscaled to 480x800: 82 KB as a dithered JPEG against 6.6 KB
+as a smooth grayscale one.
+
+Books of photographic artwork fare better, since the source is already noisy
+and was already a large JPEG. But a book of clean line art or flat colour can
+come out several times bigger, so the report says "increase" rather than
+printing a negative reduction.
+
+Worth revisiting at some point: storing a carefully dithered image in a *lossy*
+format is self-defeating, since the codec blurs the very pattern the dither
+paid to produce. The device spec calls for JPEG, so that is what is emitted.
 
 ### A broken table of contents is actually repaired
 

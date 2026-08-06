@@ -30,6 +30,9 @@ pub enum Error {
 
     #[error("image error: {0}")]
     Image(String),
+
+    #[error("this EPUB is DRM-protected; remove the DRM first (e.g. with DeDRM and Calibre)")]
+    DrmProtected,
 }
 
 impl Error {

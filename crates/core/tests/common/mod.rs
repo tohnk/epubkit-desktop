@@ -1,6 +1,8 @@
 //! Shared fixture helpers. Synthesizes EPUBs rather than checking binaries
 //! into the repo, so every structural property under test is explicit here.
 
+#![allow(dead_code)] // compiled into each test binary; each uses a subset
+
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -101,4 +103,22 @@ pub fn encryption_xml(algorithm: &str, uri: &str) -> Vec<u8> {
 "#
     )
     .into_bytes()
+}
+
+/// A PNG gradient, for exercising the image pipeline.
+pub fn png_gradient(width: u32, height: u32) -> Vec<u8> {
+    let mut rgb = image::RgbImage::new(width, height);
+    for (x, y, pixel) in rgb.enumerate_pixels_mut() {
+        *pixel = image::Rgb([
+            ((x * 255) / width.max(1)) as u8,
+            ((y * 255) / height.max(1)) as u8,
+            128,
+        ]);
+    }
+
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encode fixture png");
+    out
 }

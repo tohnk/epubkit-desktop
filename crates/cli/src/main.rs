@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
+use epubkit_core::metadata::MetadataEdits;
+use epubkit_core::pipeline::{process_epub, ProcessingOptions};
 use epubkit_core::{metadata, package, structure, xml};
 
 #[derive(Parser)]
@@ -29,6 +31,43 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Optimize an EPUB for an e-ink reader.
+    Optimize {
+        input: PathBuf,
+        /// Write here. Defaults to "Author - Title.epub" in the current directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Target device: x4 or x3.
+        #[arg(short, long, default_value = "x4")]
+        device: String,
+        /// JPEG quality, 20-95.
+        #[arg(short, long, default_value_t = 70)]
+        quality: u8,
+        /// Rotate and split landscape artwork for vertical reading.
+        #[arg(long)]
+        light_novel: bool,
+        /// Override the book's title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Override the book's author.
+        #[arg(long)]
+        author: Option<String>,
+        /// Keep images in colour.
+        #[arg(long)]
+        no_grayscale: bool,
+        /// Keep embedded fonts.
+        #[arg(long)]
+        no_font_removal: bool,
+        /// Keep unused CSS rules.
+        #[arg(long)]
+        no_css_cleanup: bool,
+        /// Leave text content exactly as written.
+        #[arg(long)]
+        no_text_cleanup: bool,
+        /// Keep store and reader metadata.
+        #[arg(long)]
+        no_metadata_cleanup: bool,
+    },
     /// Parse and reserialize one XHTML file through the repair backend.
     Repair {
         path: PathBuf,
@@ -43,6 +82,46 @@ fn main() -> Result<()> {
         Command::Info { path } => info(&path),
         Command::Validate { path } => validate(&path),
         Command::Roundtrip { input, output } => roundtrip(&input, &output),
+        Command::Optimize {
+            input,
+            output,
+            device,
+            quality,
+            light_novel,
+            title,
+            author,
+            no_grayscale,
+            no_font_removal,
+            no_css_cleanup,
+            no_text_cleanup,
+            no_metadata_cleanup,
+        } => {
+            let profile = epubkit_core::image::device(&device).ok_or_else(|| {
+                anyhow::anyhow!("unknown device '{device}' (expected 'x4' or 'x3')")
+            })?;
+
+            optimize(
+                &input,
+                output.as_deref(),
+                ProcessingOptions {
+                    device: profile,
+                    quality,
+                    light_novel_mode: light_novel,
+                    grayscale: !no_grayscale,
+                    eink_quantize: !no_grayscale,
+                    remove_fonts: !no_font_removal,
+                    remove_unused_css: !no_css_cleanup,
+                    text_cleanup: !no_text_cleanup,
+                    clean_metadata: !no_metadata_cleanup,
+                    metadata_edits: MetadataEdits {
+                        title,
+                        author,
+                        language: None,
+                    },
+                    ..ProcessingOptions::default()
+                },
+            )
+        }
         Command::Repair { path, output } => repair(&path, output.as_deref()),
     }
 }
@@ -196,6 +275,41 @@ fn repair(path: &Path, output: Option<&Path>) -> Result<()> {
             print!("{}", String::from_utf8_lossy(&repaired.bytes));
         }
     }
+
+    Ok(())
+}
+
+fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> Result<()> {
+    // The output name comes from the book's metadata, which is not known until
+    // the run finishes — so write to a temporary file and move it into place.
+    let staging = tempfile::Builder::new()
+        .suffix(".epub")
+        .tempfile()
+        .context("creating a staging file")?;
+
+    let mut last_percent = u8::MAX;
+    let report = process_epub(input, staging.path(), &options, |percent, message| {
+        if percent != last_percent {
+            eprintln!("[{percent:>3}%] {message}");
+            last_percent = percent;
+        }
+    })
+    .with_context(|| format!("optimizing {}", input.display()))?;
+
+    let destination = match output {
+        Some(path) => path.to_path_buf(),
+        None => PathBuf::from(&report.output_filename),
+    };
+
+    // `persist` fails across filesystems, so fall back to a copy.
+    if let Err(error) = staging.persist(&destination) {
+        std::fs::copy(error.file.path(), &destination)
+            .with_context(|| format!("writing {}", destination.display()))?;
+    }
+
+    println!();
+    println!("{}", destination.display());
+    println!("{}", report.summary());
 
     Ok(())
 }
