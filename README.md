@@ -53,8 +53,16 @@ Your choices are remembered between runs, so an option you turn off stays off.
 `epubkit settings show` prints the current state, and `epubkit settings save
 "My X4"` keeps it as a named preset.
 
-Building needs libxml2's headers (`apt-get install libxml2-dev` on Debian and
-Ubuntu; macOS has one in the SDK).
+Building needs libxml2 and pkg-config:
+
+```sh
+apt-get install libxml2-dev          # Debian/Ubuntu
+brew install pkgconf libxml2         # macOS
+```
+
+The desktop app additionally needs a webview on Linux
+(`libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`); macOS and Windows use the
+system one.
 
 ## Processing presets
 

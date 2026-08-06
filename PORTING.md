@@ -42,11 +42,26 @@ reference implementation.
 ```sh
 # Debian/Ubuntu
 apt-get install libxml2-dev
+
+# macOS
+brew install pkgconf libxml2
 ```
 
-macOS ships a libxml2 in the SDK. Windows needs one built (vcpkg or cmake);
-for packaging, vendoring and statically linking it is likely the better answer
-than depending on a system copy.
+The `libxml` crate finds libxml2 through pkg-config and has **no option to
+build it from source**, so the host must provide both the library and
+pkg-config itself.
+
+macOS needs `pkgconf` explicitly — it is not installed by default, and without
+it the build fails with "The pkg-config command could not be found". It also
+needs a findable libxml2: the SDK ships one, but its `.pc` file is not on
+pkg-config's default search path, and Homebrew's is keg-only. `.cargo/config.toml`
+in this repo points `PKG_CONFIG_PATH` at both Homebrew prefixes so neither has
+to be set by hand; a value you export yourself still takes precedence.
+
+Windows needs libxml2 via vcpkg (the crate's build script looks there). For
+packaging, vendoring and statically linking is likely the better answer than
+depending on a system copy — which would mean replacing the `libxml` crate,
+since it cannot vendor.
 
 The desktop crate additionally needs a webview and GTK:
 

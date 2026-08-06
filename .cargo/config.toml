@@ -1,0 +1,13 @@
+# Where to find libxml2's pkg-config metadata.
+#
+# The `libxml` crate locates libxml2 through pkg-config and has no option to
+# build it from source, so the host has to provide it. On macOS that means
+# Homebrew: the copy inside the SDK is not on pkg-config's default search path,
+# and Homebrew's is keg-only, so neither is found without help.
+#
+# PKG_CONFIG_PATH is *prepended* to the default search path rather than
+# replacing it, and non-existent directories are skipped — so listing both
+# Homebrew prefixes here is harmless on Linux and on Intel or Apple Silicon
+# alike. `force = false` means a value you set yourself still wins.
+[env]
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/libxml2/lib/pkgconfig:/usr/local/opt/libxml2/lib/pkgconfig", force = false }
