@@ -4,9 +4,12 @@ This repository is being converted from the original Python/FastAPI web app
 into a native desktop application: a Rust core, a thin CLI for validation, and
 eventually a Tauri front-end reusing the existing HTML/CSS.
 
-The Python implementation is still present and still the reference. Nothing
-should be deleted from it until the Rust port produces equivalent output on a
-corpus of real books.
+The Python implementation has been removed now that the port is complete. It
+survives in git history at `7cf9a65`, which is the pinned reference for any
+comparison — see "Validating against the reference" below.
+
+`static/` and `templates/` are deliberately kept: that is the UI the desktop
+front-end will reuse, and none of it is Python.
 
 ## Layout
 
@@ -122,10 +125,15 @@ The Rust port serializes as XML, so void elements stay closed. Verify either
 side directly:
 
 ```sh
-python3 -c "import sys; sys.path.insert(0,'.'); from html_cleaner import repair_html; \
+# restore the reference into a scratch directory, then run it
+mkdir -p /tmp/ref && git show 7cf9a65:html_cleaner.py > /tmp/ref/html_cleaner.py
+python3 -c "import sys; sys.path.insert(0,'/tmp/ref'); from html_cleaner import repair_html; \
     print(repair_html(open('chapter.xhtml','rb').read()).decode())"
+
 cargo run -p epubkit-cli -- repair chapter.xhtml
 ```
+
+(The reference needs `lxml` and `cssutils` installed to run.)
 
 Two smaller differences in the same step: the Python emits no XML declaration
 at all (it serializes the root element rather than the document), and its

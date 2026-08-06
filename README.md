@@ -6,7 +6,7 @@ Originally built for the [Xteink X4](https://xteink.com/) (480x800 portrait e-in
 
 ## Processing pipeline
 
-epubkit runs a 20-step pipeline on every EPUB:
+epubkit runs this pipeline on every EPUB:
 
 | Step | What it does |
 |------|-------------|
@@ -18,7 +18,6 @@ epubkit runs a 20-step pipeline on every EPUB:
 | 6 | **Find content files** — catalogs all XHTML, CSS, image, and font files in the EPUB |
 | 7 | **Process images** — converts all images to baseline JPEG, resizes to the device screen (480x800 for X4, 528x792 for X3; max 1024x1024), applies 4-level grayscale quantization with Floyd-Steinberg dithering, autocontrast histogram stretching, and contrast boost. Light Novel mode rotates/splits landscape images |
 | 8 | **Fix SVG covers** — unwraps SVG-wrapped cover images (common in Gutenberg/store EPUBs) |
-| 9 | **Generate cover** — creates a title/author cover image if the book doesn't have one |
 | 10 | **Update references** — rewrites all internal hrefs and srcs to match renamed image files |
 | 11 | **Repair HTML + strip attributes** — fixes malformed XHTML with lxml recovery parser, strips unnecessary attributes (data-\*, aria-\*, role, tabindex, etc.) to reduce parsing overhead for the 380KB RAM device |
 | 12 | **Remove unused CSS** — collects all used classes/IDs/elements across XHTML files, then strips CSS rules that don't match anything |
@@ -33,12 +32,25 @@ epubkit runs a 20-step pipeline on every EPUB:
 
 ## Usage
 
-1. **Drop** one or more EPUB files onto the upload zone
-2. **Edit** title/author if needed (auto-detected from metadata)
-3. **Pick your device**: X4 or X3 (sets screen size and grayscale depth)
-4. **Pick a preset**: Quick (images + text), Full (device-optimized), or Custom
-5. **Click Optimize** and watch real-time progress via SSE streaming
-6. **Download** the optimized EPUB — ready to transfer to your reader
+```sh
+cargo build --release
+
+# optimize a book; the output is named from its metadata
+./target/release/epubkit optimize book.epub
+
+# pick a device and a preset
+./target/release/epubkit optimize book.epub --device x3 --preset quick
+
+# inspect a book without changing it
+./target/release/epubkit info book.epub
+```
+
+Your choices are remembered between runs, so an option you turn off stays off.
+`epubkit settings show` prints the current state, and `epubkit settings save
+"My X4"` keeps it as a named preset.
+
+Building needs libxml2's headers (`apt-get install libxml2-dev` on Debian and
+Ubuntu; macOS has one in the SDK).
 
 ## Processing presets
 
@@ -91,11 +103,21 @@ Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`):
 
 ## Tech stack
 
-- **[FastAPI](https://fastapi.tiangolo.com/)** — async web framework
-- **[Pillow](https://python-pillow.org/)** — image processing (4-level quantization, autocontrast)
-- **[lxml](https://lxml.de/)** — XML/HTML parsing and repair
-- **[cssutils](https://cssutils.readthedocs.io/)** — CSS parsing and cleanup
-- **Server-Sent Events** — real-time progress streaming
+Rust, as a library plus a CLI, with a desktop front-end to follow.
+
+- **[libxml2](https://gitlab.gnome.org/GNOME/libxml2)** — XML/XHTML parsing and repair, via the `libxml` crate
+- **[image](https://crates.io/crates/image)** — decoding and Lanczos resampling
+- **[lightningcss](https://lightningcss.dev/)** — CSS parsing and cleanup
+- **[zip](https://crates.io/crates/zip)** — EPUB container handling
+
+This began as a Python/FastAPI web app. The port is described in
+[PORTING.md](PORTING.md), which also records where the Rust deliberately
+behaves differently from the original. The Python implementation lives on in
+git history at `7cf9a65` if you need to compare against it:
+
+```sh
+git show 7cf9a65:epub_processor.py
+```
 
 ## DRM note
 
