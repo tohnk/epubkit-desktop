@@ -7,6 +7,7 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open } = window.__TAURI__.dialog;
+const { revealItemInDir } = window.__TAURI__.opener;
 
 const BUILTIN_PRESETS = [
     { id: 'quick', label: 'Quick', icon: '⚡', description: 'Images + text' },
@@ -54,12 +55,29 @@ async function start() {
     renderPresets();
     renderOptions();
     wireEvents();
+    showReady();
+}
+
+/// The footer carries the current device and preset, so what a run will do is
+/// visible without opening the options panel.
+function showReady() {
+    const device = devices.find((d) => d.id === settings.device);
+    const name = device ? `${device.label} · ${device.width}×${device.height}` : settings.device;
+    setStatus(`Ready · ${name} · ${presetLabel()}`);
+}
+
+function presetLabel() {
+    if (settings.active === 'quick') return 'Quick';
+    if (settings.active === 'full') return 'Full';
+    if (settings.active === 'custom') return 'Custom';
+    return settings.presets.find((p) => p.id === settings.active)?.name ?? 'Custom';
 }
 
 function applySettings(next) {
     settings = next;
     renderPresets();
     renderOptions();
+    showReady();
 }
 
 // ------------------------------------------------------------------ settings
@@ -78,6 +96,7 @@ function renderDevices() {
             settings.device = device.id;
             await persist();
             renderDevices();
+            showReady();
         });
         toggle.appendChild(button);
     }
@@ -152,15 +171,23 @@ function setQuality(value, markCustom = true) {
 function markCustomized() {
     settings.active = 'custom';
     renderPresets();
+    showReady();
     persist();
 }
 
+let persistTimer = null;
+
 async function persist() {
-    try {
-        await invoke('save_settings', { settings });
-    } catch (error) {
-        setStatus(`Could not save settings: ${error}`, true);
-    }
+    // Dragging the quality slider fires on every pixel, so coalesce writes
+    // rather than rewriting the settings file dozens of times a second.
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(async () => {
+        try {
+            await invoke('save_settings', { settings });
+        } catch (error) {
+            setStatus(`Could not save settings: ${error}`, true);
+        }
+    }, 250);
 }
 
 // --------------------------------------------------------------------- books
@@ -177,7 +204,7 @@ async function addBooks(paths) {
         const inspected = await invoke('inspect_books', { paths: fresh });
         books.push(...inspected);
         renderBooks();
-        setStatus('');
+        showReady();
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
     }
@@ -298,7 +325,11 @@ function showResults(outcomes) {
                     <span class="size-new">${formatBytes(report.optimizedSize)}</span>
                     <span class="size-reduction">${Math.abs(change).toFixed(1)}% ${label}</span>
                 </div>
-                <div class="result-summary">${escapeHtml(outcome.summary)}</div>`;
+                <div class="result-summary">${escapeHtml(outcome.summary)}</div>
+                <div class="result-output">
+                    <span class="path" title="${escapeAttr(outcome.output ?? '')}">${escapeHtml(outcome.output ?? '')}</span>
+                    <button class="reveal-btn" data-reveal="${escapeAttr(outcome.output ?? '')}">Show</button>
+                </div>`;
         }
 
         resultsItems.appendChild(card);
@@ -362,15 +393,37 @@ function wireEvents() {
         button.addEventListener('click', () => setQuality(Number(button.dataset.quality)));
     }
 
-    savePresetBtn.addEventListener('click', async () => {
-        const name = prompt('Name this preset');
+    // `prompt()` is a no-op in the macOS webview, so the name is asked for
+    // inline instead.
+    const namer = document.getElementById('preset-namer');
+    const nameField = document.getElementById('preset-name');
+
+    const closeNamer = () => {
+        namer.hidden = true;
+        nameField.value = '';
+    };
+
+    const commitName = async () => {
+        const name = nameField.value.trim();
         if (!name) return;
         try {
             applySettings(await invoke('save_preset', { name, settings }));
             setStatus(`Saved "${name}".`);
+            closeNamer();
         } catch (error) {
             setStatus(`Could not save that preset: ${error}`, true);
         }
+    };
+
+    savePresetBtn.addEventListener('click', () => {
+        namer.hidden = false;
+        nameField.focus();
+    });
+    document.getElementById('preset-confirm').addEventListener('click', commitName);
+    document.getElementById('preset-cancel').addEventListener('click', closeNamer);
+    nameField.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') commitName();
+        if (event.key === 'Escape') closeNamer();
     });
 
     deletePresetBtn.addEventListener('click', async () => {
@@ -381,6 +434,26 @@ function wireEvents() {
         } catch (error) {
             setStatus(`Could not delete that preset: ${error}`, true);
         }
+    });
+
+    resultsItems.addEventListener('click', async (event) => {
+        const button = event.target.closest('[data-reveal]');
+        if (!button || !button.dataset.reveal) return;
+        try {
+            await revealItemInDir(button.dataset.reveal);
+        } catch (error) {
+            setStatus(`Could not open that folder: ${error}`, true);
+        }
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+        books = [];
+        renderBooks();
+        progressSection.hidden = true;
+        resultsSection.hidden = true;
+        progressItems.innerHTML = '';
+        resultsItems.innerHTML = '';
+        showReady();
     });
 
     optimizeBtn.addEventListener('click', optimize);

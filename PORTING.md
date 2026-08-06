@@ -88,6 +88,21 @@ so the window and the CLI cannot drift apart. Commands are ordinary functions,
 so the IPC layer is covered by tests in `crates/desktop/tests/` rather than
 resting on a screenshot.
 
+Two things about that boundary are easy to get wrong silently, and both are now
+pinned by tests:
+
+- `app.withGlobalTauri` must stay `true` in `tauri.conf.json`. The front-end has
+  no bundler, so it reaches the API through `window.__TAURI__`; without the flag
+  that object does not exist and the module throws on its first line. The window
+  still opens and the static HTML still renders, so the failure looks like
+  nothing happening rather than like an error.
+- `OptionSet` serializes snake_case, which keeps `settings.toml` hand-editable.
+  The page must bind `data-option` attributes to those same names.
+  `the_page_binds_to_option_keys_that_exist` reads the real `index.html` and
+  checks every binding against the real serialization, in both directions — so
+  an option added to one and not the other fails the build rather than quietly
+  doing nothing.
+
 ## Using the CLI
 
 ```sh

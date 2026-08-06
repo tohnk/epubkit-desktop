@@ -889,3 +889,66 @@ footer a:hover {
 .error-text {
     color: var(--error);
 }
+
+.preset-namer {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.preset-namer input {
+    flex: 1;
+    padding: 9px 12px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+.preset-namer input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.preset-namer .ghost-btn {
+    flex: 0 0 auto;
+}
+
+#clear-btn {
+    width: 100%;
+    margin-top: 12px;
+}
+
+.result-output {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.result-output .path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.reveal-btn {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.reveal-btn:hover {
+    color: var(--text);
+    border-color: var(--border-hover);
+}

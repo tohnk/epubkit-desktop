@@ -48,27 +48,27 @@
                     <div class="option-text"><span>Grayscale</span><small>Convert images for e-ink display</small></div>
                 </label>
                 <label class="option">
-                    <input type="checkbox" data-option="contrastBoost">
+                    <input type="checkbox" data-option="contrast_boost">
                     <div class="option-text"><span>Contrast Boost</span><small>Improve readability on e-ink</small></div>
                 </label>
                 <label class="option">
-                    <input type="checkbox" data-option="removeFonts">
+                    <input type="checkbox" data-option="remove_fonts">
                     <div class="option-text"><span>Remove Fonts</span><small>Strip embedded fonts</small></div>
                 </label>
                 <label class="option">
-                    <input type="checkbox" data-option="removeUnusedCss">
+                    <input type="checkbox" data-option="remove_unused_css">
                     <div class="option-text"><span>Clean CSS</span><small>Remove unused stylesheets</small></div>
                 </label>
                 <label class="option">
-                    <input type="checkbox" data-option="cleanMetadata">
+                    <input type="checkbox" data-option="clean_metadata">
                     <div class="option-text"><span>Clean Metadata</span><small>Strip store/calibre tags</small></div>
                 </label>
                 <label class="option">
-                    <input type="checkbox" data-option="textCleanup">
+                    <input type="checkbox" data-option="text_cleanup">
                     <div class="option-text"><span>Text Cleanup</span><small>Fix spacing, OCR errors, encoding</small></div>
                 </label>
                 <label class="option option-wide">
-                    <input type="checkbox" data-option="lightNovelMode">
+                    <input type="checkbox" data-option="light_novel_mode">
                     <div class="option-text"><span>Light Novel Mode</span><small>Rotate &amp; split landscape images for vertical reading</small></div>
                 </label>
             </div>
@@ -92,6 +92,12 @@
                 <button id="delete-preset-btn" class="ghost-btn danger" hidden>Delete this preset</button>
             </div>
 
+            <div id="preset-namer" class="preset-namer" hidden>
+                <input type="text" id="preset-name" placeholder="Name this preset" maxlength="40">
+                <button id="preset-confirm" class="ghost-btn">Save</button>
+                <button id="preset-cancel" class="ghost-btn">Cancel</button>
+            </div>
+
             <button id="optimize-btn" class="process-btn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
                     <polyline points="16 16 12 12 8 16"/>
@@ -110,6 +116,7 @@
         <div id="results-section" class="results-section" hidden>
             <div class="section-header"><h2>Results</h2></div>
             <div id="results-items"></div>
+            <button id="clear-btn" class="ghost-btn">Start again</button>
         </div>
 
         <footer>

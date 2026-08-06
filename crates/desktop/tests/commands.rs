@@ -207,3 +207,75 @@ fn what_crosses_the_boundary_is_shaped_the_way_the_page_expects() {
         );
     }
 }
+
+// ------------------------------------------------------- the page's contract
+
+/// Every `data-option` the page binds to must exist in the serialized options.
+///
+/// This is the test that was missing. `OptionSet` serializes snake_case (which
+/// keeps `settings.toml` hand-editable) while the page was written asking for
+/// camelCase, so every checkbox silently read `undefined` — showing unchecked
+/// whatever the setting was, and writing a key the core discards. Nothing
+/// failed; the options just quietly did nothing.
+///
+/// Reading the real HTML rather than a copied list is the point: the two files
+/// cannot drift apart without this noticing.
+#[test]
+fn the_page_binds_to_option_keys_that_exist() {
+    let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html"))
+        .expect("the page should be readable");
+
+    let bound: Vec<&str> = html
+        .match_indices("data-option=\"")
+        .map(|(at, marker)| {
+            let rest = &html[at + marker.len()..];
+            &rest[..rest.find('"').expect("unterminated data-option")]
+        })
+        .collect();
+
+    assert!(
+        bound.len() >= 7,
+        "expected the page to bind every option, found {bound:?}"
+    );
+
+    let options = serde_json::to_value(epubkit_core::settings::OptionSet::full()).unwrap();
+    for key in &bound {
+        assert!(
+            options.get(key).is_some(),
+            "the page binds '{key}', which is not a field of OptionSet.\n\
+             Serialized keys are: {:?}",
+            options.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+    }
+
+    // And the reverse: an option the core gained but the page never exposes.
+    for key in options.as_object().unwrap().keys() {
+        // Quality has its own slider rather than a checkbox.
+        if key == "quality" {
+            continue;
+        }
+        assert!(
+            bound.contains(&key.as_str()),
+            "OptionSet has '{key}' but the page never binds it"
+        );
+    }
+}
+
+/// The settings payload the page reads has to carry these under these names.
+#[test]
+fn the_settings_payload_is_shaped_the_way_the_page_expects() {
+    let json = serde_json::to_value(epubkit_core::settings::Settings::default()).unwrap();
+
+    for field in ["device", "options", "active", "presets"] {
+        assert!(json.get(field).is_some(), "settings is missing '{field}'");
+    }
+
+    let mut settings = epubkit_core::settings::Settings::default();
+    settings.save_preset("Example").unwrap();
+    let json = serde_json::to_value(&settings).unwrap();
+
+    let preset = &json["presets"][0];
+    for field in ["id", "name", "options"] {
+        assert!(preset.get(field).is_some(), "a preset is missing '{field}'");
+    }
+}
