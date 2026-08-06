@@ -27,6 +27,7 @@ Module names mirror the Python ones so the two can be read side by side:
 | —                     | `core::xml`           | new: shared libxml2 wrapper |
 | `image_processor.py`  | `core::image`         | ported; cover generation deliberately omitted |
 | `epub_processor.py`   | `core::pipeline`      | ported |
+| —                     | `core::settings`      | new: persisted options and presets |
 
 ## Build prerequisites
 
@@ -50,7 +51,35 @@ cargo run -p epubkit-cli -- info      book.epub
 cargo run -p epubkit-cli -- validate  book.epub
 cargo run -p epubkit-cli -- roundtrip book.epub -o out.epub
 cargo run -p epubkit-cli -- repair    chapter.xhtml
+cargo run -p epubkit-cli -- optimize  book.epub
+cargo run -p epubkit-cli -- settings  show
 ```
+
+## Settings
+
+`core::settings` persists what the user last chose, plus any presets they
+saved, to `settings.toml` in the platform's config directory.
+
+The model is one live set of option values plus a pointer to which preset the
+UI should show as selected. **The values are the truth; the pointer is a
+label.** On launch the values are restored verbatim — whether the user last had
+a built-in preset, a saved one, or something they tweaked by hand — so "restore
+what I had" is one rule rather than three cases. Restoring by value also means
+redefining a built-in preset in a later version cannot silently rewrite
+someone's stored choices.
+
+Selecting a preset copies its values in. Changing any option moves the
+selection to Custom, matching how the web UI already behaves; the difference is
+that Custom now persists and can be given a name.
+
+The device is deliberately *not* part of a preset — it describes the hardware
+on the desk, not a processing taste — so it is sticky on its own and survives
+every preset change.
+
+On the CLI, saved settings are the base and the flags are overrides: each
+`--no-*` flag can only turn something off, so an option nobody mentioned keeps
+whatever it had. Metadata edits (`--title`, `--author`) are about one book and
+are never persisted.
 
 ## Validating against the reference
 

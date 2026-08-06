@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
 use epubkit_core::metadata::MetadataEdits;
 use epubkit_core::pipeline::{process_epub, ProcessingOptions};
+use epubkit_core::settings::Settings;
 use epubkit_core::{metadata, package, structure, xml};
 
 #[derive(Parser)]
@@ -32,17 +33,23 @@ enum Command {
         output: PathBuf,
     },
     /// Optimize an EPUB for an e-ink reader.
+    ///
+    /// Saved settings provide the defaults; the flags below override them for
+    /// this run, and the result is remembered for the next one.
     Optimize {
         input: PathBuf,
         /// Write here. Defaults to "Author - Title.epub" in the current directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Start from a preset: quick, full, or one you saved.
+        #[arg(short, long)]
+        preset: Option<String>,
         /// Target device: x4 or x3.
-        #[arg(short, long, default_value = "x4")]
-        device: String,
+        #[arg(short, long)]
+        device: Option<String>,
         /// JPEG quality, 20-95.
-        #[arg(short, long, default_value_t = 70)]
-        quality: u8,
+        #[arg(short, long)]
+        quality: Option<u8>,
         /// Rotate and split landscape artwork for vertical reading.
         #[arg(long)]
         light_novel: bool,
@@ -67,6 +74,14 @@ enum Command {
         /// Keep store and reader metadata.
         #[arg(long)]
         no_metadata_cleanup: bool,
+        /// Process this book without remembering the choices.
+        #[arg(long)]
+        no_save: bool,
+    },
+    /// Show or change the saved settings.
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
     },
     /// Parse and reserialize one XHTML file through the repair backend.
     Repair {
@@ -77,6 +92,24 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Print the current settings and where they live.
+    Show,
+    /// Select a preset: quick, full, or one you saved.
+    Use { preset: String },
+    /// Save the current options as a named preset.
+    Save { name: String },
+    /// Delete a saved preset.
+    Delete { id: String },
+    /// Set the reader this machine is for.
+    Device { device: String },
+}
+
+fn settings_path() -> Result<PathBuf> {
+    Settings::default_path().context("could not locate a configuration directory")
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Info { path } => info(&path),
@@ -85,6 +118,7 @@ fn main() -> Result<()> {
         Command::Optimize {
             input,
             output,
+            preset,
             device,
             quality,
             light_novel,
@@ -95,33 +129,67 @@ fn main() -> Result<()> {
             no_css_cleanup,
             no_text_cleanup,
             no_metadata_cleanup,
+            no_save,
         } => {
-            let profile = epubkit_core::image::device(&device).ok_or_else(|| {
-                anyhow::anyhow!("unknown device '{device}' (expected 'x4' or 'x3')")
-            })?;
+            let path = settings_path()?;
+            let mut settings = Settings::load(&path).context("loading settings")?;
 
-            optimize(
-                &input,
-                output.as_deref(),
-                ProcessingOptions {
-                    device: profile,
-                    quality,
-                    light_novel_mode: light_novel,
-                    grayscale: !no_grayscale,
-                    eink_quantize: !no_grayscale,
-                    remove_fonts: !no_font_removal,
-                    remove_unused_css: !no_css_cleanup,
-                    text_cleanup: !no_text_cleanup,
-                    clean_metadata: !no_metadata_cleanup,
-                    metadata_edits: MetadataEdits {
-                        title,
-                        author,
-                        language: None,
-                    },
-                    ..ProcessingOptions::default()
+            if let Some(preset) = &preset {
+                settings.select(preset)?;
+            }
+            if let Some(device) = &device {
+                if epubkit_core::image::device(device).is_none() {
+                    anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
+                }
+                settings.device = device.clone();
+            }
+
+            // Each flag can only turn something off, so saved settings stay the
+            // base and an unmentioned option keeps whatever it had.
+            let mut customized = false;
+            let mut turn_off = |current: &mut bool, flag: bool| {
+                if flag && *current {
+                    *current = false;
+                    customized = true;
+                }
+            };
+            turn_off(&mut settings.options.grayscale, no_grayscale);
+            turn_off(&mut settings.options.remove_fonts, no_font_removal);
+            turn_off(&mut settings.options.remove_unused_css, no_css_cleanup);
+            turn_off(&mut settings.options.text_cleanup, no_text_cleanup);
+            turn_off(&mut settings.options.clean_metadata, no_metadata_cleanup);
+
+            if let Some(quality) = quality {
+                if settings.options.quality != quality {
+                    settings.options.quality = quality;
+                    customized = true;
+                }
+            }
+            if light_novel && !settings.options.light_novel_mode {
+                settings.options.light_novel_mode = true;
+                customized = true;
+            }
+            if customized {
+                settings.mark_customized();
+            }
+
+            // Metadata edits are about one book, so they are never persisted.
+            let options = settings.options.to_processing_options(
+                settings.device_profile(),
+                MetadataEdits {
+                    title,
+                    author,
+                    language: None,
                 },
-            )
+            );
+
+            if !no_save {
+                settings.save(&path).context("saving settings")?;
+            }
+
+            optimize(&input, output.as_deref(), options)
         }
+        Command::Settings { action } => settings_command(action),
         Command::Repair { path, output } => repair(&path, output.as_deref()),
     }
 }
@@ -312,4 +380,57 @@ fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> 
     println!("{}", report.summary());
 
     Ok(())
+}
+
+fn settings_command(action: SettingsAction) -> Result<()> {
+    let path = settings_path()?;
+    let mut settings = Settings::load(&path).context("loading settings")?;
+
+    match action {
+        SettingsAction::Show => {
+            println!("file:    {}", path.display());
+            println!("device:  {}", settings.device);
+            println!("preset:  {}", settings.active_label());
+            println!();
+            let o = &settings.options;
+            println!("  grayscale        {}", o.grayscale);
+            println!("  contrast boost   {}", o.contrast_boost);
+            println!("  quality          {}", o.quality);
+            println!("  remove fonts     {}", o.remove_fonts);
+            println!("  clean css        {}", o.remove_unused_css);
+            println!("  clean metadata   {}", o.clean_metadata);
+            println!("  text cleanup     {}", o.text_cleanup);
+            println!("  light novel      {}", o.light_novel_mode);
+
+            if !settings.presets.is_empty() {
+                println!();
+                println!("saved presets:");
+                for preset in &settings.presets {
+                    println!("  {:<20} {}", preset.id, preset.name);
+                }
+            }
+            return Ok(());
+        }
+        SettingsAction::Use { preset } => {
+            settings.select(&preset)?;
+            println!("selected {}", settings.active_label());
+        }
+        SettingsAction::Save { name } => {
+            let id = settings.save_preset(&name)?;
+            println!("saved current options as '{id}'");
+        }
+        SettingsAction::Delete { id } => {
+            settings.delete_preset(&id)?;
+            println!("deleted '{id}'");
+        }
+        SettingsAction::Device { device } => {
+            if epubkit_core::image::device(&device).is_none() {
+                anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
+            }
+            settings.device = device;
+            println!("device set to {}", settings.device);
+        }
+    }
+
+    settings.save(&path).context("saving settings")
 }
