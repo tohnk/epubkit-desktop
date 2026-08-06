@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("XML parse error: {0}")]
     Xml(String),
+
+    #[error("image error: {0}")]
+    Image(String),
 }
 
 impl Error {

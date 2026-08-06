@@ -13,6 +13,7 @@
 pub mod css;
 pub mod error;
 pub mod html;
+pub mod image;
 pub mod metadata;
 pub mod package;
 pub mod structure;

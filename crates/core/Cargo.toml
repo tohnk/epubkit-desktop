@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+jpeg-encoder = "0.7.1"
 libxml.workspace = true
 lightningcss = "1.0.0-alpha.72"
 percent-encoding.workspace = true
@@ -17,4 +19,5 @@ walkdir.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 tempfile.workspace = true
