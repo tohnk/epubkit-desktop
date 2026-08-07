@@ -1,15 +1,15 @@
 # Porting epubkit to Rust
 
-This repository is being converted from the original Python/FastAPI web app
+This repository has been converted from the original Python/FastAPI web app
 into a native desktop application: a Rust core, a thin CLI for validation, and
 a Tauri front-end reusing the original HTML and CSS.
 
-The Python implementation has been removed now that the port is complete. It
+The Python implementation has been removed now that the port is complete, along
+with the `static/` and `templates/` assets its web app served. All of it
 survives in git history at `7cf9a65`, which is the pinned reference for any
-comparison — see "Validating against the reference" below.
-
-`static/` and `templates/` are deliberately kept: that is the UI the desktop
-front-end will reuse, and none of it is Python.
+comparison — see "Validating against the reference" below. The desktop
+front-end carries its own descendants of that HTML and CSS in
+`crates/desktop/ui/`.
 
 ## Layout
 
