@@ -1,14 +1,4 @@
-__pycache__/
-*.pyc
-*.pyo
-tmp/
-*.egg-info/
-dist/
-build/
-.env
-.venv/
-venv/
-*.epub
-
-# Rust
 /target/
+tmp/
+.env
+*.epub
