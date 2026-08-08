@@ -556,13 +556,12 @@ fn gray_to_rgb(gray: &GrayImage) -> RgbImage {
 /// JPEG would be smaller still, but that changes the file's structure and
 /// wants testing on real hardware first.
 ///
-/// Optimized Huffman tables are deliberately *not* used, though the reference
-/// passes `optimize=True`. Files written with them are valid — libjpeg reads
-/// them correctly — but this crate's own decoder returns garbage for them, and
-/// a decoder that trips over a standard-but-uncommon construct is exactly what
-/// a reader running on an ESP32 is likely to be. The saving is a few percent
-/// on real images; the risk is a book that renders as noise on the device this
-/// exists to serve. Re-enable it only with hardware to test on.
+/// Huffman tables are optimized for each image, matching the reference's
+/// `optimize=True`, but by rewriting the finished file rather than by asking
+/// the encoder for it: `jpeg-encoder`'s own optimization also splits the single
+/// interleaved scan into three, which several decoders mishandle. See
+/// [`crate::jpeg`]. The rewrite is lossless and leaves the file's structure
+/// alone; if anything about it fails, the unoptimized file is kept.
 fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, grayscale: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut encoder = JpegEncoder::new(&mut out, quality);
@@ -582,5 +581,5 @@ fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, grayscale: bool) -> Result<
         .encode(rgb.as_raw(), width, height, ColorType::Rgb)
         .map_err(|e| Error::Image(format!("JPEG encoding failed: {e}")))?;
 
-    Ok(out)
+    Ok(crate::jpeg::optimize_huffman(&out).unwrap_or(out))
 }

@@ -297,9 +297,12 @@ fn overall_brightness_survives_the_pipeline() {
 }
 
 /// A solid white image must come back solid white. This is the regression
-/// guard for the encoder settings: enabling optimized Huffman tables produces
-/// files that are valid to libjpeg but decode to noise here, which would mean
-/// shipping books that render as static on a reader with a simple decoder.
+/// guard for the encoder settings, and it earned its keep: it caught
+/// `jpeg-encoder`'s optimized-table mode splitting the interleaved scan into
+/// three single-component scans, which is legal baseline JPEG but which
+/// several decoders — this crate's included — turn into noise. Optimized
+/// tables now come from rewriting the finished file instead, which leaves the
+/// scan structure alone. See `core::jpeg`.
 #[test]
 fn a_solid_image_round_trips_through_our_own_decoder() {
     let mut rgb = RgbImage::new(96, 96);

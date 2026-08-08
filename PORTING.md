@@ -232,17 +232,40 @@ so an empty paragraph could pair with an unrelated one elsewhere in the tree
 and be dropped. The port groups runs among siblings, which is what
 "consecutive empty paragraphs" means.
 
-### Image output omits optimized Huffman tables
+### Optimized Huffman tables are applied by rewriting, not by the encoder
 
-The reference encodes with `optimize=True`. Those files are perfectly valid —
-libjpeg reads them correctly — but the `image` crate's own decoder returns
-noise for them, which was caught by a test asserting that a solid white image
-survives the pipeline.
+The reference encodes with `optimize=True`, and so does this port — but not via
+`jpeg-encoder`'s own `set_optimized_huffman_tables`, which is a trap.
 
-A decoder that trips over a standard-but-uncommon construct is exactly what a
-reader running on an ESP32 is likely to be, and the saving is a few percent on
-real images. The option is off, with a regression test pinning it. Re-enable it
-only with hardware to test on.
+Turning that flag on also switches the encoder from one interleaved scan to
+three single-component scans (`encoder.rs:589` routes to the sequential path
+whenever optimization is on, with no way to opt out). That layout is legal
+baseline JPEG and libjpeg reads it, but it is rare enough that simpler decoders
+mishandle it: `zune-jpeg`, which the `image` crate uses, returns noise for every
+such file. The test asserting that a solid white image survives the pipeline
+caught it.
+
+The two things are separable, and only the scan split is dangerous. Optimal
+tables are what `cjpeg -optimize`, mozjpeg and Pillow all produce, and they keep
+the ordinary interleaved scan. So `core::jpeg` takes the finished interleaved
+file and rewrites only its Huffman coding — decode the scan to its symbol
+stream, count frequencies, build tables per Annex K, re-encode the identical
+symbols. No dequantization and no IDCT are involved, so nothing is
+approximated; SOF, DQT, scan header, component order and every DCT coefficient
+are copied through byte for byte. It is what `jpegtran -optimize` does.
+
+The output is therefore structurally identical to what the reference emits, and
+it is verified three ways: the rewritten file must decode to the same pixels,
+must be smaller, and must re-decode to the exact symbol stream it was built
+from — that last check runs inside `optimize_huffman` itself, so a bug degrades
+to "no saving" rather than to a corrupt book. Anything unrecognized
+(progressive, restart markers, multiple scans, 12-bit) is declined and the
+original kept. Set `EPUBKIT_JPEG_TRACE=1` to see why a file was declined.
+
+Measured against the unoptimized file, on images that have been through the
+full pipeline: ~7.5% on photographic content, ~6% on line art, ~3% on a page of
+text, ~4% on 4-level dithered noise, and 40–55% on near-empty images. Sizes
+land within 0.05% of what libjpeg produces from the same pixels.
 
 ### Pixel operations are checked against Pillow, not eyeballed
 
