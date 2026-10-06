@@ -89,6 +89,23 @@ fn a_stale_latin1_declaration_does_not_mangle_utf8() {
     assert_not_mangled(&output);
 }
 
+/// Whatever holds the parser to UTF-8 must not end up in the book, however
+/// little the chapter holds. A byte order mark given nothing to precede is
+/// read by libxml2 2.9 as text: an invisible U+FEFF in an empty paragraph.
+#[test]
+fn nothing_is_added_to_the_text() {
+    for chapter in ["", "   \n", "<p>x", "<p>ä", "<p>ä<br></p>"] {
+        let Ok(out) = LibxmlRepair::new().repair(chapter.as_bytes()) else {
+            continue; // refusing an empty chapter is not adding to it
+        };
+        let text = String::from_utf8(out.bytes).unwrap();
+        assert!(
+            !text.contains('\u{feff}'),
+            "{chapter:?} came back as {text:?}"
+        );
+    }
+}
+
 /// The other direction: bytes that are not UTF-8 are not forced to be, so a
 /// chapter that really is Latin-1 still decodes, whether it declares itself
 /// or not.

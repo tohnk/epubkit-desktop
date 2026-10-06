@@ -110,6 +110,11 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
 /// (`libxml`'s `encoding` option would be the direct route, but 0.3.21 frees
 /// the C string it builds from it before libxml2 reads it.)
 ///
+/// Only input with something to decode gets the mark. ASCII reads the same in
+/// every encoding in question, and 2.9 looks for a mark only when at least four
+/// bytes are there to look at, so on an empty chapter it would come out as
+/// text.
+///
 /// Input that is not UTF-8 goes through untouched, left to libxml2's own
 /// detection rather than forced into the wrong encoding.
 ///
@@ -118,7 +123,7 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
 fn prepare_for_recovery(input: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
     let utf8 = std::str::from_utf8(input).is_ok();
 
-    let bytes = if utf8 && !input.starts_with(UTF8_BOM) {
+    let bytes = if utf8 && !input.is_ascii() && !input.starts_with(UTF8_BOM) {
         Cow::Owned([UTF8_BOM, input].concat())
     } else {
         Cow::Borrowed(input)

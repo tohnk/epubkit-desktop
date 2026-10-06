@@ -216,8 +216,8 @@ port does the same, so here it matches upstream rather than `7cf9a65`.
 
 It cannot do so by passing the encoding: the `libxml` crate's `encoding`
 option is unsound in 0.3.21, freeing the C string it builds before libxml2
-reads it. `html::parse_content` prefixes a byte order mark and sets
-`ignore_enc` instead. `tests/encoding.rs` pins the result, and must pass
+reads it. `html::parse_content` instead sets `ignore_enc` and, when there is
+anything non-ASCII to decode, prefixes a byte order mark. `tests/encoding.rs` pins the result, and must pass
 against libxml2 2.9 and 2.14 alike, which disagree about the default.
 
 ### Prose after `<code>` and `<pre>` is cleaned
