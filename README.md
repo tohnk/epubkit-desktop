@@ -76,9 +76,9 @@ system one.
 The Flatpak carries everything the desktop app needs, so nothing has to be
 installed beyond Flatpak itself, with the [Flathub](https://flathub.org/setup)
 remote added (most distributions add it for you). Every push builds one:
-download `epubkit.flatpak` from the artifacts of the latest run of the
+from the latest run of the
 [Flatpak workflow](https://github.com/tohnk/epubkit-desktop/actions/workflows/flatpak.yml),
-then
+download the `epubkit-x86_64.flatpak` artifact and unzip it, then
 
 ```sh
 flatpak install --user epubkit.flatpak   # fetches the GNOME runtime from Flathub
