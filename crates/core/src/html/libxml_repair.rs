@@ -34,9 +34,12 @@
 //! whole document, which also means it emits no XML declaration at all.
 
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
+use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 use libxml::parser::{Parser, ParserOptions};
 use libxml::tree::{Document, NodeType, SaveOptions};
+use regex::bytes::Regex;
 
 use super::{ContentDocument, HtmlRepair, Repaired};
 use crate::xml::hardened_options;
@@ -45,6 +48,18 @@ use crate::{Error, Result};
 const XML_DECLARATION: &str = r#"<?xml version="1.0" encoding="utf-8"?>"#;
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The encoding an XML declaration names. A declaration can only open the
+/// document.
+static XML_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i-u)\A\s*<\?xml\s[^>]*?\bencoding\s*=\s*["']([^"'>]*)["']"#).unwrap()
+});
+
+/// The encoding a `<meta>` names, as `charset="…"` or inside `content="…;
+/// charset=…"`.
+static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
+});
 
 /// Repairs XHTML with libxml2, trying a strict parse before falling back to
 /// error recovery.
@@ -104,41 +119,70 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
 /// declare ISO-8859-1 long after their bytes were re-encoded as UTF-8.
 ///
 /// EPUB content documents are UTF-8, so input that is valid UTF-8 is parsed as
-/// UTF-8 whatever it declares. Two things hold every release to that: a byte
-/// order mark, which settles the encoding before anything in the document can,
-/// and `ignore_enc`, without which 2.9 still lets a `<meta>` override the mark.
-/// (`libxml`'s `encoding` option would be the direct route, but 0.3.21 frees
-/// the C string it builds from it before libxml2 reads it.)
+/// UTF-8 whatever it declares. Input that is not is decoded here first, as
+/// [`legacy_encoding`] decides, and so reaches the parser as UTF-8 as well.
+///
+/// Two things hold every release to UTF-8: a byte order mark, which settles
+/// the encoding before anything in the document can, and `ignore_enc`,
+/// without which 2.9 still lets a `<meta>` override the mark. (`libxml`'s
+/// `encoding` option would be the direct route, but 0.3.21 frees the C string
+/// it builds from it before libxml2 reads it.)
 ///
 /// Only input with something to decode carries the mark, a mark of the file's
 /// own included. ASCII reads the same in every encoding in question, and 2.9
 /// looks for a mark only when at least four bytes are there to look at, so on
 /// a chapter holding nothing else it would come out as text.
 ///
-/// Input that is not UTF-8 goes through untouched, left to libxml2's own
-/// detection rather than forced into the wrong encoding.
-///
 /// The strict XML parse needs none of this: XML settles the encoding from the
 /// byte order mark and the XML declaration, defaulting to UTF-8.
 fn prepare_for_recovery(input: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
-    let utf8 = std::str::from_utf8(input).is_ok();
-    let content = if utf8 {
-        input.strip_prefix(UTF8_BOM).unwrap_or(input)
+    let text = if std::str::from_utf8(input).is_ok() {
+        Cow::Borrowed(input.strip_prefix(UTF8_BOM).unwrap_or(input))
     } else {
-        input
+        // Decoding drops a byte order mark along with the rest of the old
+        // encoding.
+        let (text, _, _) = legacy_encoding(input).decode(input);
+        Cow::Owned(text.into_owned().into_bytes())
     };
 
-    let bytes = if utf8 && !content.is_ascii() {
-        Cow::Owned([UTF8_BOM, content].concat())
+    let bytes = if text.is_ascii() {
+        text
     } else {
-        Cow::Borrowed(content)
+        Cow::Owned([UTF8_BOM, &text].concat())
     };
     let options = ParserOptions {
-        ignore_enc: utf8,
+        ignore_enc: true,
         ..hardened_options(true)
     };
 
     (bytes, options)
+}
+
+/// What a chapter that is not UTF-8 is written in.
+///
+/// A byte order mark decides, then an encoding the chapter names, in its XML
+/// declaration or else a `<meta>`. Otherwise it is windows-1252, which legacy
+/// text overwhelmingly was and which browsers take a declared ISO-8859-1 to
+/// mean: it has curly quotes and dashes where Latin-1 has invisible controls.
+///
+/// libxml2 cannot be left to do this: its HTML parser ignores an encoding
+/// named in an XML declaration, 2.9 reading on as Latin-1 and 2.14 as UTF-8,
+/// and reads windows-1252's punctuation as Latin-1's controls.
+///
+/// A name that cannot be right counts for nothing: a UTF-8 the bytes belie,
+/// one nobody knows, or one of an encoding that is not ASCII-compatible, which
+/// could not have been read as ASCII to find it.
+fn legacy_encoding(input: &[u8]) -> &'static Encoding {
+    if let Some((encoding, _)) = Encoding::for_bom(input) {
+        return encoding;
+    }
+
+    [XML_DECLARED.captures(input), META_DECLARED.captures(input)]
+        .into_iter()
+        .flatten()
+        .filter_map(|declared| Encoding::for_label(&declared[1]))
+        .find(|encoding| encoding.is_ascii_compatible() && *encoding != UTF_8)
+        .unwrap_or(WINDOWS_1252)
 }
 
 /// Parse an EPUB content document, recovering if it is malformed.

@@ -1,5 +1,6 @@
 //! UTF-8 text in malformed chapters: upstream's issue #1, where German came
-//! back from the recovery parser as "Ã¤".
+//! back from the recovery parser as "Ã¤". And chapters that are not UTF-8 at
+//! all, which the same parser misreads in other ways.
 //!
 //! Every chapter here is malformed on purpose (an unclosed `<br>`), because a
 //! well-formed one never reaches the HTML parser that did the damage. Given no
@@ -12,6 +13,7 @@ mod common;
 use std::fs;
 use std::io::Read;
 
+use encoding_rs::{Encoding, SHIFT_JIS, WINDOWS_1251, WINDOWS_1252};
 use epubkit_core::css::collect_used_selectors;
 use epubkit_core::html::{
     normalize_whitespace, strip_unnecessary_attributes, HtmlRepair, LibxmlRepair,
@@ -21,6 +23,10 @@ use epubkit_core::text::{clean_text_content, TextCleanOptions};
 
 const GERMAN: &str = "Während ihre Schwester die Lehre als Verkäuferin abgebrochen hatte";
 const QUOTED: &str = "»Wie geht’s Mutter übrigens?«";
+const JAPANESE: &str = "吾輩は猫である。";
+const RUSSIAN: &str = "Война и мир";
+/// Word's punctuation, which windows-1252 has where Latin-1 has controls.
+const PUNCTUATION: &str = "“Quoted” … it’s – done";
 
 /// UTF-8, with no charset declared anywhere.
 fn undeclared() -> Vec<u8> {
@@ -50,6 +56,13 @@ fn latin1(text: &str) -> Vec<u8> {
     text.chars()
         .map(|c| u8::try_from(u32::from(c)).expect("fixture should be Latin-1"))
         .collect()
+}
+
+/// `text` in a legacy encoding, which has to be able to spell all of it.
+fn encoded(encoding: &'static Encoding, text: &str) -> Vec<u8> {
+    let (bytes, _, unmappable) = encoding.encode(text);
+    assert!(!unmappable, "{} cannot spell {text:?}", encoding.name());
+    bytes.into_owned()
 }
 
 fn repaired(input: &[u8]) -> String {
@@ -119,6 +132,104 @@ fn latin1_bytes_are_still_read_as_latin1() {
     for chapter in [declared, undeclared] {
         let output = repaired(&latin1(&chapter));
         assert!(output.contains(GERMAN), "{output}");
+    }
+}
+
+/// libxml2's HTML parser ignores an encoding named in an XML declaration: 2.9
+/// reads on as Latin-1 and 2.14 as UTF-8, so German came back from 2.14 as
+/// "W�hrend", and Japanese or Russian from either as nonsense.
+#[test]
+fn an_encoding_named_in_the_xml_declaration_is_obeyed() {
+    let cases = [
+        ("iso-8859-1", WINDOWS_1252, GERMAN),
+        ("Shift_JIS", SHIFT_JIS, JAPANESE),
+        ("windows-1251", WINDOWS_1251, RUSSIAN),
+    ];
+
+    for (label, encoding, text) in cases {
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="{label}"?><html><body><p>{text}<br></p></body></html>"#
+        );
+        let output = repaired(&encoded(encoding, &chapter));
+
+        assert!(output.contains(text), "{label}: {output}");
+        // And the chapter now says what it is.
+        assert!(
+            output.starts_with(r#"<?xml version="1.0" encoding="utf-8"?>"#),
+            "{label}: {output}"
+        );
+        assert_eq!(output.matches("<?xml").count(), 1, "{label}: {output}");
+    }
+}
+
+/// Bytes that are not the UTF-8 they claim to be are legacy text under a
+/// declaration pasted over it.
+#[test]
+fn a_chapter_that_is_not_the_utf8_it_claims_is_read_as_windows_1252() {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><html><body><p>{GERMAN}<br></p></body></html>"#
+    );
+    let output = repaired(&latin1(&chapter));
+    assert!(output.contains(GERMAN), "{output}");
+}
+
+/// Word's curly quotes, dashes and ellipses sit where Latin-1 has invisible
+/// control characters. Browsers read such text as windows-1252, even when it
+/// claims to be ISO-8859-1, and so does this.
+#[test]
+fn windows_1252_punctuation_comes_through() {
+    let declared = format!(
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1"/></head><body><p>{PUNCTUATION}<br></p></body></html>"#
+    );
+    let undeclared = format!("<html><body><p>{PUNCTUATION}<br></p></body></html>");
+
+    for chapter in [declared, undeclared] {
+        let output = repaired(&encoded(WINDOWS_1252, &chapter));
+        assert!(output.contains(PUNCTUATION), "{output}");
+    }
+}
+
+/// A `<meta>` charset was always obeyed, and still is.
+#[test]
+fn an_encoding_named_in_a_meta_element_is_still_obeyed() {
+    let cases = [
+        (r#"<meta charset="Shift_JIS"/>"#, SHIFT_JIS, JAPANESE),
+        (
+            r#"<meta http-equiv="Content-Type" content="text/html; charset=windows-1251"/>"#,
+            WINDOWS_1251,
+            RUSSIAN,
+        ),
+    ];
+
+    for (meta, encoding, text) in cases {
+        let chapter = format!("<html><head>{meta}</head><body><p>{text}<br></p></body></html>");
+        let output = repaired(&encoded(encoding, &chapter));
+        assert!(output.contains(text), "{meta}: {output}");
+    }
+}
+
+/// A byte order mark settles the encoding before anything the chapter says.
+#[test]
+fn a_utf16_chapter_is_read_by_its_byte_order_mark() {
+    let chapter = format!("<html><body><p>{GERMAN}<br></p></body></html>");
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(chapter.encode_utf16().flat_map(u16::to_le_bytes));
+
+    let output = repaired(&bytes);
+    assert!(output.contains(GERMAN), "{output}");
+}
+
+/// A name read as ASCII cannot be of an encoding that is not ASCII-compatible,
+/// and a name nobody knows names nothing; either way the chapter is read as
+/// windows-1252 rather than as nonsense.
+#[test]
+fn a_declaration_that_cannot_be_right_is_passed_over() {
+    for label in ["UTF-16", "iso-2022-kr", "x-no-such-thing"] {
+        let chapter = format!(
+            r#"<html><head><meta charset="{label}"/></head><body><p>{GERMAN}<br></p></body></html>"#
+        );
+        let output = repaired(&latin1(&chapter));
+        assert!(output.contains(GERMAN), "{label}: {output}");
     }
 }
 

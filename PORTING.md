@@ -225,6 +225,17 @@ anything non-ASCII to decode, prefixes a byte order mark. `tests/encoding.rs`
 pins the result, and must pass against libxml2 2.9 and 2.14 alike, which
 disagree about the default.
 
+A malformed chapter whose bytes are not UTF-8 is decoded before the parser
+sees it, and is parsed as UTF-8 in turn. A byte order mark decides, then an
+encoding named in the XML declaration, then one named in a `<meta>`, and
+otherwise windows-1252, which is also what browsers take a declared
+ISO-8859-1 to mean. Upstream still leaves such a chapter to libxml2, whose
+HTML parser ignores an encoding named in an XML declaration: 2.9 reads on as
+Latin-1 and 2.14 as UTF-8, so a Shift_JIS or windows-1251 chapter came out as
+nonsense, and under 2.14 Latin-1 accents came out as replacement characters.
+Both releases also read windows-1252's curly quotes and dashes as Latin-1's
+invisible control characters.
+
 ### Prose after `<code>` and `<pre>` is cleaned
 
 lxml stores the text *following* an element as that element's `tail`, so
@@ -463,9 +474,3 @@ always produces a byte-identical archive.
   release, since this code parses untrusted files. The parser is already
   configured to refuse network access and to leave entity references
   unexpanded; see `core::xml::hardened_options`.
-- A malformed chapter that is *not* UTF-8 and opens with an XML declaration
-  loses its accented characters under libxml2 2.14, which takes `<?xml` to
-  mean UTF-8 whatever the declaration says. EPUB requires UTF-8, so this is
-  rare, and the UTF-8 fix above neither causes nor cures it. Passing the
-  declared encoding to the parser would, once the `libxml` crate's `encoding`
-  option is safe to use.
