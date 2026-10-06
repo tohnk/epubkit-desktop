@@ -242,10 +242,16 @@ had.
 
 `cssutils` is prone to dropping comments and reformatting at-rules. The port
 uses `lightningcss`, so comments, `@import` and `@media` blocks survive a
-round-trip. Rule *selection* is unchanged: only top-level style rules are
-considered for removal, a rule survives if any part of any of its selectors is
-in use, and anything with a pseudo-class, pseudo-element or attribute selector
-is kept outright.
+round-trip. Rule *selection* is unchanged in outline: only top-level style
+rules are considered for removal, a rule survives if any part of any of its
+selectors is in use, and anything with a pseudo-class, pseudo-element or
+attribute selector is kept outright.
+
+Two details differ. Names are read as CSS defines them, so one may begin with
+a non-ASCII character; the reference wanted ASCII there, and removed a rule
+like `.überschrift` while the book was using it. And a selector with an
+escaped name, such as `.\31 st` for the class `1st`, is kept outright too,
+since reading escapes is beyond this scan.
 
 Note that `lightningcss` is pre-1.0 (currently an alpha), so its API may move
 under a future upgrade. It is confined to `core::css`.

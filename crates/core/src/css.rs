@@ -146,8 +146,9 @@ fn single_selector_matches(selector: &str, used: &UsedSelectors) -> bool {
     }
 
     // State-dependent and attribute selectors are beyond what a static scan of
-    // the markup can decide, so they stay.
-    if selector.contains(':') || selector.contains('[') {
+    // the markup can decide, so they stay. So does an escaped name, which this
+    // scan would misread: `.\31 st` is the class `1st`.
+    if selector.contains(':') || selector.contains('[') || selector.contains('\\') {
         return true;
     }
 
@@ -177,6 +178,10 @@ enum NameKind {
 }
 
 /// Pull the class, id and element names out of one simple selector sequence.
+///
+/// A name runs over CSS's name characters, which include every non-ASCII
+/// character: `.kapitelüberschrift` is one class, not the class `kapitel`
+/// followed by an element `berschrift`.
 fn selector_names(selector: &str) -> Vec<(NameKind, &str)> {
     let mut names = Vec::new();
     let bytes = selector.as_bytes();
@@ -200,9 +205,7 @@ fn selector_names(selector: &str) -> Vec<(NameKind, &str)> {
         };
 
         let start = i;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
-        {
+        while i < bytes.len() && is_name_byte(bytes[i]) {
             i += 1;
         }
 
@@ -214,4 +217,10 @@ fn selector_names(selector: &str) -> Vec<(NameKind, &str)> {
     }
 
     names
+}
+
+/// Every byte of a multi-byte UTF-8 character is non-ASCII, so testing bytes
+/// keeps such a character whole and the slices on character boundaries.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || !byte.is_ascii()
 }

@@ -80,6 +80,41 @@ fn keeps_pseudo_and_attribute_selectors() {
     assert_eq!(removed, 0, "{out}");
 }
 
+/// CSS names may contain any non-ASCII character. Reading only ASCII split
+/// `.kapitelüberschrift` into the class `kapitel` and an element `berschrift`,
+/// neither in use, so a rule the book relies on was removed.
+#[test]
+fn keeps_rules_whose_names_are_not_ascii() {
+    let used = used_from(
+        r#"<p class="kapitelüberschrift">x</p><p class="überschrift">y</p><div id="kapitel-ä">z</div>"#,
+    );
+    let css = ".kapitelüberschrift { font-weight: bold; }\n\
+               .überschrift { font-size: 1.2em; }\n\
+               #kapitel-ä { margin: 0; }\n\
+               .ungenutzt-ö { color: red; }\n";
+
+    let (out, removed) = remove_unused_css(css, &used);
+
+    assert_eq!(removed, 1, "{out}");
+    assert!(out.contains(".kapitelüberschrift"), "{out}");
+    assert!(out.contains(".überschrift"), "{out}");
+    assert!(out.contains("#kapitel-ä"), "{out}");
+    assert!(!out.contains("ungenutzt"), "{out}");
+}
+
+/// An escaped name is beyond what this scan can read — `.\31 st` is the class
+/// `1st` — so, like pseudo-classes, it stays rather than being misread.
+#[test]
+fn keeps_rules_with_escaped_names() {
+    let used = used_from(r#"<p class="1st">x</p><p class="w-1/2">y</p>"#);
+    let (out, removed) = remove_unused_css(
+        ".\\31 st { color: red; }\n.w-1\\/2 { width: 50%; }\n",
+        &used,
+    );
+
+    assert_eq!(removed, 0, "{out}");
+}
+
 #[test]
 fn keeps_a_rule_when_any_selector_in_the_group_is_used() {
     let used = used_from(r#"<p class="lead">x</p>"#);
