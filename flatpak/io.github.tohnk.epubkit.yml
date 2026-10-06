@@ -40,7 +40,8 @@ finish-args:
   - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  # bindgen also runs clang itself, to find clang's own headers.
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
   build-args:
     - --share=network
   env:
