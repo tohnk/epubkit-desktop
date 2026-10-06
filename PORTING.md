@@ -228,6 +228,16 @@ after it. libxml2 keeps that text in its own sibling node, so only what is
 genuinely inside a skipped element is spared. A book with inline `<code>` will
 differ here.
 
+### Mojibake is repaired before the other text fixes
+
+`text_cleaner` repairs mojibake after normalizing quotes, so a repaired quote
+escaped the normalization every intact one got, and one pattern could never
+match at all: "à" read as Latin-1 ends in a no-break space, which quote
+normalization had already made a plain one. The port repairs encoding first.
+The table is upstream's current one (b1rdmania/epubkit#8), which adds UTF-8
+punctuation, "ß", the acute vowels and the capital umlauts to what `7cf9a65`
+had.
+
 ### CSS goes through a real parser
 
 `cssutils` is prone to dropping comments and reformatting at-rules. The port

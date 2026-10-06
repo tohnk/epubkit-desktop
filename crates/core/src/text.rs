@@ -43,7 +43,18 @@ const SMART_QUOTES: &[(char, &str)] = &[
 
 /// UTF-8 bytes that were decoded as Latin-1 somewhere upstream, and the
 /// characters they were meant to be.
+///
+/// Longest first, so that no pattern can claim the start of a longer one.
+/// Typographic punctuation is three bytes in UTF-8 and comes back as "â"
+/// followed by two invisible C1 controls.
 const MOJIBAKE: &[(&str, &str)] = &[
+    ("\u{00e2}\u{0080}\u{0099}", "\u{2019}"),
+    ("\u{00e2}\u{0080}\u{0098}", "\u{2018}"),
+    ("\u{00e2}\u{0080}\u{009c}", "\u{201c}"),
+    ("\u{00e2}\u{0080}\u{009d}", "\u{201d}"),
+    ("\u{00e2}\u{0080}\u{0094}", "\u{2014}"),
+    ("\u{00e2}\u{0080}\u{0093}", "\u{2013}"),
+    ("\u{00e2}\u{0080}\u{00a6}", "\u{2026}"),
     ("\u{00c3}\u{00a9}", "\u{00e9}"),
     ("\u{00c3}\u{00a8}", "\u{00e8}"),
     ("\u{00c3}\u{00ab}", "\u{00eb}"),
@@ -53,6 +64,14 @@ const MOJIBAKE: &[(&str, &str)] = &[
     ("\u{00c3}\u{00a7}", "\u{00e7}"),
     ("\u{00c3}\u{00b6}", "\u{00f6}"),
     ("\u{00c3}\u{00a4}", "\u{00e4}"),
+    ("\u{00c3}\u{009f}", "\u{00df}"),
+    ("\u{00c3}\u{00a1}", "\u{00e1}"),
+    ("\u{00c3}\u{00ad}", "\u{00ed}"),
+    ("\u{00c3}\u{00b3}", "\u{00f3}"),
+    ("\u{00c3}\u{00ba}", "\u{00fa}"),
+    ("\u{00c3}\u{0084}", "\u{00c4}"),
+    ("\u{00c3}\u{0096}", "\u{00d6}"),
+    ("\u{00c3}\u{009c}", "\u{00dc}"),
     ("\u{00c2}\u{00a3}", "\u{00a3}"),
     ("\u{00c2}\u{00bb}", "\u{00bb}"),
     ("\u{00c2}\u{00ab}", "\u{00ab}"),
@@ -189,6 +208,21 @@ pub fn clean_string(
 ) -> String {
     let mut text = text.to_string();
 
+    // Encoding repair comes first, unlike in the reference. Recovering what the
+    // text actually says is the precondition for every other fix: a repaired
+    // quote should be normalized along with the intact ones, and the later
+    // passes can break a pattern before it is found — "à" read as Latin-1
+    // ends in a no-break space, which quote normalization makes a plain one.
+    if options.fix_encoding {
+        for (from, to) in MOJIBAKE {
+            let count = text.matches(from).count();
+            if count > 0 {
+                text = text.replace(from, to);
+                report.encoding_issues_fixed += count;
+            }
+        }
+    }
+
     if options.fix_whitespace {
         text = replace_counted(&RUNS_OF_SPACES, &text, " ", &mut report.double_spaces_fixed);
         // The reference counts this one under whitespace rather than
@@ -217,16 +251,6 @@ pub fn clean_string(
                     text = text.replace(*from, to);
                     report.smart_quotes_normalized += count;
                 }
-            }
-        }
-    }
-
-    if options.fix_encoding {
-        for (from, to) in MOJIBAKE {
-            let count = text.matches(from).count();
-            if count > 0 {
-                text = text.replace(from, to);
-                report.encoding_issues_fixed += count;
             }
         }
     }
@@ -289,4 +313,23 @@ fn is_inside_skipped_element(node: &Node) -> bool {
         current = element.get_parent();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Patterns are replaced in table order, so one that began a longer
+    /// pattern further down would eat the start of it first.
+    #[test]
+    fn mojibake_patterns_run_longest_first() {
+        let lengths: Vec<usize> = MOJIBAKE
+            .iter()
+            .map(|(from, _)| from.chars().count())
+            .collect();
+        assert!(
+            lengths.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{lengths:?}"
+        );
+    }
 }

@@ -53,6 +53,82 @@ fn repairs_mojibake() {
     assert_eq!(report.encoding_issues_fixed, 1);
 }
 
+fn clean_with(body: &str, options: &TextCleanOptions) -> (String, TextCleanReport) {
+    let (bytes, report) = clean_text_content(&wrap(body), options).unwrap();
+    (String::from_utf8(bytes).expect("utf-8 output"), report)
+}
+
+const KEEP_QUOTES: TextCleanOptions = TextCleanOptions {
+    fix_whitespace: true,
+    fix_ocr: true,
+    normalize_quotes: false,
+    fix_encoding: true,
+    fix_punctuation: true,
+    normalize_unicode: true,
+};
+
+/// Typographic punctuation is three bytes in UTF-8, so read as Latin-1 it
+/// becomes "â" and two invisible C1 controls. Upstream's `test_encoding.py`.
+#[test]
+fn repairs_utf8_punctuation_read_as_latin1() {
+    let (out, report) = clean_with(
+        "<p>geht\u{e2}\u{80}\u{99}s and \u{e2}\u{80}\u{9c}quoted\u{e2}\u{80}\u{9d}</p>",
+        &KEEP_QUOTES,
+    );
+    assert!(
+        out.contains("geht\u{2019}s and \u{201c}quoted\u{201d}"),
+        "{out}"
+    );
+    assert_eq!(report.encoding_issues_fixed, 3);
+
+    let (out, report) = clean_with(
+        "<p>\u{e2}\u{80}\u{98}a\u{e2}\u{80}\u{99} b\u{e2}\u{80}\u{94}c d\u{e2}\u{80}\u{93}e f\u{e2}\u{80}\u{a6}</p>",
+        &KEEP_QUOTES,
+    );
+    assert!(
+        out.contains("\u{2018}a\u{2019} b\u{2014}c d\u{2013}e f\u{2026}"),
+        "{out}"
+    );
+    assert_eq!(report.encoding_issues_fixed, 5);
+}
+
+/// Upstream's `test_encoding.py`, plus the acute vowels and capital umlauts
+/// it added alongside.
+#[test]
+fn repairs_letters_read_as_latin1() {
+    let (out, report) = clean(
+        "<p>Verk\u{c3}\u{a4}uferin Kopfh\u{c3}\u{b6}rer Stra\u{c3}\u{9f}e \
+         \u{c3}\u{84}rger \u{c3}\u{96}l \u{c3}\u{9c}ber \
+         m\u{c3}\u{a1}s s\u{c3}\u{ad} cami\u{c3}\u{b3}n \u{c3}\u{ba}ltimo</p>",
+    );
+    assert!(
+        out.contains("Verkäuferin Kopfhörer Straße Ärger Öl Über más sí camión último"),
+        "{out}"
+    );
+    assert_eq!(report.encoding_issues_fixed, 10);
+}
+
+/// Repair comes before the other passes, so what it restores is treated like
+/// the rest of the text: a repaired quote is straightened along with every
+/// intact one rather than surviving as the only curly quote in the book.
+#[test]
+fn repaired_punctuation_is_normalized_like_the_rest() {
+    let (out, report) = clean("<p>It\u{e2}\u{80}\u{99}s Anna\u{2019}s</p>");
+    assert!(out.contains("It's Anna's"), "{out}");
+    assert_eq!(report.encoding_issues_fixed, 1);
+    assert_eq!(report.smart_quotes_normalized, 2);
+}
+
+/// "à" is the bytes C3 A0, and A0 read as Latin-1 is a no-break space, which
+/// quote normalization turns into a plain one. Run in the other order, the
+/// pattern could never match.
+#[test]
+fn repairs_an_a_grave_whose_second_byte_is_a_no_break_space() {
+    let (out, report) = clean("<p>voil\u{c3}\u{a0} tout</p>");
+    assert!(out.contains("voilà tout"), "{out}");
+    assert_eq!(report.encoding_issues_fixed, 1);
+}
+
 #[test]
 fn fixes_punctuation() {
     let (out, report) = clean("<p>Wait..... Really,,, yes!!!!!!</p>");
