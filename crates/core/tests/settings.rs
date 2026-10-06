@@ -1,3 +1,4 @@
+use epubkit_core::metadata::{FilenameFormat, FilenameOptions, MetadataEdits};
 use epubkit_core::settings::{OptionSet, Settings, CUSTOM, FULL, QUICK};
 
 fn tempdir() -> tempfile::TempDir {
@@ -340,4 +341,83 @@ fn the_written_file_is_readable_by_a_human() {
     // And it round-trips.
     let parsed: Settings = toml::from_str(&text).unwrap();
     assert_eq!(parsed, settings);
+}
+
+// ------------------------------------------------------------ output names
+
+/// How the output is named is about the user's library, not the book, so
+/// like the device it survives every preset change.
+#[test]
+fn the_filename_format_is_sticky_across_presets() {
+    let mut settings = Settings {
+        filename: FilenameOptions {
+            format: FilenameFormat::Custom,
+            template: "{year} - {title}".into(),
+        },
+        ..Settings::default()
+    };
+
+    settings.select(QUICK).unwrap();
+    settings.select(FULL).unwrap();
+    settings.save_preset("Mine").unwrap();
+
+    assert_eq!(settings.filename.format, FilenameFormat::Custom);
+    assert_eq!(
+        settings
+            .processing_options(MetadataEdits::default())
+            .filename,
+        settings.filename
+    );
+}
+
+#[test]
+fn the_filename_format_round_trips_through_the_settings_file() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+
+    let settings = Settings {
+        filename: FilenameOptions {
+            format: FilenameFormat::TitleAuthor,
+            template: "{title}".into(),
+        },
+        ..Settings::default()
+    };
+    settings.save(&path).unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(r#"format = "title-author""#), "{text}");
+    assert_eq!(Settings::load(&path).unwrap().filename, settings.filename);
+}
+
+/// A settings file written before filenames were configurable still loads,
+/// naming books as they were always named.
+#[test]
+fn an_older_settings_file_names_books_as_before() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, "device = \"x3\"\nactive = \"full\"\n").unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.device, "x3");
+    assert_eq!(settings.filename.format, FilenameFormat::AuthorTitle);
+}
+
+/// The names the command line and the page use are the settings file's own.
+#[test]
+fn every_filename_format_is_named_as_the_settings_file_writes_it() {
+    for format in FilenameFormat::ALL {
+        let settings = Settings {
+            filename: FilenameOptions {
+                format,
+                template: String::new(),
+            },
+            ..Settings::default()
+        };
+        let text = toml::to_string(&settings).unwrap();
+        assert!(
+            text.contains(&format!("format = \"{}\"", format.name())),
+            "{text}"
+        );
+        assert_eq!(FilenameFormat::from_name(format.name()), Some(format));
+    }
 }

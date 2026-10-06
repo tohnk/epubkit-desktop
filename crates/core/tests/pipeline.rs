@@ -806,3 +806,41 @@ fn an_unreadable_chapter_is_left_alone_and_reported() {
         "the rest of the book is done: {one}"
     );
 }
+
+// ------------------------------------------------------------ output names
+
+#[test]
+fn the_output_is_named_as_chosen() {
+    let options = ProcessingOptions {
+        filename: metadata::FilenameOptions {
+            format: metadata::FilenameFormat::Custom,
+            template: "{title} ({original})".into(),
+        },
+        ..ProcessingOptions::default()
+    };
+    let (_, report) = run(options);
+    assert_eq!(report.output_filename, "The Long Afternoon (in).epub");
+}
+
+/// A template that cannot name the book fails before the work, not after.
+#[test]
+fn a_bad_template_is_refused_before_anything_is_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    write_demo_epub(&input);
+
+    let options = ProcessingOptions {
+        filename: metadata::FilenameOptions {
+            format: metadata::FilenameFormat::Custom,
+            template: "{publisher}".into(),
+        },
+        ..ProcessingOptions::default()
+    };
+    let mut steps = 0;
+    let error = process_epub(&input, &output, &options, |_, _| steps += 1).unwrap_err();
+
+    assert!(error.to_string().contains("{publisher}"), "{error}");
+    assert_eq!(steps, 0, "no step should have started");
+    assert!(!output.exists());
+}

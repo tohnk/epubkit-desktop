@@ -1,5 +1,6 @@
 use epubkit_core::metadata::{
-    extract_metadata, format_filename, strip_store_metadata, update_metadata, MetadataEdits,
+    check_template, extract_metadata, format_filename, output_filename, strip_store_metadata,
+    unused_path, update_metadata, FilenameFormat, FilenameOptions, Metadata, MetadataEdits,
 };
 use epubkit_core::xml;
 
@@ -270,4 +271,189 @@ fn long_multibyte_titles_do_not_panic() {
     let name = format_filename(&long_title, "");
     assert!(name.ends_with(".epub"));
     assert!(name.chars().count() <= 205);
+}
+
+// ------------------------------------------------- filename formats (PR #5)
+
+fn book(title: &str, author: &str) -> Metadata {
+    Metadata {
+        title: title.into(),
+        author: author.into(),
+        ..Metadata::default()
+    }
+}
+
+fn named(metadata: &Metadata, format: FilenameFormat, template: &str, original: &str) -> String {
+    let options = FilenameOptions {
+        format,
+        template: template.into(),
+    };
+    output_filename(metadata, &options, original).unwrap()
+}
+
+/// Upstream's `test_metadata_handler.py`, case for case.
+#[test]
+fn every_preset_names_the_book_its_own_way() {
+    let the_book = book("The Book", "A. Writer");
+    assert_eq!(
+        named(&the_book, FilenameFormat::Original, "", "upload.epub"),
+        "upload.epub"
+    );
+    assert_eq!(
+        named(&the_book, FilenameFormat::TitleAuthor, "", ""),
+        "The Book - A. Writer.epub"
+    );
+    assert_eq!(
+        named(&the_book, FilenameFormat::AuthorTitle, "", ""),
+        "A. Writer - The Book.epub"
+    );
+    assert_eq!(
+        named(&the_book, FilenameFormat::Title, "", ""),
+        "The Book.epub"
+    );
+}
+
+#[test]
+fn a_template_fills_in_metadata_and_the_original_name() {
+    let the_book = Metadata {
+        year: "2026".into(),
+        ..book("The Book", "A/Writer")
+    };
+    assert_eq!(
+        named(
+            &the_book,
+            FilenameFormat::Custom,
+            "{year} - {title} - {author} [{original}]",
+            "source.epub"
+        ),
+        "2026 - The Book - A-Writer [source].epub"
+    );
+
+    let in_a_series = Metadata {
+        series: "Saga".into(),
+        series_index: "2".into(),
+        language: "en".into(),
+        ..book("The Book", "A. Writer")
+    };
+    assert_eq!(
+        named(
+            &in_a_series,
+            FilenameFormat::Custom,
+            "{series} {series_index} - {title} ({language})",
+            ""
+        ),
+        "Saga 2 - The Book (en).epub"
+    );
+}
+
+#[test]
+fn missing_metadata_and_unsafe_names_fall_back_safely() {
+    assert_eq!(
+        named(&book("", ""), FilenameFormat::TitleAuthor, "", ""),
+        "optimized.epub"
+    );
+    assert_eq!(
+        named(&book("", ""), FilenameFormat::Original, "", "../../.epub"),
+        "optimized.epub"
+    );
+    // Only the original file's name counts, never its directory.
+    assert_eq!(
+        named(
+            &book("", ""),
+            FilenameFormat::Original,
+            "",
+            "/books/Mine.EPUB"
+        ),
+        "Mine.epub"
+    );
+}
+
+#[test]
+fn a_template_cannot_name_fields_it_does_not_know() {
+    let error = check_template("{title} {publisher} {}")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unknown filename template field"), "{error}");
+    assert!(
+        error.contains("{publisher}") && error.contains("{}"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_template_cannot_format_its_fields() {
+    for template in ["{title:>20}", "{title!r}"] {
+        let error = check_template(template).unwrap_err().to_string();
+        assert!(
+            error.contains("do not support formatting options"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_template_must_say_something_and_close_its_braces() {
+    for template in ["", "   ", "{title", "title}", &"x".repeat(201)] {
+        assert!(
+            check_template(template).is_err(),
+            "{template:?} was accepted"
+        );
+    }
+}
+
+#[test]
+fn doubled_braces_are_literal_and_the_extension_is_not_doubled() {
+    assert_eq!(
+        check_template("{{{title}}}").unwrap(),
+        "{The Long Afternoon}.epub"
+    );
+    assert_eq!(
+        check_template("{original}.epub").unwrap(),
+        "long-afternoon.epub"
+    );
+}
+
+#[test]
+fn the_year_comes_from_the_publication_date() {
+    for (date, year) in [
+        ("2026-07-31", "2026"),
+        ("1999", "1999"),
+        ("2019-04-02T00:00:00+00:00", "2019"),
+        ("unknown", ""),
+    ] {
+        let doc = opf(&format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title><dc:date>{date}</dc:date></metadata></package>"#
+        ));
+        assert_eq!(extract_metadata(&doc).unwrap().year, year, "{date}");
+    }
+}
+
+/// A finished book never replaces a file — least of all the one it came from,
+/// which is exactly where `Original` points.
+#[test]
+fn an_output_never_replaces_a_file_already_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("Vale - Afternoon.epub");
+    assert_eq!(unused_path(&wanted), wanted);
+
+    std::fs::write(&wanted, b"the original").unwrap();
+    let second = dir.path().join("Vale - Afternoon (2).epub");
+    assert_eq!(unused_path(&wanted), second);
+
+    std::fs::write(&second, b"an earlier run").unwrap();
+    assert_eq!(
+        unused_path(&wanted),
+        dir.path().join("Vale - Afternoon (3).epub")
+    );
+}
+
+/// Copying onto a dangling link would write wherever it points.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_counts_as_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("Afternoon.epub");
+    std::os::unix::fs::symlink(dir.path().join("nowhere.epub"), &wanted).unwrap();
+
+    assert_eq!(unused_path(&wanted), dir.path().join("Afternoon (2).epub"));
 }

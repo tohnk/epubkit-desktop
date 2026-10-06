@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::html::{self, HtmlRepair};
 use crate::image::{self, DeviceProfile, ImageOptions};
-use crate::metadata::{self, MetadataEdits};
+use crate::metadata::{self, FilenameFormat, FilenameOptions, MetadataEdits};
 use crate::text::{TextCleanOptions, TextCleanReport};
 use crate::{css, package, structure, xml, Error, Result};
 
@@ -37,6 +37,8 @@ pub struct ProcessingOptions {
     pub text_cleanup: bool,
     pub normalize_quotes: bool,
     pub metadata_edits: MetadataEdits,
+    /// How [`ProcessingReport::output_filename`] is worked out.
+    pub filename: FilenameOptions,
 }
 
 impl Default for ProcessingOptions {
@@ -56,6 +58,7 @@ impl Default for ProcessingOptions {
             text_cleanup: true,
             normalize_quotes: true,
             metadata_edits: MetadataEdits::default(),
+            filename: FilenameOptions::default(),
         }
     }
 }
@@ -242,6 +245,12 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             .len(),
         ..ProcessingReport::default()
     };
+
+    // A template that cannot name the book should say so before the run, not
+    // after it.
+    if options.filename.format == FilenameFormat::Custom {
+        metadata::check_template(&options.filename.template)?;
+    }
 
     progress(2, "Checking for DRM...");
     if package::has_drm(input_path)? {
@@ -433,8 +442,12 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     package::package_epub(work_dir, output_path)?;
 
     let final_metadata = metadata::extract_metadata(&opf)?;
+    let original = input_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
     report.output_filename =
-        metadata::format_filename(&final_metadata.title, &final_metadata.author);
+        metadata::output_filename(&final_metadata, &options.filename, &original)?;
     report.optimized_size = fs::metadata(output_path)
         .map_err(|e| Error::io(output_path, e))?
         .len();

@@ -34,6 +34,10 @@ pub enum Error {
     #[error("settings error: {0}")]
     Settings(String),
 
+    /// Said to the user as it stands, so the message carries its own context.
+    #[error("{0}")]
+    FilenameTemplate(String),
+
     #[error("this EPUB is DRM-protected; remove the DRM first (e.g. with DeDRM and Calibre)")]
     DrmProtected,
 }

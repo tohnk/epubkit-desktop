@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use epubkit_core::metadata::MetadataEdits;
+use epubkit_core::metadata::{self, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingReport};
 use epubkit_core::settings::Settings;
 use epubkit_core::{image, package, preview, Error};
@@ -96,6 +96,13 @@ pub fn delete_preset(id: String) -> Response<Settings> {
     settings.save(&path).map_err(to_message)?;
 
     Ok(settings)
+}
+
+/// What a custom filename template makes of an example book, or what is wrong
+/// with it — so a mistake shows while it is typed, not when every book fails.
+#[tauri::command]
+pub fn check_filename_template(template: String) -> Response<String> {
+    metadata::check_template(&template).map_err(to_message)
 }
 
 // -------------------------------------------------------------------- books
@@ -226,26 +233,10 @@ pub async fn optimize_books(
 ) -> Response<Vec<Outcome>> {
     tauri::async_runtime::spawn_blocking(move || {
         let destination = PathBuf::from(destination);
-        let device = settings.device_profile();
         let total = jobs.len();
         let mut outcomes = Vec::with_capacity(total);
 
         for (index, job) in jobs.iter().enumerate() {
-            let input = PathBuf::from(&job.path);
-            let options = settings.options.to_processing_options(
-                device,
-                MetadataEdits {
-                    title: job.title.clone().filter(|value| !value.trim().is_empty()),
-                    author: job.author.clone().filter(|value| !value.trim().is_empty()),
-                    language: None,
-                },
-            );
-
-            // The output name comes from the book's metadata, which is not
-            // known until the run finishes — so write beside the destination
-            // and rename once the report says what to call it.
-            let staging = destination.join(format!(".epubkit-{index}.part"));
-
             let emit = |percent: u8, message: &str| {
                 let _ = app.emit(
                     "progress",
@@ -259,40 +250,7 @@ pub async fn optimize_books(
                 );
             };
 
-            let outcome = match process_epub(&input, &staging, &options, emit) {
-                Ok(report) => {
-                    let final_path = unique_path(&destination.join(&report.output_filename));
-                    match std::fs::rename(&staging, &final_path) {
-                        Ok(()) => Outcome {
-                            path: job.path.clone(),
-                            output: Some(final_path.to_string_lossy().to_string()),
-                            summary: report.summary(),
-                            report: Some(report),
-                            error: None,
-                        },
-                        Err(error) => Outcome {
-                            path: job.path.clone(),
-                            output: None,
-                            summary: String::new(),
-                            report: None,
-                            error: Some(format!(
-                                "could not write {}: {error}",
-                                final_path.display()
-                            )),
-                        },
-                    }
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&staging);
-                    Outcome {
-                        path: job.path.clone(),
-                        output: None,
-                        summary: String::new(),
-                        report: None,
-                        error: Some(error.to_string()),
-                    }
-                }
-            };
+            let outcome = optimize_one(job, &destination, &settings, index, emit);
 
             let _ = app.emit("finished", outcome.clone());
             outcomes.push(outcome);
@@ -304,30 +262,66 @@ pub async fn optimize_books(
     .map_err(to_message)?
 }
 
+/// Optimize one book into `destination`, as [`optimize_books`] does for each.
+///
+/// Apart so it can be tested without a window. `slot` keeps the staging files
+/// of one run apart.
+pub fn optimize_one(
+    job: &Job,
+    destination: &Path,
+    settings: &Settings,
+    slot: usize,
+    progress: impl FnMut(u8, &str),
+) -> Outcome {
+    let input = PathBuf::from(&job.path);
+    let options = settings.processing_options(MetadataEdits {
+        title: job.title.clone().filter(|value| !value.trim().is_empty()),
+        author: job.author.clone().filter(|value| !value.trim().is_empty()),
+        language: None,
+    });
+
+    // The output name comes from the book's metadata, which is not known until
+    // the run finishes — so write beside the destination and rename once the
+    // report says what to call it.
+    let staging = destination.join(format!(".epubkit-{slot}.part"));
+
+    let failed = |error: String| Outcome {
+        path: job.path.clone(),
+        output: None,
+        summary: String::new(),
+        report: None,
+        error: Some(error),
+    };
+
+    let report = match process_epub(&input, &staging, &options, progress) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return failed(error.to_string());
+        }
+    };
+
+    let final_path = metadata::unused_path(&destination.join(&report.output_filename));
+    if let Err(error) = std::fs::rename(&staging, &final_path) {
+        let _ = std::fs::remove_file(&staging);
+        return failed(format!("could not write {}: {error}", final_path.display()));
+    }
+
+    Outcome {
+        path: job.path.clone(),
+        output: Some(final_path.to_string_lossy().to_string()),
+        summary: report.summary(),
+        report: Some(report),
+        error: None,
+    }
+}
+
 // ------------------------------------------------------------------ helpers
 
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default()
-}
-
-/// Never silently overwrite a book that is already there.
-fn unique_path(preferred: &Path) -> PathBuf {
-    if !preferred.exists() {
-        return preferred.to_path_buf();
-    }
-
-    let stem = preferred
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "optimized".to_string());
-    let parent = preferred.parent().unwrap_or(Path::new("."));
-
-    (2..)
-        .map(|n| parent.join(format!("{stem} ({n}).epub")))
-        .find(|candidate| !candidate.exists())
-        .expect("an unused suffix always exists")
 }
 
 /// Encode a cover for display.

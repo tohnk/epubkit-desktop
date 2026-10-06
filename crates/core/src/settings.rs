@@ -24,14 +24,15 @@
 //!   already behaves. The difference here is that Custom persists and can be
 //!   given a name.
 //! - The device is *not* part of a preset. It describes the hardware on the
-//!   desk, not a processing taste, so it is sticky on its own.
+//!   desk, not a processing taste, so it is sticky on its own. So is how the
+//!   output is named, which is about the user's library, not the book.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::image::{self, DeviceProfile};
-use crate::metadata::MetadataEdits;
+use crate::metadata::{FilenameOptions, MetadataEdits};
 use crate::pipeline::ProcessingOptions;
 use crate::{Error, Result};
 
@@ -129,6 +130,8 @@ pub struct Preset {
 pub struct Settings {
     /// Which reader this machine is for. Sticky, and never part of a preset.
     pub device: String,
+    /// How an optimized book is named. Sticky, and never part of a preset.
+    pub filename: FilenameOptions,
     /// The live values — restored verbatim on launch.
     pub options: OptionSet,
     /// Which preset the UI should show as selected. A label, not the truth.
@@ -140,6 +143,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             device: image::DEFAULT_DEVICE.to_string(),
+            filename: FilenameOptions::default(),
             options: OptionSet::full(),
             active: FULL.to_string(),
             presets: Vec::new(),
@@ -183,6 +187,17 @@ impl Settings {
         image::device(&self.device)
             .or_else(|| image::device(image::DEFAULT_DEVICE))
             .unwrap_or(image::X4)
+    }
+
+    /// Everything a run needs: the options, on this device, naming the output
+    /// as chosen, with `edits` for the one book.
+    pub fn processing_options(&self, edits: MetadataEdits) -> ProcessingOptions {
+        ProcessingOptions {
+            filename: self.filename.clone(),
+            ..self
+                .options
+                .to_processing_options(self.device_profile(), edits)
+        }
     }
 
     /// Apply a preset: copy its values in and point `active` at it.

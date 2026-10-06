@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
-use epubkit_core::metadata::MetadataEdits;
+use epubkit_core::metadata::{FilenameFormat, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingOptions};
 use epubkit_core::settings::Settings;
 use epubkit_core::{metadata, package, structure, xml};
@@ -38,7 +38,9 @@ enum Command {
     /// this run, and the result is remembered for the next one.
     Optimize {
         input: PathBuf,
-        /// Write here. Defaults to "Author - Title.epub" in the current directory.
+        /// Write here. Defaults to a name made from the book's metadata, as
+        /// --filename chooses, in the current directory; that never replaces
+        /// a file already there.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Start from a preset: quick, full, or one you saved.
@@ -59,6 +61,15 @@ enum Command {
         /// Override the book's author.
         #[arg(long)]
         author: Option<String>,
+        /// How to name the output: original, title-author, author-title,
+        /// title, or custom.
+        #[arg(long, value_name = "FORMAT", value_parser = parse_filename_format)]
+        filename: Option<FilenameFormat>,
+        /// Name the output from a template, using {title} {author} {year}
+        /// {series} {series_index} {language} and {original}. Implies
+        /// --filename custom.
+        #[arg(long, value_name = "TEMPLATE")]
+        filename_template: Option<String>,
         /// Keep images in colour.
         #[arg(long)]
         no_grayscale: bool,
@@ -106,6 +117,13 @@ enum SettingsAction {
     Device { device: String },
 }
 
+fn parse_filename_format(name: &str) -> std::result::Result<FilenameFormat, String> {
+    FilenameFormat::from_name(name).ok_or_else(|| {
+        let names: Vec<&str> = FilenameFormat::ALL.iter().map(|f| f.name()).collect();
+        format!("expected one of {}", names.join(", "))
+    })
+}
+
 fn settings_path() -> Result<PathBuf> {
     Settings::default_path().context("could not locate a configuration directory")
 }
@@ -124,6 +142,8 @@ fn main() -> Result<()> {
             light_novel,
             title,
             author,
+            filename,
+            filename_template,
             no_grayscale,
             no_font_removal,
             no_css_cleanup,
@@ -173,15 +193,26 @@ fn main() -> Result<()> {
                 settings.mark_customized();
             }
 
+            // Naming, like the device, is remembered apart from the presets.
+            // A template is checked here, before the book is touched.
+            if let Some(template) = filename_template {
+                metadata::check_template(&template)?;
+                settings.filename.template = template;
+                settings.filename.format = FilenameFormat::Custom;
+            }
+            if let Some(format) = filename {
+                if format == FilenameFormat::Custom {
+                    metadata::check_template(&settings.filename.template)?;
+                }
+                settings.filename.format = format;
+            }
+
             // Metadata edits are about one book, so they are never persisted.
-            let options = settings.options.to_processing_options(
-                settings.device_profile(),
-                MetadataEdits {
-                    title,
-                    author,
-                    language: None,
-                },
-            );
+            let options = settings.processing_options(MetadataEdits {
+                title,
+                author,
+                language: None,
+            });
 
             if !no_save {
                 settings.save(&path).context("saving settings")?;
@@ -366,7 +397,9 @@ fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> 
 
     let destination = match output {
         Some(path) => path.to_path_buf(),
-        None => PathBuf::from(&report.output_filename),
+        // A name of the book's own choosing may already be taken — by the book
+        // itself, when it keeps its original name.
+        None => metadata::unused_path(Path::new(&report.output_filename)),
     };
 
     // `persist` fails across filesystems, so fall back to a copy.
@@ -390,6 +423,12 @@ fn settings_command(action: SettingsAction) -> Result<()> {
         SettingsAction::Show => {
             println!("file:    {}", path.display());
             println!("device:  {}", settings.device);
+            match settings.filename.format {
+                FilenameFormat::Custom => {
+                    println!("names:   custom \"{}\"", settings.filename.template)
+                }
+                format => println!("names:   {}", format.name()),
+            }
             println!("preset:  {}", settings.active_label());
             println!();
             let o = &settings.options;

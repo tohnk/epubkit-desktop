@@ -87,6 +87,22 @@
                 </div>
             </div>
 
+            <div class="filename-control">
+                <label class="quality-label">Output Filename</label>
+                <div class="quality-presets filename-presets">
+                    <button class="filename-btn" data-filename-format="original">Original</button>
+                    <button class="filename-btn" data-filename-format="title-author">Title - Author</button>
+                    <button class="filename-btn" data-filename-format="author-title">Author - Title</button>
+                    <button class="filename-btn" data-filename-format="title">Title</button>
+                    <button class="filename-btn" data-filename-format="custom">Custom</button>
+                </div>
+                <div id="filename-template-row" class="filename-template-row" hidden>
+                    <input type="text" id="filename-template" maxlength="200" spellcheck="false" autocomplete="off" aria-label="Custom filename template">
+                    <small id="filename-fields">Fields: {title} {author} {year} {series} {series_index} {language} {original}</small>
+                    <small id="filename-example"></small>
+                </div>
+            </div>
+
             <div class="preset-actions">
                 <button id="save-preset-btn" class="ghost-btn">Save these as a preset…</button>
                 <button id="delete-preset-btn" class="ghost-btn danger" hidden>Delete this preset</button>

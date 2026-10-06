@@ -101,7 +101,8 @@ pinned by tests:
   `the_page_binds_to_option_keys_that_exist` reads the real `index.html` and
   checks every binding against the real serialization, in both directions — so
   an option added to one and not the other fails the build rather than quietly
-  doing nothing.
+  doing nothing. The filename buttons and the template fields the page lists
+  are checked against the core the same way.
 
 ## Using the CLI
 
@@ -111,6 +112,7 @@ cargo run -p epubkit-cli -- validate  book.epub
 cargo run -p epubkit-cli -- roundtrip book.epub -o out.epub
 cargo run -p epubkit-cli -- repair    chapter.xhtml
 cargo run -p epubkit-cli -- optimize  book.epub
+cargo run -p epubkit-cli -- optimize  book.epub --filename-template '{series} {series_index} - {title}'
 cargo run -p epubkit-cli -- settings  show
 ```
 
@@ -133,12 +135,14 @@ that Custom now persists and can be given a name.
 
 The device is deliberately *not* part of a preset — it describes the hardware
 on the desk, not a processing taste — so it is sticky on its own and survives
-every preset change.
+every preset change. How finished books are named is kept apart the same way:
+it is about the user's library, not about any one way of processing.
 
 On the CLI, saved settings are the base and the flags are overrides: each
 `--no-*` flag can only turn something off, so an option nobody mentioned keeps
-whatever it had. Metadata edits (`--title`, `--author`) are about one book and
-are never persisted.
+whatever it had. `--filename` and `--filename-template` are remembered too.
+Metadata edits (`--title`, `--author`) are about one book and are never
+persisted.
 
 ## Validating against the reference
 
@@ -376,6 +380,22 @@ an `@charset` naming a legacy encoding; otherwise as UTF-8 if the bytes are
 valid UTF-8, and as windows-1252 if not. The reference read them as UTF-8 and
 dropped what did not fit. One the run rewrites is saved as UTF-8, its
 `@charset` rewritten to match; one it leaves alone keeps its bytes.
+
+### Output names follow upstream's later filename options
+
+Upstream added a choice of output name after the reference commit, in its
+PR #5: the original filename, Title - Author, Author - Title, Title, or a
+template filled from `{title}`, `{author}`, `{year}`, `{series}`,
+`{series_index}`, `{language}` and `{original}`. The port follows its rules:
+doubled braces are literal, a field it does not know or a formatting option is
+refused, and a template ending in `.epub` does not get a second one. Author -
+Title, the default, is the name the reference always gave.
+
+The choice is remembered with the settings rather than made per upload, and
+both front ends check a template before any book is touched. Since a book can
+now be named exactly as the file it came from, neither front end ever
+replaces a file that is already there; the output becomes `name (2).epub`.
+The CLI used to write over one without asking.
 
 ### The HTML repair pass runs earlier
 
