@@ -220,7 +220,7 @@ function renderBooks() {
         card.className = `file-card ${book.error ? 'error' : ''}`;
 
         const cover = book.cover
-            ? `<img src="${book.cover}" alt="">`
+            ? `<img src="${escapeAttr(book.cover)}" alt="">`
             : '<div class="no-cover">No cover</div>';
 
         const meta = [book.author, book.series].filter(Boolean).join(' — ');

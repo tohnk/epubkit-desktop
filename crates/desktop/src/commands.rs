@@ -10,7 +10,7 @@ use base64::Engine;
 use epubkit_core::metadata::MetadataEdits;
 use epubkit_core::pipeline::{process_epub, ProcessingReport};
 use epubkit_core::settings::Settings;
-use epubkit_core::{image, metadata, package, xml, Error};
+use epubkit_core::{image, package, preview, Error};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -133,15 +133,25 @@ impl BookInfo {
 }
 
 /// Read metadata and a cover thumbnail for each dropped book.
+///
+/// Runs on a blocking worker: a command without `async` runs on the main
+/// thread, and the window would hang for as long as the books took to read.
 #[tauri::command]
-pub fn inspect_books(paths: Vec<String>) -> Vec<BookInfo> {
-    paths
-        .iter()
-        .map(|path| inspect_one(Path::new(path)))
-        .collect()
+pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| inspect_one(Path::new(path)))
+            .collect()
+    })
+    .await
+    .map_err(to_message)
 }
 
 fn inspect_one(path: &Path) -> BookInfo {
+    // This is for a thumbnail, not the artwork.
+    const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+
     if !path.is_file() {
         return BookInfo::failed(path, "not a file");
     }
@@ -152,45 +162,21 @@ fn inspect_one(path: &Path) -> BookInfo {
         Ok(false) => {}
     }
 
-    let work = match tempdir() {
-        Ok(dir) => dir,
+    // Only the package document and the cover are read; the rest of the book
+    // stays packed.
+    let preview = match preview::read_preview(path, MAX_PREVIEW_BYTES) {
+        Ok(preview) => preview,
         Err(error) => return BookInfo::failed(path, error),
     };
-
-    if let Err(error) = package::extract_epub(path, work.path()) {
-        return BookInfo::failed(path, error);
-    }
-
-    let opf_path = match package::find_opf_path(work.path()) {
-        Ok(relative) => work.path().join(relative),
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let opf = match xml::parse_file(&opf_path) {
-        Ok(doc) => doc,
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let meta = match metadata::extract_metadata(&opf) {
-        Ok(meta) => meta,
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let cover = (!meta.cover_href.is_empty())
-        .then(|| {
-            let opf_dir = opf_path.parent().unwrap_or(work.path());
-            cover_data_url(&opf_dir.join(&meta.cover_href))
-        })
-        .flatten();
 
     BookInfo {
         path: path.to_string_lossy().to_string(),
         filename: file_name(path),
         size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        title: meta.title,
-        author: meta.author,
-        series: meta.series,
-        cover,
+        title: preview.metadata.title,
+        author: preview.metadata.author,
+        series: preview.metadata.series,
+        cover: preview.cover.as_ref().and_then(cover_data_url),
         error: None,
     }
 }
@@ -320,10 +306,6 @@ pub async fn optimize_books(
 
 // ------------------------------------------------------------------ helpers
 
-fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::tempdir()
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -348,31 +330,34 @@ fn unique_path(preferred: &Path) -> PathBuf {
         .expect("an unused suffix always exists")
 }
 
-/// Encode a cover for display. Oversized covers are skipped rather than
-/// pushed through IPC — this is a thumbnail, not the artwork.
-fn cover_data_url(path: &Path) -> Option<String> {
-    const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
-
-    if std::fs::metadata(path).ok()?.len() > MAX_PREVIEW_BYTES {
-        return None;
-    }
-
-    let bytes = std::fs::read(path).ok()?;
-    let mime = match path
+/// Encode a cover for display.
+///
+/// The type written into the data URL is always one of a fixed few, never the
+/// book's own string: the page puts the URL in an `<img src>`, and a media
+/// type is whatever the book's author typed.
+fn cover_data_url(cover: &preview::Cover) -> Option<String> {
+    let extension = Path::new(&cover.path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => return None, // not a raster preview
-        _ => "image/jpeg",
+        .map(|e| e.to_ascii_lowercase());
+
+    let mime = match cover.media_type.to_ascii_lowercase().as_str() {
+        "image/png" => "image/png",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/svg+xml" => return None, // not a raster preview
+        _ => match extension.as_deref() {
+            Some("png") => "image/png",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("svg") => return None,
+            _ => "image/jpeg",
+        },
     };
 
     Some(format!(
         "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
+        base64::engine::general_purpose::STANDARD.encode(&cover.bytes)
     ))
 }

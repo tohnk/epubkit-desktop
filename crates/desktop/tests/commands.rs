@@ -62,6 +62,11 @@ const PNG: &[u8] = &[
     0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// Run the command to completion, as the window's async runtime would.
+fn inspect(paths: Vec<String>) -> Vec<commands::BookInfo> {
+    tauri::async_runtime::block_on(commands::inspect_books(paths)).expect("the command should run")
+}
+
 fn demo_epub(path: &Path) {
     write_epub(
         path,
@@ -91,7 +96,7 @@ fn inspecting_a_book_returns_what_the_list_shows() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let books = commands::inspect_books(vec![path.to_string_lossy().to_string()]);
+    let books = inspect(vec![path.to_string_lossy().to_string()]);
 
     assert_eq!(books.len(), 1);
     let book = &books[0];
@@ -109,7 +114,7 @@ fn a_cover_comes_back_as_a_data_url_the_page_can_render() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let cover = commands::inspect_books(vec![path.to_string_lossy().to_string()])
+    let cover = inspect(vec![path.to_string_lossy().to_string()])
         .swap_remove(0)
         .cover
         .expect("the book has a cover");
@@ -127,7 +132,7 @@ fn a_broken_file_fails_on_its_own() {
     demo_epub(&good);
     std::fs::write(&bad, b"this is not an epub").unwrap();
 
-    let books = commands::inspect_books(vec![
+    let books = inspect(vec![
         good.to_string_lossy().to_string(),
         bad.to_string_lossy().to_string(),
         dir.path()
@@ -173,7 +178,7 @@ fn a_drm_protected_book_says_so_before_anything_is_processed() {
         ],
     );
 
-    let book = commands::inspect_books(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
     let message = book.error.expect("DRM should be reported");
     assert!(message.contains("DRM"), "{message}");
 }
@@ -186,7 +191,7 @@ fn what_crosses_the_boundary_is_shaped_the_way_the_page_expects() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let book = commands::inspect_books(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
     let json = serde_json::to_value(&book).unwrap();
 
     for field in [
@@ -278,4 +283,56 @@ fn the_settings_payload_is_shaped_the_way_the_page_expects() {
     for field in ["id", "name", "options"] {
         assert!(preset.get(field).is_some(), "a preset is missing '{field}'");
     }
+}
+
+/// The cover's href is a URL relative to the package document, so a space in
+/// its name arrives as `%20`.
+#[test]
+fn a_cover_whose_name_needs_escaping_still_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("book.epub");
+    let opf = String::from_utf8(OPF.to_vec())
+        .unwrap()
+        .replace(r#"href="cover.png""#, r#"href="cover%20art.png""#);
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover art.png", PNG),
+        ],
+    );
+
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    assert!(book.cover.is_some(), "{:?}", book.error);
+}
+
+/// The cover's href comes from the book. It must never lead the app to read a
+/// file of the user's into the page.
+#[test]
+fn a_cover_href_cannot_reach_a_file_outside_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.png");
+    std::fs::write(&secret, PNG).unwrap();
+    let path = dir.path().join("book.epub");
+
+    let opf = String::from_utf8(OPF.to_vec()).unwrap().replace(
+        r#"href="cover.png""#,
+        &format!(r#"href="{}""#, secret.display()),
+    );
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+        ],
+    );
+
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    assert!(book.error.is_none(), "{:?}", book.error);
+    assert!(book.cover.is_none(), "the cover came from outside the book");
 }

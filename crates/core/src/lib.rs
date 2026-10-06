@@ -18,6 +18,7 @@ pub mod jpeg;
 pub mod metadata;
 pub mod package;
 pub mod pipeline;
+pub mod preview;
 pub mod settings;
 pub mod structure;
 pub mod text;

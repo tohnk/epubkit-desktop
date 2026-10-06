@@ -282,16 +282,8 @@ pub fn find_opf_path(epub_dir: &Path) -> Result<String> {
 
     if container_path.is_file() {
         let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
-        if let Ok(doc) = xml::parse_strict(&bytes) {
-            // Namespaced form first, then a namespace-agnostic fallback for
-            // the EPUBs that omit or misdeclare it.
-            for xpath in ["//c:rootfile", "//*[local-name()='rootfile']"] {
-                let values =
-                    xml::attribute_values(&doc, xpath, "full-path", &[("c", NS_CONTAINER)])?;
-                if let Some(path) = values.into_iter().find(|v| !v.is_empty()) {
-                    return Ok(path);
-                }
-            }
+        if let Some(path) = opf_path_in_container(&bytes)? {
+            return Ok(path);
         }
     }
 
@@ -307,6 +299,23 @@ pub fn find_opf_path(epub_dir: &Path) -> Result<String> {
     }
 
     Err(Error::OpfNotFound)
+}
+
+/// The package document `container.xml` points at, if it parses and does.
+pub(crate) fn opf_path_in_container(container_xml: &[u8]) -> Result<Option<String>> {
+    let Ok(doc) = xml::parse_strict(container_xml) else {
+        return Ok(None);
+    };
+
+    // Namespaced form first, then a namespace-agnostic fallback for the EPUBs
+    // that omit or misdeclare it.
+    for xpath in ["//c:rootfile", "//*[local-name()='rootfile']"] {
+        let values = xml::attribute_values(&doc, xpath, "full-path", &[("c", NS_CONTAINER)])?;
+        if let Some(path) = values.into_iter().find(|v| !v.is_empty()) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------- internals
