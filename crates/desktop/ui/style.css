@@ -6,6 +6,12 @@
     box-sizing: border-box;
 }
 
+/* The page shows and hides things with `hidden`, which the browser's own
+   `display: none` enforces only until a rule here sets `display` itself. */
+[hidden] {
+    display: none !important;
+}
+
 :root {
     --bg: #f7f7f8;
     --surface: #ffffff;
