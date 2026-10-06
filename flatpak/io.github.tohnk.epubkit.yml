@@ -20,6 +20,8 @@ runtime-version: '51'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, for the bindings the libxml crate generates as it builds.
+  - org.freedesktop.Sdk.Extension.llvm22
 command: epubkit-desktop
 
 finish-args:
@@ -43,6 +45,7 @@ build-options:
     - --share=network
   env:
     CARGO_HOME: /run/build/epubkit/cargo
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
 
 modules:
   - name: epubkit

@@ -22,6 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: List the LLVM extensions on Flathub (temporary)
+        run: |
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak remote-ls --runtime --columns=application,branch flathub | grep -E 'Sdk\.Extension\.llvm[0-9]+' | sort -V || true
+
       # Builds the app, runs the manifest's tests inside the runtime, and
       # uploads epubkit.flatpak as an artifact of the run.
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
