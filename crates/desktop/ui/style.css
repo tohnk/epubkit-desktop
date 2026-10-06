@@ -6,6 +6,12 @@
     box-sizing: border-box;
 }
 
+/* The page shows and hides things with `hidden`, which the browser's own
+   `display: none` enforces only until a rule here sets `display` itself. */
+[hidden] {
+    display: none !important;
+}
+
 :root {
     --bg: #f7f7f8;
     --surface: #ffffff;
@@ -517,7 +523,8 @@ h2 {
     margin-bottom: 10px;
 }
 
-.quality-btn {
+.quality-btn,
+.filename-btn {
     flex: 1;
     padding: 6px;
     border: 1px solid var(--border);
@@ -529,12 +536,14 @@ h2 {
     transition: all var(--transition);
 }
 
-.quality-btn:hover {
+.quality-btn:hover,
+.filename-btn:hover {
     background: var(--bg);
     border-color: var(--border-hover);
 }
 
-.quality-btn.active {
+.quality-btn.active,
+.filename-btn.active {
     background: var(--accent);
     color: #fff;
     border-color: var(--accent);
@@ -558,6 +567,46 @@ h2 {
     font-variant-numeric: tabular-nums;
     min-width: 32px;
     color: var(--text-secondary);
+}
+
+.filename-control {
+    margin-bottom: 24px;
+}
+
+.filename-presets {
+    flex-wrap: wrap;
+}
+
+.filename-btn {
+    min-width: 90px;
+}
+
+#filename-template {
+    width: 100%;
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--text);
+    transition: border-color var(--transition);
+}
+
+#filename-template:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.filename-template-row small {
+    display: block;
+    margin-top: 5px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.filename-template-row small.error-text {
+    color: var(--error);
 }
 
 .process-btn {

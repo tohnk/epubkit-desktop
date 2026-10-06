@@ -2,9 +2,9 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use libxml::tree::{Document, Node};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -46,6 +46,9 @@ const HREF_ESCAPE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}')
     .add(b'%');
+
+/// How an image that replaces an SVG wrapper fills the page.
+const FULL_PAGE_STYLE: &str = "max-width:100%;max-height:100%;display:block;margin:auto";
 
 /// One `<item>` from the OPF manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -213,7 +216,7 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
         let Some(new_path) = rename_map
             .get(&decoded)
             .or_else(|| rename_map.get(&href))
-            .or_else(|| match_by_filename(&decoded, rename_map))
+            .or_else(|| rename_by_filename(&decoded, rename_map))
         else {
             continue;
         };
@@ -282,13 +285,22 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 /// Rewrite image references inside one XHTML file: `<img src>`, SVG
 /// `<image xlink:href>`, and `url()` in inline styles. Returns how many
 /// references changed, writing the file only if any did.
+///
+/// A reference is resolved against the file's own directory and matched by
+/// path, so two images that share a filename in different directories can be
+/// renamed differently. `opf_dir` is what the rename map's paths are relative
+/// to.
 pub fn update_xhtml_references(
+    opf_dir: &Path,
     path: &Path,
     rename_map: &BTreeMap<String, String>,
 ) -> Result<usize> {
     if rename_map.is_empty() {
         return Ok(0);
     }
+
+    let renames = Renames::new(opf_dir, rename_map);
+    let base = path.parent().unwrap_or(opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
@@ -298,8 +310,7 @@ pub fn update_xhtml_references(
         match local_name(&node).as_str() {
             "img" => {
                 let src = node.get_attribute("src").unwrap_or_default();
-                let new_src = resolve_reference(&src, rename_map);
-                if new_src != src {
+                if let Some(new_src) = rewrite_reference(&src, base, &renames) {
                     node.set_attribute("src", &new_src).ok();
                     updated += 1;
                 }
@@ -311,9 +322,8 @@ pub fn update_xhtml_references(
                 let value = xlink
                     .clone()
                     .unwrap_or_else(|| node.get_attribute("href").unwrap_or_default());
-                let new_value = resolve_reference(&value, rename_map);
 
-                if new_value != value {
+                if let Some(new_value) = rewrite_reference(&value, base, &renames) {
                     let namespace = xlink
                         .is_some()
                         .then(|| xlink_namespace(&content.doc, &node));
@@ -333,7 +343,7 @@ pub fn update_xhtml_references(
 
         let style = node.get_attribute("style").unwrap_or_default();
         if style.contains("url(") {
-            let new_style = rewrite_css_urls(&style, rename_map);
+            let new_style = rewrite_css_urls(&style, base, &renames);
             if new_style != style {
                 node.set_attribute("style", &new_style).ok();
                 updated += 1;
@@ -348,14 +358,22 @@ pub fn update_xhtml_references(
     Ok(updated)
 }
 
-/// Rewrite `url()` references in a stylesheet. Returns 1 if the file changed.
-pub fn update_css_references(path: &Path, rename_map: &BTreeMap<String, String>) -> Result<usize> {
+/// Rewrite `url()` references in a stylesheet, resolved against its own
+/// directory. Returns 1 if the file changed.
+pub fn update_css_references(
+    opf_dir: &Path,
+    path: &Path,
+    rename_map: &BTreeMap<String, String>,
+) -> Result<usize> {
     if rename_map.is_empty() {
         return Ok(0);
     }
 
-    let css = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-    let rewritten = rewrite_css_urls(&css, rename_map);
+    let renames = Renames::new(opf_dir, rename_map);
+    let base = path.parent().unwrap_or(opf_dir);
+
+    let css = crate::css::read_stylesheet(path)?;
+    let rewritten = rewrite_css_urls(&css, base, &renames);
 
     if rewritten == css {
         return Ok(0);
@@ -363,6 +381,154 @@ pub fn update_css_references(path: &Path, rename_map: &BTreeMap<String, String>)
 
     fs::write(path, rewritten).map_err(|e| Error::io(path, e))?;
     Ok(1)
+}
+
+/// Declare every page of each image Light Novel mode split, after the first,
+/// which already has the image's own manifest entry. `reshaped` maps the path
+/// of an image's first page to all its pages in reading order, relative to
+/// the OPF's directory. Returns how many entries were added.
+pub fn declare_reshaped_pages(
+    doc: &Document,
+    reshaped: &BTreeMap<String, Vec<String>>,
+) -> Result<usize> {
+    let items = manifest_items(doc)?;
+    let mut ids: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+    let mut added = 0;
+
+    for (first, pages) in reshaped {
+        let base = items
+            .iter()
+            .find(|item| item.decoded_href() == *first)
+            .map_or_else(|| "image".to_string(), |item| item.id.clone());
+
+        for (index, page) in pages.iter().enumerate().skip(1) {
+            let wanted = format!("{base}-{}", index + 1);
+            let id = std::iter::once(wanted.clone())
+                .chain((2..).map(|n| format!("{wanted}-{n}")))
+                .find(|candidate| !ids.contains(candidate))
+                .expect("an unused suffix always exists");
+
+            add_image_to_opf(doc, &encode(page), &id)?;
+            ids.insert(id);
+            added += 1;
+        }
+    }
+
+    Ok(added)
+}
+
+/// Show every page of each image Light Novel mode reshaped in one XHTML file.
+/// `reshaped` is as for [`declare_reshaped_pages`]; references should already
+/// point at the first page.
+///
+/// An `<img>` of a reshaped image loses its `width` and `height`, which give
+/// the old shape, and is followed by a copy for each further page. An SVG
+/// wrapper around one, its viewBox sized to the old shape too, gives way to a
+/// plain `<img>` per page. Returns how many images changed, writing the file
+/// only if any did.
+pub fn show_reshaped_pages(
+    opf_dir: &Path,
+    path: &Path,
+    reshaped: &BTreeMap<String, Vec<String>>,
+) -> Result<usize> {
+    if reshaped.is_empty() {
+        return Ok(0);
+    }
+
+    let pages_by_target: HashMap<PathBuf, Vec<String>> = reshaped
+        .iter()
+        .map(|(first, pages)| {
+            let names = pages.iter().map(|page| file_name_of(page)).collect();
+            (normalize_path(&opf_dir.join(first)), names)
+        })
+        .collect();
+    let base = path.parent().unwrap_or(opf_dir);
+
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    let content = html::parse_content(&bytes)?;
+    let mut changed = 0;
+
+    // Both lists are taken before anything changes, so the images added below
+    // are not visited in turn.
+    let svgs = xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))?;
+    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
+
+    for mut svg in svgs {
+        let inner =
+            xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
+        let [image] = inner.as_slice() else {
+            continue;
+        };
+        let href = image
+            .get_attribute_ns("href", NS_XLINK)
+            .or_else(|| image.get_attribute("href"))
+            .unwrap_or_default();
+        let Some(reference) = Reference::parse(&href) else {
+            continue;
+        };
+        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+            continue;
+        };
+        let Some(mut parent) = svg.get_parent() else {
+            continue;
+        };
+
+        let namespace = parent.get_namespace();
+        for page in pages {
+            let Ok(mut img) = parent.new_child(namespace.clone(), "img") else {
+                continue;
+            };
+            img.set_attribute("src", &reference.with_name(page)).ok();
+            img.set_attribute("alt", "").ok();
+            img.set_attribute("style", FULL_PAGE_STYLE).ok();
+            svg.add_prev_sibling(&mut img).ok();
+        }
+        svg.unlink();
+        changed += 1;
+    }
+
+    for mut image in images {
+        let src = image.get_attribute("src").unwrap_or_default();
+        let Some(reference) = Reference::parse(&src) else {
+            continue;
+        };
+        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+            continue;
+        };
+        let Some(mut parent) = image.get_parent() else {
+            continue;
+        };
+
+        image.remove_attribute("width").ok();
+        image.remove_attribute("height").ok();
+
+        // Each further page is shown the way the first is: same class, style
+        // and alt text, but no id, which must stay unique.
+        let attributes = image.get_attributes_ns();
+        let mut previous = image.clone();
+        for page in &pages[1..] {
+            let Ok(mut copy) = parent.new_child(image.get_namespace(), "img") else {
+                continue;
+            };
+            for ((name, namespace), value) in &attributes {
+                match namespace {
+                    Some(namespace) => copy.set_attribute_ns(name, value, namespace).ok(),
+                    None if name != "id" => copy.set_attribute(name, value).ok(),
+                    None => None,
+                };
+            }
+            copy.set_attribute("src", &reference.with_name(page)).ok();
+            previous.add_next_sibling(&mut copy).ok();
+            previous = copy;
+        }
+        changed += 1;
+    }
+
+    if changed > 0 {
+        fs::write(path, html::serialize_content(&content)).map_err(|e| Error::io(path, e))?;
+    }
+
+    Ok(changed)
 }
 
 /// Replace SVG-wrapped cover images with a plain `<img>`.
@@ -418,11 +584,7 @@ pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
             };
             img.set_attribute("src", &target).ok();
             img.set_attribute("alt", "Cover").ok();
-            img.set_attribute(
-                "style",
-                "max-width:100%;max-height:100%;display:block;margin:auto",
-            )
-            .ok();
+            img.set_attribute("style", FULL_PAGE_STYLE).ok();
 
             // `new_child` appends; move it into the SVG's position.
             svg.add_prev_sibling(&mut img).ok();
@@ -533,65 +695,186 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Fall back to matching on filename alone, for references written relative to
-/// a different directory than the manifest entry.
-fn match_by_filename<'a>(
-    href: &str,
+/// Resolve `.` and `..` without touching the filesystem, so that two spellings
+/// of one path compare equal.
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                }
+                // Nothing lies above the root.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normal.push(".."),
+            },
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// Find a rename by filename alone, for a path that leads nowhere — one
+/// written relative to the wrong directory, say. Only an unambiguous answer
+/// counts: images sharing a filename in different directories can be renamed
+/// differently, and then the filename cannot say which was meant.
+fn rename_by_filename<'a>(
+    path: &str,
     rename_map: &'a BTreeMap<String, String>,
 ) -> Option<&'a String> {
-    let name = file_name_of(href);
+    let name = file_name_of(path);
     if name.is_empty() {
         return None;
     }
-    rename_map
+
+    let mut candidates = rename_map
         .iter()
-        .find(|(old, _)| file_name_of(old) == name)
-        .map(|(_, new)| new)
+        .filter(|(old, _)| file_name_of(old) == name)
+        .map(|(_, new)| new);
+    let first = candidates.next()?;
+    let new_name = file_name_of(first);
+
+    candidates
+        .all(|other| file_name_of(other) == new_name)
+        .then_some(first)
 }
 
-/// Rewrite a single reference, preserving the directory prefix it was written
-/// with and only swapping the filename.
-fn resolve_reference(reference: &str, rename_map: &BTreeMap<String, String>) -> String {
-    if reference.is_empty() {
-        return reference.to_string();
-    }
+/// The rename map, indexed by the file each entry was renamed from.
+struct Renames<'a> {
+    rename_map: &'a BTreeMap<String, String>,
+    by_source: HashMap<PathBuf, &'a String>,
+}
 
-    let decoded = decode(reference);
-    let name = file_name_of(&decoded);
-
-    for (old_path, new_path) in rename_map {
-        if name == file_name_of(old_path) {
-            return decoded.replace(&name, &file_name_of(new_path));
+impl<'a> Renames<'a> {
+    fn new(opf_dir: &Path, rename_map: &'a BTreeMap<String, String>) -> Self {
+        let by_source = rename_map
+            .iter()
+            .map(|(old, new)| (normalize_path(&opf_dir.join(old)), new))
+            .collect();
+        Self {
+            rename_map,
+            by_source,
         }
     }
 
-    reference.to_string()
+    /// The new filename of the file `path` leads to from `base`, if that file
+    /// was renamed.
+    fn new_name(&self, base: &Path, path: &str) -> Option<String> {
+        let target = normalize_path(&base.join(path));
+        if let Some(new) = self.by_source.get(&target) {
+            return Some(file_name_of(new));
+        }
+
+        // A path to a file that is still there names something that was not
+        // renamed, whatever its filename shares with something that was.
+        if target.is_file() {
+            return None;
+        }
+
+        rename_by_filename(path, self.rename_map).map(|new| file_name_of(new))
+    }
 }
 
-/// Rewrite `url(...)` targets in CSS text.
-fn rewrite_css_urls(css: &str, rename_map: &BTreeMap<String, String>) -> String {
+/// A reference to a file in the book, taken apart so that its filename can be
+/// swapped while everything else stays as written.
+struct Reference<'a> {
+    directory: &'a str,
+    name: &'a str,
+    /// Any query or fragment.
+    suffix: &'a str,
+}
+
+impl<'a> Reference<'a> {
+    /// `None` for what is not a file in the book: a same-document fragment,
+    /// or anything with a scheme, such as http: or data:.
+    fn parse(reference: &'a str) -> Option<Self> {
+        if reference.starts_with('#') || has_scheme(reference) {
+            return None;
+        }
+
+        let (path, suffix) =
+            reference.split_at(reference.find(['?', '#']).unwrap_or(reference.len()));
+        let (directory, name) = path.split_at(path.rfind('/').map_or(0, |slash| slash + 1));
+
+        (!name.is_empty()).then_some(Self {
+            directory,
+            name,
+            suffix,
+        })
+    }
+
+    /// The path, percent-decoded.
+    fn path(&self) -> String {
+        decode(&format!("{}{}", self.directory, self.name))
+    }
+
+    /// The file it names, from a document in `base`.
+    fn target(&self, base: &Path) -> PathBuf {
+        normalize_path(&base.join(self.path()))
+    }
+
+    /// The same reference naming `new_name`, percent-encoded only if the
+    /// original name was.
+    fn with_name(&self, new_name: &str) -> String {
+        let new_name = if decode(self.name) == self.name {
+            new_name.to_string()
+        } else {
+            encode(new_name)
+        };
+        format!("{}{new_name}{}", self.directory, self.suffix)
+    }
+}
+
+/// Rewrite one reference if the file it names was renamed. `None` leaves it
+/// alone.
+fn rewrite_reference(reference: &str, base: &Path, renames: &Renames) -> Option<String> {
+    let reference = Reference::parse(reference)?;
+    let new_name = renames.new_name(base, &reference.path())?;
+    Some(reference.with_name(&new_name))
+}
+
+/// Does `reference` open with a URL scheme rather than a path?
+fn has_scheme(reference: &str) -> bool {
+    reference.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// Rewrite the `url(...)` targets in CSS text that name a renamed file. Every
+/// other byte, quotes included, stays as written.
+fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
 
     while let Some(start) = rest.find("url(") {
-        let (before, from_url) = rest.split_at(start);
-        out.push_str(before);
-
-        let Some(end) = from_url.find(')') else {
+        let open = start + "url(".len();
+        let Some(close) = rest[open..].find(')').map(|end| open + end) else {
             // Unterminated url( — leave the remainder untouched.
-            out.push_str(from_url);
-            return out;
+            break;
         };
+        out.push_str(&rest[..open]);
 
-        let inner = &from_url["url(".len()..end];
-        let trimmed = inner.trim().trim_matches(['\'', '"']);
-        let rewritten = resolve_reference(trimmed, rename_map);
+        let inner = &rest[open..close];
+        let trimmed = inner.trim();
+        let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let target = quote.map_or(trimmed, |q| trimmed.trim_matches(q));
 
-        out.push_str("url(");
-        out.push_str(&rewritten);
-        out.push(')');
+        match (rewrite_reference(target, base, renames), quote) {
+            (Some(new), Some(q)) => {
+                out.push(q);
+                out.push_str(&new);
+                out.push(q);
+            }
+            (Some(new), None) => out.push_str(&new),
+            (None, _) => out.push_str(inner),
+        }
 
-        rest = &from_url[end + 1..];
+        rest = &rest[close..];
     }
 
     out.push_str(rest);

@@ -1,14 +1,17 @@
 //! The IPC surface, exercised without a window.
 //!
 //! `#[tauri::command]` leaves the underlying function callable, so everything
-//! except the one command needing an `AppHandle` can be tested directly. That
+//! except the one command needing an `AppHandle` can be tested directly — and
+//! that one does its work through `optimize_one`, which can be too. That
 //! matters because a screenshot only proves the page loaded — it says nothing
 //! about whether the data crossing the boundary is right.
 
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use epubkit_core::metadata::{FilenameFormat, FilenameOptions, TEMPLATE_FIELDS};
+use epubkit_core::settings::Settings;
 use epubkit_desktop::commands;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -62,6 +65,11 @@ const PNG: &[u8] = &[
     0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// Run the command to completion, as the window's async runtime would.
+fn inspect(paths: Vec<String>) -> Vec<commands::BookInfo> {
+    tauri::async_runtime::block_on(commands::inspect_books(paths)).expect("the command should run")
+}
+
 fn demo_epub(path: &Path) {
     write_epub(
         path,
@@ -91,7 +99,7 @@ fn inspecting_a_book_returns_what_the_list_shows() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let books = commands::inspect_books(vec![path.to_string_lossy().to_string()]);
+    let books = inspect(vec![path.to_string_lossy().to_string()]);
 
     assert_eq!(books.len(), 1);
     let book = &books[0];
@@ -109,7 +117,7 @@ fn a_cover_comes_back_as_a_data_url_the_page_can_render() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let cover = commands::inspect_books(vec![path.to_string_lossy().to_string()])
+    let cover = inspect(vec![path.to_string_lossy().to_string()])
         .swap_remove(0)
         .cover
         .expect("the book has a cover");
@@ -127,7 +135,7 @@ fn a_broken_file_fails_on_its_own() {
     demo_epub(&good);
     std::fs::write(&bad, b"this is not an epub").unwrap();
 
-    let books = commands::inspect_books(vec![
+    let books = inspect(vec![
         good.to_string_lossy().to_string(),
         bad.to_string_lossy().to_string(),
         dir.path()
@@ -173,7 +181,7 @@ fn a_drm_protected_book_says_so_before_anything_is_processed() {
         ],
     );
 
-    let book = commands::inspect_books(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
     let message = book.error.expect("DRM should be reported");
     assert!(message.contains("DRM"), "{message}");
 }
@@ -186,7 +194,7 @@ fn what_crosses_the_boundary_is_shaped_the_way_the_page_expects() {
     let path = dir.path().join("book.epub");
     demo_epub(&path);
 
-    let book = commands::inspect_books(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
     let json = serde_json::to_value(&book).unwrap();
 
     for field in [
@@ -208,7 +216,109 @@ fn what_crosses_the_boundary_is_shaped_the_way_the_page_expects() {
     }
 }
 
+// ------------------------------------------------------------------- naming
+
+fn job(path: &Path) -> commands::Job {
+    commands::Job {
+        path: path.to_string_lossy().to_string(),
+        title: None,
+        author: None,
+    }
+}
+
+fn naming(format: FilenameFormat) -> Settings {
+    Settings {
+        filename: FilenameOptions {
+            format,
+            ..FilenameOptions::default()
+        },
+        ..Settings::default()
+    }
+}
+
+/// The window names its books as chosen, not only the CLI.
+#[test]
+fn a_book_is_written_under_the_chosen_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book.epub");
+    demo_epub(&book);
+    let out = tempfile::tempdir().unwrap();
+
+    let outcome = commands::optimize_one(
+        &job(&book),
+        out.path(),
+        &naming(FilenameFormat::TitleAuthor),
+        0,
+        |_, _| {},
+    );
+
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let output = PathBuf::from(outcome.output.expect("a book was written"));
+    assert_eq!(
+        output.file_name().unwrap(),
+        "The Long Afternoon - Marguerite Vale.epub"
+    );
+    // And nothing but the book is left behind.
+    let left: Vec<_> = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, [output.file_name().unwrap()]);
+}
+
+/// Keeping the original name, in the folder the book came from, must not
+/// replace the book.
+#[test]
+fn keeping_the_original_name_never_replaces_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book.epub");
+    demo_epub(&book);
+    let before = std::fs::read(&book).unwrap();
+
+    let outcome = commands::optimize_one(
+        &job(&book),
+        dir.path(),
+        &naming(FilenameFormat::Original),
+        0,
+        |_, _| {},
+    );
+
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let output = PathBuf::from(outcome.output.expect("a book was written"));
+    assert_eq!(output.file_name().unwrap(), "book (2).epub");
+    assert_eq!(std::fs::read(&book).unwrap(), before);
+}
+
+/// The page asks before a run whether a template will do, and shows the
+/// answer as it is typed.
+#[test]
+fn a_filename_template_is_checked_before_a_run() {
+    assert_eq!(
+        commands::check_filename_template("{author} - {title}".into()).unwrap(),
+        "Marguerite Vale - The Long Afternoon.epub"
+    );
+
+    let error = commands::check_filename_template("{publisher}".into()).unwrap_err();
+    assert!(error.contains("{publisher}"), "{error}");
+}
+
 // ------------------------------------------------------- the page's contract
+
+fn page() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html"))
+        .expect("the page should be readable")
+}
+
+/// The values of every `name="…"` attribute on the page, in order.
+fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
+    let marker = format!("{name}=\"");
+    html.match_indices(&marker)
+        .map(|(at, _)| {
+            let rest = &html[at + marker.len()..];
+            &rest[..rest.find('"').expect("unterminated attribute")]
+        })
+        .collect()
+}
 
 /// Every `data-option` the page binds to must exist in the serialized options.
 ///
@@ -222,16 +332,8 @@ fn what_crosses_the_boundary_is_shaped_the_way_the_page_expects() {
 /// cannot drift apart without this noticing.
 #[test]
 fn the_page_binds_to_option_keys_that_exist() {
-    let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html"))
-        .expect("the page should be readable");
-
-    let bound: Vec<&str> = html
-        .match_indices("data-option=\"")
-        .map(|(at, marker)| {
-            let rest = &html[at + marker.len()..];
-            &rest[..rest.find('"').expect("unterminated data-option")]
-        })
-        .collect();
+    let html = page();
+    let bound = attribute_values(&html, "data-option");
 
     assert!(
         bound.len() >= 7,
@@ -261,13 +363,53 @@ fn the_page_binds_to_option_keys_that_exist() {
     }
 }
 
+/// The page offers every way of naming a book, under the names the settings
+/// carry — it writes the one clicked straight into `settings.filename`.
+#[test]
+fn the_page_offers_every_filename_format() {
+    let html = page();
+    let offered = attribute_values(&html, "data-filename-format");
+
+    let names: Vec<&str> = FilenameFormat::ALL.iter().map(|f| f.name()).collect();
+    assert_eq!(offered, names);
+
+    for format in FilenameFormat::ALL {
+        assert_eq!(serde_json::to_value(format).unwrap(), format.name());
+    }
+}
+
+/// The fields the page lists for a template are the ones the core fills in.
+#[test]
+fn the_page_lists_every_template_field() {
+    let html = page();
+    let marker = "id=\"filename-fields\">";
+    let at = html
+        .find(marker)
+        .expect("the page lists the template fields")
+        + marker.len();
+    let note = &html[at..at + html[at..].find('<').expect("unterminated note")];
+
+    let listed: Vec<&str> = note
+        .split('{')
+        .skip(1)
+        .map(|rest| &rest[..rest.find('}').expect("unterminated field")])
+        .collect();
+    assert_eq!(listed, TEMPLATE_FIELDS);
+}
+
 /// The settings payload the page reads has to carry these under these names.
 #[test]
 fn the_settings_payload_is_shaped_the_way_the_page_expects() {
     let json = serde_json::to_value(epubkit_core::settings::Settings::default()).unwrap();
 
-    for field in ["device", "options", "active", "presets"] {
+    for field in ["device", "options", "active", "presets", "filename"] {
         assert!(json.get(field).is_some(), "settings is missing '{field}'");
+    }
+    for field in ["format", "template"] {
+        assert!(
+            json["filename"].get(field).is_some(),
+            "settings.filename is missing '{field}'"
+        );
     }
 
     let mut settings = epubkit_core::settings::Settings::default();
@@ -278,4 +420,56 @@ fn the_settings_payload_is_shaped_the_way_the_page_expects() {
     for field in ["id", "name", "options"] {
         assert!(preset.get(field).is_some(), "a preset is missing '{field}'");
     }
+}
+
+/// The cover's href is a URL relative to the package document, so a space in
+/// its name arrives as `%20`.
+#[test]
+fn a_cover_whose_name_needs_escaping_still_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("book.epub");
+    let opf = String::from_utf8(OPF.to_vec())
+        .unwrap()
+        .replace(r#"href="cover.png""#, r#"href="cover%20art.png""#);
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover art.png", PNG),
+        ],
+    );
+
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    assert!(book.cover.is_some(), "{:?}", book.error);
+}
+
+/// The cover's href comes from the book. It must never lead the app to read a
+/// file of the user's into the page.
+#[test]
+fn a_cover_href_cannot_reach_a_file_outside_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.png");
+    std::fs::write(&secret, PNG).unwrap();
+    let path = dir.path().join("book.epub");
+
+    let opf = String::from_utf8(OPF.to_vec()).unwrap().replace(
+        r#"href="cover.png""#,
+        &format!(r#"href="{}""#, secret.display()),
+    );
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+        ],
+    );
+
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+    assert!(book.error.is_none(), "{:?}", book.error);
+    assert!(book.cover.is_none(), "the cover came from outside the book");
 }

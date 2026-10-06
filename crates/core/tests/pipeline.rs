@@ -374,3 +374,473 @@ fn a_size_increase_is_described_as_an_increase() {
     assert!(summary.contains("increase"), "{summary}");
     assert!(!summary.contains('-'), "no negative percentages: {summary}");
 }
+
+// ------------------------------------------------------ image name collisions
+
+/// A square of one grey, so a test can tell which image ended up where.
+fn solid(format: image::ImageFormat, grey: u8) -> Vec<u8> {
+    let square = image::GrayImage::from_pixel(64, 64, image::Luma([grey]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(square)
+        .write_to(&mut std::io::Cursor::new(&mut out), format)
+        .expect("encode fixture image");
+    out
+}
+
+/// Optimize a book whose manifest lists `images` in the order given and whose
+/// one chapter, in a subdirectory of its own, shows each of them. Returns the
+/// unpacked output.
+fn convert_images_book(images: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
+    let body: String = images
+        .iter()
+        .map(|(href, _)| format!(r#"<p><img src="../{href}" alt=""/></p>"#))
+        .collect();
+    optimize_book(images, &body, &ProcessingOptions::default())
+}
+
+/// Optimize a book whose manifest lists `images` and whose one chapter, in a
+/// subdirectory of its own, has `body`. Returns the unpacked output.
+fn optimize_book(
+    images: &[(&str, Vec<u8>)],
+    body: &str,
+    options: &ProcessingOptions,
+) -> tempfile::TempDir {
+    let mut manifest = String::new();
+    for (index, (href, _)) in images.iter().enumerate() {
+        let media_type = if href.to_ascii_lowercase().ends_with(".png") {
+            "image/png"
+        } else {
+            "image/jpeg"
+        };
+        manifest.push_str(&format!(
+            r#"<item id="img{index}" href="{href}" media-type="{media_type}"/>"#
+        ));
+    }
+
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:images</dc:identifier>
+    <dc:title>Images</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    {manifest}
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>{body}</body></html>
+"#
+    );
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".into(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".into(),
+            common::CONTAINER_XML.to_vec(),
+        ),
+        ("OEBPS/content.opf".into(), opf.into_bytes()),
+        ("OEBPS/text/chapter1.xhtml".into(), chapter.into_bytes()),
+    ];
+    for (href, bytes) in images {
+        entries.push((format!("OEBPS/{href}"), bytes.clone()));
+    }
+    let entries: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(&input, &entries);
+    process_epub(&input, &output, options, |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    work
+}
+
+/// The chapter's image references, in order.
+fn chapter_sources(work: &Path) -> Vec<String> {
+    let chapter = fs::read_to_string(work.join("OEBPS/text/chapter1.xhtml")).unwrap();
+    chapter
+        .split(r#"src=""#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// The grey of each image the chapter shows, followed through its own
+/// references, to the nearest of black, mid-grey and white.
+fn shown_greys(work: &Path) -> Vec<u8> {
+    chapter_sources(work)
+        .iter()
+        .map(|src| {
+            let path = work.join("OEBPS/text").join(src);
+            let image = image::open(&path)
+                .unwrap_or_else(|e| panic!("{src} does not lead to an image: {e}"))
+                .to_luma8();
+            let mean =
+                image.pixels().map(|p| u64::from(p[0])).sum::<u64>() / image.pixels().len() as u64;
+            [0u8, 128, 255]
+                .into_iter()
+                .min_by_key(|level| (i64::from(*level) - mean as i64).abs())
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Every image in the manifest is in the archive, under an href of its own,
+/// and every image in the archive is in the manifest.
+fn assert_manifest_matches_archive(work: &Path) {
+    let opf = xml::parse_file(&work.join("OEBPS/content.opf")).unwrap();
+    let hrefs: Vec<String> = structure::manifest_items(&opf)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.media_type.starts_with("image/"))
+        .map(|item| item.decoded_href())
+        .collect();
+
+    for href in &hrefs {
+        assert!(work.join("OEBPS").join(href).is_file(), "{href} is missing");
+    }
+    let unique: std::collections::BTreeSet<&String> = hrefs.iter().collect();
+    assert_eq!(
+        unique.len(),
+        hrefs.len(),
+        "two items share a file: {hrefs:?}"
+    );
+
+    let declared: std::collections::BTreeSet<std::path::PathBuf> = hrefs
+        .iter()
+        .map(|href| work.join("OEBPS").join(href))
+        .collect();
+    for file in image_files(&work.join("OEBPS")) {
+        assert!(
+            declared.contains(&file),
+            "{} is packaged but not in the manifest",
+            file.display()
+        );
+    }
+}
+
+fn image_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(image_files(&path));
+        } else if image::ImageFormat::from_path(&path).is_ok() {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Upstream's issue #11: `image.png` and `image.jpeg` both became `image.jpg`,
+/// and whichever was converted second replaced the first.
+#[test]
+fn images_that_would_share_a_name_are_both_kept() {
+    let work = convert_images_book(&[
+        ("images/image.png", solid(image::ImageFormat::Png, 0)),
+        ("images/image.jpeg", solid(image::ImageFormat::Jpeg, 255)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
+/// A converted image must not land on another image that already has the name
+/// it wants.
+#[test]
+fn a_conversion_never_overwrites_an_existing_image() {
+    let work = convert_images_book(&[
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+        ("images/plate.jpg", solid(image::ImageFormat::Jpeg, 255)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
+/// macOS and Windows hold `IMG.JPG` and `IMG.jpg` as one file, so converting
+/// `IMG.JPG` under the lowercase name and then deleting the source deleted the
+/// output with it. Replaced in place, it keeps its own name.
+#[test]
+fn an_uppercase_jpg_is_replaced_under_its_own_name() {
+    let work =
+        convert_images_book(&[("images/IMG_0001.JPG", solid(image::ImageFormat::Jpeg, 128))]);
+
+    assert_eq!(chapter_sources(work.path()), ["../images/IMG_0001.JPG"]);
+    assert_eq!(shown_greys(work.path()), [128]);
+    assert_manifest_matches_archive(work.path());
+}
+
+/// Images that share a filename in different directories can now be renamed
+/// differently, so a reference has to be followed by its path, not matched by
+/// its filename.
+#[test]
+fn same_named_images_in_different_directories_keep_their_own_references() {
+    let work = convert_images_book(&[
+        ("a/pic.png", solid(image::ImageFormat::Png, 0)),
+        ("b/pic.png", solid(image::ImageFormat::Png, 255)),
+        ("b/pic.jpg", solid(image::ImageFormat::Jpeg, 128)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255, 128],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
+// ---------------------------------------------------------- Light Novel mode
+
+/// A double-page spread: black on the left, white on the right.
+fn spread() -> Vec<u8> {
+    let picture = image::GrayImage::from_fn(1000, 400, |x, _| {
+        image::Luma([if x < 500 { 0 } else { 255 }])
+    });
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(picture)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encode fixture image");
+    out
+}
+
+fn light_novel() -> ProcessingOptions {
+    ProcessingOptions {
+        light_novel_mode: true,
+        ..ProcessingOptions::default()
+    }
+}
+
+fn read_chapter(work: &Path) -> String {
+    fs::read_to_string(work.join("OEBPS/text/chapter1.xhtml")).unwrap()
+}
+
+/// Light Novel mode splits a spread into two pages, the right half first for
+/// right-to-left reading. Both pages have to reach the manifest and the
+/// chapter, or half the picture is lost.
+#[test]
+fn both_halves_of_a_split_spread_are_shown_right_half_first() {
+    let work = optimize_book(
+        &[("images/spread.png", spread())],
+        r#"<p><img src="../images/spread.png" alt="A spread" class="plate" width="1000" height="400"/></p>"#,
+        &light_novel(),
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [255, 0]);
+    assert_manifest_matches_archive(work.path());
+
+    // The second page is shown like the first, but the spread's own size
+    // describes neither half.
+    let chapter = read_chapter(work.path());
+    assert_eq!(chapter.matches(r#"class="plate""#).count(), 2, "{chapter}");
+    assert!(!chapter.contains("width="), "{chapter}");
+    assert!(!chapter.contains("height="), "{chapter}");
+}
+
+/// Full-page illustrations are often wrapped in an SVG sized to the picture.
+/// A wrapper sized for the spread would squash each half into it, so it gives
+/// way to one plain image per page.
+#[test]
+fn an_svg_wrapped_spread_becomes_one_image_per_page() {
+    let work = optimize_book(
+        &[("images/spread.png", spread())],
+        r#"<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="100%" height="100%" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread.png"/></svg></div>"#,
+        &light_novel(),
+    );
+
+    let chapter = read_chapter(work.path());
+    assert!(!chapter.contains("<svg"), "{chapter}");
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [255, 0]);
+    assert_manifest_matches_archive(work.path());
+}
+
+#[test]
+fn the_summary_counts_a_split_spread_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", DEMO_OPF.as_bytes()),
+            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/chapter2.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/styles/main.css", DEMO_CSS.as_bytes()),
+            ("OEBPS/fonts/body.otf", b"not really a font"),
+            ("OEBPS/images/cover.png", &common::png_gradient(300, 400)),
+            ("OEBPS/images/plate.png", &spread()),
+        ],
+    );
+
+    let report = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &light_novel(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.images_total, 2);
+    assert_eq!(report.images_converted, 2);
+    assert_eq!(report.spreads_split, 1);
+    let summary = report.summary();
+    assert!(summary.contains("Converted 2/2 images"), "{summary}");
+    assert!(summary.contains("Split 1 double-page spread"), "{summary}");
+}
+
+// ------------------------------------------------- files that cannot be read
+
+/// The demo book, with some of its files replaced.
+fn demo_epub_with(path: &Path, replacements: &[(&str, &[u8])]) {
+    let cover = common::png_gradient(300, 400);
+    let plate = common::png_gradient(240, 160);
+    let mut entries: Vec<(&str, &[u8])> = vec![
+        ("mimetype", b"application/epub+zip"),
+        ("META-INF/container.xml", common::CONTAINER_XML),
+        ("OEBPS/content.opf", DEMO_OPF.as_bytes()),
+        ("OEBPS/chapter1.xhtml", MALFORMED_CHAPTER.as_bytes()),
+        ("OEBPS/chapter2.xhtml", CLEAN_CHAPTER.as_bytes()),
+        ("OEBPS/styles/main.css", DEMO_CSS.as_bytes()),
+        (
+            "OEBPS/fonts/body.otf",
+            b"not really a font, but named like one",
+        ),
+        ("OEBPS/images/cover.png", &cover),
+        ("OEBPS/images/plate.png", &plate),
+    ];
+    for (name, bytes) in replacements {
+        let entry = entries.iter_mut().find(|(n, _)| n == name).unwrap();
+        entry.1 = bytes;
+    }
+    common::write_epub(path, &entries);
+}
+
+/// A stylesheet saved in a legacy encoding is read in it, and written back as
+/// UTF-8 that says so, rather than failing the book.
+#[test]
+fn a_stylesheet_in_a_legacy_encoding_does_not_sink_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    demo_epub_with(
+        &input,
+        &[(
+            "OEBPS/styles/main.css",
+            b"@charset \"iso-8859-1\";\n/* \xa9 Verlag */\n.lead { background: url(../images/plate.png); }\n",
+        )],
+    );
+
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
+        .expect("one stylesheet must not sink the book");
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    let css = String::from_utf8(fs::read(work.path().join("OEBPS/styles/main.css")).unwrap())
+        .expect("a rewritten stylesheet is UTF-8");
+    assert!(css.contains("\u{a9} Verlag"), "{css}");
+    assert!(css.contains("plate.jpg"), "{css}");
+    assert!(
+        !css.to_ascii_lowercase().contains("iso-8859-1"),
+        "the declaration must match the bytes: {css}"
+    );
+}
+
+/// A chapter nothing can parse, such as an empty file, is left as it was
+/// rather than failing the whole book, and the report says so.
+#[test]
+fn an_unreadable_chapter_is_left_alone_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", b"")]);
+
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
+        .expect("one chapter must not sink the book");
+
+    assert_eq!(report.documents_unreadable, 1);
+    assert!(
+        report.summary().contains("1 unreadable document"),
+        "{}",
+        report.summary()
+    );
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    assert!(fs::read(work.path().join("OEBPS/chapter2.xhtml"))
+        .unwrap()
+        .is_empty());
+    let one = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    assert!(
+        one.contains("images/plate.jpg"),
+        "the rest of the book is done: {one}"
+    );
+}
+
+// ------------------------------------------------------------ output names
+
+#[test]
+fn the_output_is_named_as_chosen() {
+    let options = ProcessingOptions {
+        filename: metadata::FilenameOptions {
+            format: metadata::FilenameFormat::Custom,
+            template: "{title} ({original})".into(),
+        },
+        ..ProcessingOptions::default()
+    };
+    let (_, report) = run(options);
+    assert_eq!(report.output_filename, "The Long Afternoon (in).epub");
+}
+
+/// A template that cannot name the book fails before the work, not after.
+#[test]
+fn a_bad_template_is_refused_before_anything_is_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    write_demo_epub(&input);
+
+    let options = ProcessingOptions {
+        filename: metadata::FilenameOptions {
+            format: metadata::FilenameFormat::Custom,
+            template: "{publisher}".into(),
+        },
+        ..ProcessingOptions::default()
+    };
+    let mut steps = 0;
+    let error = process_epub(&input, &output, &options, |_, _| steps += 1).unwrap_err();
+
+    assert!(error.to_string().contains("{publisher}"), "{error}");
+    assert_eq!(steps, 0, "no step should have started");
+    assert!(!output.exists());
+}

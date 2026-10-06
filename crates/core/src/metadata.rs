@@ -1,11 +1,17 @@
 //! OPF metadata: extraction, user edits, store-tag stripping, and output
 //! filenames. Port of `metadata_handler.py`.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
 use libxml::tree::{Document, Node};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::xml;
-use crate::Result;
+use crate::{Error, Result};
 
 pub const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
 pub const NS_OPF: &str = "http://www.idpf.org/2007/opf";
@@ -45,10 +51,86 @@ const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
 /// Leave room for the `.epub` extension within common filesystem limits.
 const MAX_FILENAME_CHARS: usize = 200;
 
+/// A filename template longer than a filename is a mistake.
+const MAX_TEMPLATE_CHARS: usize = 200;
+
+/// The year in a `dc:date`, which may be a bare year, a date, or a timestamp.
+static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{4})\b").unwrap());
+
+/// What a custom filename template can fill in.
+pub const TEMPLATE_FIELDS: &[&str] = &[
+    "title",
+    "author",
+    "year",
+    "series",
+    "series_index",
+    "language",
+    "original",
+];
+
+/// How an optimized book's file is named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilenameFormat {
+    /// The name of the file it came from.
+    Original,
+    TitleAuthor,
+    #[default]
+    AuthorTitle,
+    Title,
+    /// Filled in from [`FilenameOptions::template`].
+    Custom,
+}
+
+impl FilenameFormat {
+    pub const ALL: [FilenameFormat; 5] = [
+        FilenameFormat::Original,
+        FilenameFormat::TitleAuthor,
+        FilenameFormat::AuthorTitle,
+        FilenameFormat::Title,
+        FilenameFormat::Custom,
+    ];
+
+    /// As written in the settings file, on the command line and in the page.
+    pub fn name(self) -> &'static str {
+        match self {
+            FilenameFormat::Original => "original",
+            FilenameFormat::TitleAuthor => "title-author",
+            FilenameFormat::AuthorTitle => "author-title",
+            FilenameFormat::Title => "title",
+            FilenameFormat::Custom => "custom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|format| format.name() == name)
+    }
+}
+
+/// The chosen [`FilenameFormat`], and the template `Custom` uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilenameOptions {
+    pub format: FilenameFormat,
+    /// Kept whatever the format, so choosing Custom again brings it back.
+    pub template: String,
+}
+
+impl Default for FilenameOptions {
+    fn default() -> Self {
+        Self {
+            format: FilenameFormat::AuthorTitle,
+            template: "{title} - {author}".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
     pub title: String,
     pub author: String,
+    /// From `dc:date`, the first four-digit year in it.
+    pub year: String,
     pub series: String,
     pub series_index: String,
     pub language: String,
@@ -76,6 +158,10 @@ pub fn extract_metadata(doc: &Document) -> Result<Metadata> {
     let mut metadata = Metadata {
         title: dc_text(doc, "title")?,
         author: dc_text(doc, "creator")?,
+        year: YEAR
+            .captures(&dc_text(doc, "date")?)
+            .map(|found| found[1].to_string())
+            .unwrap_or_default(),
         language: dc_text(doc, "language")?,
         ..Metadata::default()
     };
@@ -170,26 +256,90 @@ pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
 /// Build an `Author - Title.epub` filename, degrading gracefully when either
 /// field is missing.
 pub fn format_filename(title: &str, author: &str) -> String {
-    let title = title.trim();
-    let author = author.trim();
+    finish_filename(&join_parts(author.trim(), title.trim()))
+}
 
-    let name = match (author.is_empty(), title.is_empty()) {
-        (false, false) => format!("{author} - {title}"),
-        (true, false) => title.to_string(),
-        (false, true) => author.to_string(),
-        (true, true) => "optimized".to_string(),
+/// Name an optimized book from its metadata. `original` is the name of the
+/// file it came from.
+pub fn output_filename(
+    metadata: &Metadata,
+    options: &FilenameOptions,
+    original: &str,
+) -> Result<String> {
+    let title = metadata.title.trim();
+    let author = metadata.author.trim();
+    let original = Path::new(original)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let original = strip_epub_extension(&original);
+
+    let name = match options.format {
+        FilenameFormat::Original => original.to_string(),
+        FilenameFormat::TitleAuthor => join_parts(title, author),
+        FilenameFormat::AuthorTitle => join_parts(author, title),
+        FilenameFormat::Title => title.to_string(),
+        FilenameFormat::Custom => render_template(
+            &options.template,
+            &[
+                ("title", title),
+                ("author", author),
+                ("year", metadata.year.trim()),
+                ("series", metadata.series.trim()),
+                ("series_index", metadata.series_index.trim()),
+                ("language", metadata.language.trim()),
+                ("original", original),
+            ],
+        )?,
     };
 
-    let mut name = sanitize_filename(&name);
+    Ok(finish_filename(&name))
+}
 
-    // Truncate by characters, not bytes — the latter would split a multi-byte
-    // codepoint and panic.
-    if name.chars().count() > MAX_FILENAME_CHARS {
-        name = name.chars().take(MAX_FILENAME_CHARS).collect();
-        name = name.trim_end().to_string();
+/// Check a custom template, returning the name it gives an example book, or
+/// what is wrong with it.
+pub fn check_template(template: &str) -> Result<String> {
+    let example = Metadata {
+        title: "The Long Afternoon".into(),
+        author: "Marguerite Vale".into(),
+        year: "2026".into(),
+        series: "Afternoons".into(),
+        series_index: "2".into(),
+        language: "en".into(),
+        ..Metadata::default()
+    };
+    let options = FilenameOptions {
+        format: FilenameFormat::Custom,
+        template: template.to_string(),
+    };
+    output_filename(&example, &options, "long-afternoon.epub")
+}
+
+/// `preferred`, or if something is already there, the first free
+/// `name (2).epub`, `name (3).epub`, … beside it.
+///
+/// A name made from a book's metadata can be the name of a file that already
+/// exists — the book itself, when it keeps its original name — and a finished
+/// book should never replace it.
+pub fn unused_path(preferred: &Path) -> PathBuf {
+    // A dangling symlink counts as taken: copying to it would write wherever
+    // it points.
+    let taken = |path: &Path| path.symlink_metadata().is_ok();
+
+    if !taken(preferred) {
+        return preferred.to_path_buf();
     }
 
-    format!("{name}.epub")
+    let stem = preferred
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "optimized".to_string());
+    let parent = preferred.parent().unwrap_or(Path::new(""));
+
+    (2..)
+        .map(|n| parent.join(format!("{stem} ({n}).epub")))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused suffix always exists")
 }
 
 // ---------------------------------------------------------------- internals
@@ -258,6 +408,117 @@ fn find_cover_id(doc: &Document) -> Result<String> {
     Ok(String::new())
 }
 
+/// The fields that are present, joined with a dash.
+fn join_parts(first: &str, second: &str) -> String {
+    [first, second]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" - ")
+}
+
+fn strip_epub_extension(name: &str) -> &str {
+    match name.len().checked_sub(".epub".len()) {
+        Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".epub") => {
+            &name[..at]
+        }
+        _ => name,
+    }
+}
+
+/// Make a name a safe filename with an `.epub` extension.
+fn finish_filename(name: &str) -> String {
+    let mut name = sanitize_filename(strip_epub_extension(name.trim()));
+
+    // Truncate by characters, not bytes — the latter would split a multi-byte
+    // codepoint and panic.
+    if name.chars().count() > MAX_FILENAME_CHARS {
+        name = name.chars().take(MAX_FILENAME_CHARS).collect();
+        name = name.trim_end_matches([' ', '.', '-']).to_string();
+    }
+
+    // Nothing left, or nothing but dots, names no file.
+    if name.is_empty() {
+        name = "optimized".to_string();
+    }
+
+    format!("{name}.epub")
+}
+
+/// Fill in a custom template. `{field}` is replaced by its value, and `{{` and
+/// `}}` stand for literal braces; nothing else in braces is allowed.
+fn render_template(template: &str, fields: &[(&str, &str)]) -> Result<String> {
+    let invalid = |message: String| Err(Error::FilenameTemplate(message));
+
+    if template.trim().is_empty() {
+        return invalid("Custom filename template cannot be empty".into());
+    }
+    if template.chars().count() > MAX_TEMPLATE_CHARS {
+        return invalid(format!(
+            "Filename template is longer than {MAX_TEMPLATE_CHARS} characters"
+        ));
+    }
+
+    let mut out = String::new();
+    let mut unknown = BTreeSet::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut field = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{') | None => {
+                            return invalid(
+                                "A '{' in the filename template is never closed".into(),
+                            );
+                        }
+                        Some(c) => field.push(c),
+                    }
+                }
+                if field.contains([':', '!']) {
+                    return invalid(
+                        "Filename template fields do not support formatting options".into(),
+                    );
+                }
+                match fields.iter().find(|(name, _)| *name == field) {
+                    Some((_, value)) => out.push_str(value),
+                    None => {
+                        unknown.insert(format!("{{{field}}}"));
+                    }
+                }
+            }
+            '}' => {
+                return invalid(
+                    "A '}' in the filename template has no '{'; write '}}' for a literal one"
+                        .into(),
+                );
+            }
+            c => out.push(c),
+        }
+    }
+
+    if !unknown.is_empty() {
+        let names: Vec<String> = unknown.into_iter().collect();
+        return invalid(format!(
+            "Unknown filename template field: {}",
+            names.join(", ")
+        ));
+    }
+
+    Ok(out)
+}
+
 fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
 
@@ -286,5 +547,7 @@ fn sanitize_filename(name: &str) -> String {
         last = Some(ch);
     }
 
-    collapsed.trim().to_string()
+    // A name ending in a dot or a dash looks broken, and Windows drops a
+    // trailing dot altogether; leading ones hide the file or read as flags.
+    collapsed.trim_matches([' ', '.', '-']).to_string()
 }

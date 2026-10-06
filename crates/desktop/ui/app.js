@@ -27,6 +27,8 @@ const qualityValue = document.getElementById('quality-value');
 const statusLine = document.getElementById('status-line');
 const savePresetBtn = document.getElementById('save-preset-btn');
 const deletePresetBtn = document.getElementById('delete-preset-btn');
+const filenameTemplate = document.getElementById('filename-template');
+const filenameExample = document.getElementById('filename-example');
 
 /** Books currently listed, in the order they were added. */
 let books = [];
@@ -54,6 +56,7 @@ async function start() {
     renderDevices();
     renderPresets();
     renderOptions();
+    renderFilename();
     wireEvents();
     showReady();
 }
@@ -77,6 +80,7 @@ function applySettings(next) {
     settings = next;
     renderPresets();
     renderOptions();
+    renderFilename();
     showReady();
 }
 
@@ -92,9 +96,9 @@ function renderDevices() {
         button.innerHTML = `
             <span class="device-name">${escapeHtml(device.id.toUpperCase())}</span>
             <span class="device-desc">${device.width}&times;${device.height}</span>`;
-        button.addEventListener('click', async () => {
+        button.addEventListener('click', () => {
             settings.device = device.id;
-            await persist();
+            persist();
             renderDevices();
             showReady();
         });
@@ -133,12 +137,14 @@ async function selectPreset(id) {
     if (id === 'custom') {
         // Custom means "keep what is on screen"; there is nothing to restore.
         settings.active = 'custom';
-        await persist();
+        persist();
         renderPresets();
         return;
     }
 
     try {
+        // The core starts from the settings file, so it has to be up to date.
+        await flushPersist();
         applySettings(await invoke('select_preset', { id }));
     } catch (error) {
         setStatus(`Could not select that preset: ${error}`, true);
@@ -175,19 +181,68 @@ function markCustomized() {
     persist();
 }
 
+/// How finished books are named is remembered apart from the presets, like
+/// the device, so choosing one leaves it alone.
+function renderFilename() {
+    const { format, template } = settings.filename;
+
+    for (const button of document.querySelectorAll('[data-filename-format]')) {
+        button.classList.toggle('active', button.dataset.filenameFormat === format);
+    }
+    document.getElementById('filename-template-row').hidden = format !== 'custom';
+
+    // Rewriting the field while it is typed in would move the caret.
+    if (document.activeElement !== filenameTemplate) filenameTemplate.value = template;
+    if (format === 'custom') checkTemplate();
+}
+
+let templateChecks = 0;
+
+/// Show what the template makes of an example book, or what is wrong with it.
+async function checkTemplate() {
+    const check = ++templateChecks;
+    let message;
+    let ok = true;
+
+    try {
+        message = `e.g. ${await invoke('check_filename_template', { template: settings.filename.template })}`;
+    } catch (error) {
+        message = `${error}`;
+        ok = false;
+    }
+
+    // Answers can arrive out of order while typing; only the latest counts.
+    if (check !== templateChecks) return;
+    filenameExample.textContent = message;
+    filenameExample.classList.toggle('error-text', !ok);
+}
+
 let persistTimer = null;
 
-async function persist() {
+function persist() {
     // Dragging the quality slider fires on every pixel, so coalesce writes
     // rather than rewriting the settings file dozens of times a second.
     clearTimeout(persistTimer);
-    persistTimer = setTimeout(async () => {
-        try {
-            await invoke('save_settings', { settings });
-        } catch (error) {
-            setStatus(`Could not save settings: ${error}`, true);
-        }
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        save();
     }, 250);
+}
+
+/// Write a change that is still waiting, for a command that reads the file.
+async function flushPersist() {
+    if (persistTimer === null) return;
+    clearTimeout(persistTimer);
+    persistTimer = null;
+    await save();
+}
+
+async function save() {
+    try {
+        await invoke('save_settings', { settings });
+    } catch (error) {
+        setStatus(`Could not save settings: ${error}`, true);
+    }
 }
 
 // --------------------------------------------------------------------- books
@@ -220,7 +275,7 @@ function renderBooks() {
         card.className = `file-card ${book.error ? 'error' : ''}`;
 
         const cover = book.cover
-            ? `<img src="${book.cover}" alt="">`
+            ? `<img src="${escapeAttr(book.cover)}" alt="">`
             : '<div class="no-cover">No cover</div>';
 
         const meta = [book.author, book.series].filter(Boolean).join(' — ');
@@ -256,6 +311,17 @@ async function optimize() {
     if (jobs.length === 0) {
         setStatus('Nothing to do — every book listed has a problem.', true);
         return;
+    }
+
+    // Every book would fail on a template the core refuses, so say so first.
+    if (settings.filename.format === 'custom') {
+        try {
+            await invoke('check_filename_template', { template: settings.filename.template });
+        } catch (error) {
+            setStatus(`${error}`, true);
+            filenameTemplate.focus();
+            return;
+        }
     }
 
     const destination = await open({
@@ -317,8 +383,11 @@ function showResults(outcomes) {
             // smooth artwork can legitimately come out bigger.
             const label = change < 0 ? 'larger' : 'smaller';
 
+            // The name written, which is the report's unless that was taken.
+            const written = outcome.output ? basename(outcome.output) : report.outputFilename;
+
             card.innerHTML = `
-                <div class="result-header"><span class="filename">${escapeHtml(report.outputFilename)}</span></div>
+                <div class="result-header"><span class="filename">${escapeHtml(written)}</span></div>
                 <div class="result-size">
                     <span class="size-original">${formatBytes(report.originalSize)}</span>
                     <span class="size-arrow">&rarr;</span>
@@ -393,6 +462,20 @@ function wireEvents() {
         button.addEventListener('click', () => setQuality(Number(button.dataset.quality)));
     }
 
+    for (const button of document.querySelectorAll('[data-filename-format]')) {
+        button.addEventListener('click', () => {
+            settings.filename.format = button.dataset.filenameFormat;
+            renderFilename();
+            persist();
+            if (settings.filename.format === 'custom') filenameTemplate.focus();
+        });
+    }
+    filenameTemplate.addEventListener('input', () => {
+        settings.filename.template = filenameTemplate.value;
+        checkTemplate();
+        persist();
+    });
+
     // `prompt()` is a no-op in the macOS webview, so the name is asked for
     // inline instead.
     const namer = document.getElementById('preset-namer');
@@ -429,6 +512,7 @@ function wireEvents() {
     deletePresetBtn.addEventListener('click', async () => {
         const id = settings.active;
         try {
+            await flushPersist();
             applySettings(await invoke('delete_preset', { id }));
             setStatus('Preset deleted.');
         } catch (error) {

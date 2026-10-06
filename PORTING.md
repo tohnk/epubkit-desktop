@@ -101,7 +101,8 @@ pinned by tests:
   `the_page_binds_to_option_keys_that_exist` reads the real `index.html` and
   checks every binding against the real serialization, in both directions — so
   an option added to one and not the other fails the build rather than quietly
-  doing nothing.
+  doing nothing. The filename buttons and the template fields the page lists
+  are checked against the core the same way.
 
 ## Using the CLI
 
@@ -111,6 +112,7 @@ cargo run -p epubkit-cli -- validate  book.epub
 cargo run -p epubkit-cli -- roundtrip book.epub -o out.epub
 cargo run -p epubkit-cli -- repair    chapter.xhtml
 cargo run -p epubkit-cli -- optimize  book.epub
+cargo run -p epubkit-cli -- optimize  book.epub --filename-template '{series} {series_index} - {title}'
 cargo run -p epubkit-cli -- settings  show
 ```
 
@@ -133,12 +135,14 @@ that Custom now persists and can be given a name.
 
 The device is deliberately *not* part of a preset — it describes the hardware
 on the desk, not a processing taste — so it is sticky on its own and survives
-every preset change.
+every preset change. How finished books are named is kept apart the same way:
+it is about the user's library, not about any one way of processing.
 
 On the CLI, saved settings are the base and the flags are overrides: each
 `--no-*` flag can only turn something off, so an option nobody mentioned keeps
-whatever it had. Metadata edits (`--title`, `--author`) are about one book and
-are never persisted.
+whatever it had. `--filename` and `--filename-template` are remembered too.
+Metadata edits (`--title`, `--author`) are about one book and are never
+persisted.
 
 ## Validating against the reference
 
@@ -205,6 +209,33 @@ whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
 
+### Malformed chapters are read as UTF-8
+
+The reference's recovery parser left the encoding to libxml2, which obeys a
+`<meta>` charset that is often stale, and which in recent releases (2.14) reads
+a chapter declaring no charset as ISO-8859-1. Either way valid UTF-8 came out
+as mojibake: "ä" as "Ã¤". Upstream fixed this after the fork
+(b1rdmania/epubkit#8) by forcing UTF-8 whenever the bytes are valid UTF-8. The
+port does the same, so here it matches upstream rather than `7cf9a65`.
+
+It cannot do so by passing the encoding: the `libxml` crate's `encoding`
+option is unsound in 0.3.21, freeing the C string it builds before libxml2
+reads it. `html::parse_content` instead sets `ignore_enc` and, when there is
+anything non-ASCII to decode, prefixes a byte order mark. `tests/encoding.rs`
+pins the result, and must pass against libxml2 2.9 and 2.14 alike, which
+disagree about the default.
+
+A malformed chapter whose bytes are not UTF-8 is decoded before the parser
+sees it, and is parsed as UTF-8 in turn. A byte order mark decides, then an
+encoding named in the XML declaration, then one named in a `<meta>`, and
+otherwise windows-1252, which is also what browsers take a declared
+ISO-8859-1 to mean. Upstream still leaves such a chapter to libxml2, whose
+HTML parser ignores an encoding named in an XML declaration: 2.9 reads on as
+Latin-1 and 2.14 as UTF-8, so a Shift_JIS or windows-1251 chapter came out as
+nonsense, and under 2.14 Latin-1 accents came out as replacement characters.
+Both releases also read windows-1252's curly quotes and dashes as Latin-1's
+invisible control characters.
+
 ### Prose after `<code>` and `<pre>` is cleaned
 
 lxml stores the text *following* an element as that element's `tail`, so
@@ -213,14 +244,30 @@ after it. libxml2 keeps that text in its own sibling node, so only what is
 genuinely inside a skipped element is spared. A book with inline `<code>` will
 differ here.
 
+### Mojibake is repaired before the other text fixes
+
+`text_cleaner` repairs mojibake after normalizing quotes, so a repaired quote
+escaped the normalization every intact one got, and one pattern could never
+match at all: "à" read as Latin-1 ends in a no-break space, which quote
+normalization had already made a plain one. The port repairs encoding first.
+The table is upstream's current one (b1rdmania/epubkit#8), which adds UTF-8
+punctuation, "ß", the acute vowels and the capital umlauts to what `7cf9a65`
+had.
+
 ### CSS goes through a real parser
 
 `cssutils` is prone to dropping comments and reformatting at-rules. The port
 uses `lightningcss`, so comments, `@import` and `@media` blocks survive a
-round-trip. Rule *selection* is unchanged: only top-level style rules are
-considered for removal, a rule survives if any part of any of its selectors is
-in use, and anything with a pseudo-class, pseudo-element or attribute selector
-is kept outright.
+round-trip. Rule *selection* is unchanged in outline: only top-level style
+rules are considered for removal, a rule survives if any part of any of its
+selectors is in use, and anything with a pseudo-class, pseudo-element or
+attribute selector is kept outright.
+
+Two details differ. Names are read as CSS defines them, so one may begin with
+a non-ASCII character; the reference wanted ASCII there, and removed a rule
+like `.überschrift` while the book was using it. And a selector with an
+escaped name, such as `.\31 st` for the class `1st`, is kept outright too,
+since reading escapes is beyond this scan.
 
 Note that `lightningcss` is pre-1.0 (currently an alpha), so its API may move
 under a future upgrade. It is confined to `core::css`.
@@ -301,6 +348,65 @@ not ported: it needs text rendering, which needs a bundled typeface, and the
 reference's own fallback (`ImageFont.load_default()`) produces an unreadable
 bitmap-font cover on any machine without DejaVu or Helvetica. A book with no
 cover comes out with no cover.
+
+### Converted images never overwrite each other
+
+The reference names every converted image `stem.jpg` and writes it without
+looking, so `cover.png` and `cover.jpeg` both became `cover.jpg` and one
+silently replaced the other (upstream's issue #11), as did `plate.png` and an
+existing `plate.jpg`. A case-insensitive filesystem made it worse: `IMG.JPG`
+was written as `IMG.jpg`, which there is the same file, and then deleted as
+the old one.
+
+The port gives each output a name nothing else in its directory has,
+ignoring case, appending `-2`, `-3`… where it must, and an image that converts
+to its own name keeps its exact spelling. Since images sharing a filename can
+now be renamed differently, a reference is followed by its path from the
+document that makes it, falling back to the bare filename only when the path
+leads nowhere and the filename is unambiguous. Only the filename in a
+reference changes; its directory, fragment, percent-encoding and quotes stay
+as written, and links to other sites are left alone.
+
+### Light Novel mode keeps every page it makes
+
+The reference split a double-page spread into two images but pointed the book
+at only the last, the left half; the right half, which comes first, was
+packaged and never shown. The port declares every page in the manifest and
+shows them in reading order where the spread was, each the way the spread
+was shown, minus the `width` and `height` that described it. An SVG wrapper,
+common around full-page illustrations and sized to the spread in its viewBox,
+gives way to a plain image per page. A rotated image sheds its old size and
+wrapper the same way. The report counts a split spread as one image.
+
+### One unreadable file does not sink the book
+
+A chapter nothing can parse, an empty or blank file say, is left exactly as
+it was, as the reference left it, and the report counts it; every other step
+works on the chapters that did parse. libxml2 2.14 "recovers" an empty file
+into a document with no root element, which would serialize to a bare
+declaration, so that counts as unreadable too.
+
+Stylesheets are decoded as browsers decode them, from a byte order mark, then
+an `@charset` naming a legacy encoding; otherwise as UTF-8 if the bytes are
+valid UTF-8, and as windows-1252 if not. The reference read them as UTF-8 and
+dropped what did not fit. One the run rewrites is saved as UTF-8, its
+`@charset` rewritten to match; one it leaves alone keeps its bytes.
+
+### Output names follow upstream's later filename options
+
+Upstream added a choice of output name after the reference commit, in its
+PR #5: the original filename, Title - Author, Author - Title, Title, or a
+template filled from `{title}`, `{author}`, `{year}`, `{series}`,
+`{series_index}`, `{language}` and `{original}`. The port follows its rules:
+doubled braces are literal, a field it does not know or a formatting option is
+refused, and a template ending in `.epub` does not get a second one. Author -
+Title, the default, is the name the reference always gave.
+
+The choice is remembered with the settings rather than made per upload, and
+both front ends check a template before any book is touched. Since a book can
+now be named exactly as the file it came from, neither front end ever
+replaces a file that is already there; the output becomes `name (2).epub`.
+The CLI used to write over one without asking.
 
 ### The HTML repair pass runs earlier
 

@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use epubkit_core::metadata::MetadataEdits;
+use epubkit_core::metadata::{self, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingReport};
 use epubkit_core::settings::Settings;
-use epubkit_core::{image, metadata, package, xml, Error};
+use epubkit_core::{image, package, preview, Error};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -98,6 +98,13 @@ pub fn delete_preset(id: String) -> Response<Settings> {
     Ok(settings)
 }
 
+/// What a custom filename template makes of an example book, or what is wrong
+/// with it — so a mistake shows while it is typed, not when every book fails.
+#[tauri::command]
+pub fn check_filename_template(template: String) -> Response<String> {
+    metadata::check_template(&template).map_err(to_message)
+}
+
 // -------------------------------------------------------------------- books
 
 /// What the file list shows for one book before anything is done to it.
@@ -133,15 +140,25 @@ impl BookInfo {
 }
 
 /// Read metadata and a cover thumbnail for each dropped book.
+///
+/// Runs on a blocking worker: a command without `async` runs on the main
+/// thread, and the window would hang for as long as the books took to read.
 #[tauri::command]
-pub fn inspect_books(paths: Vec<String>) -> Vec<BookInfo> {
-    paths
-        .iter()
-        .map(|path| inspect_one(Path::new(path)))
-        .collect()
+pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| inspect_one(Path::new(path)))
+            .collect()
+    })
+    .await
+    .map_err(to_message)
 }
 
 fn inspect_one(path: &Path) -> BookInfo {
+    // This is for a thumbnail, not the artwork.
+    const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+
     if !path.is_file() {
         return BookInfo::failed(path, "not a file");
     }
@@ -152,45 +169,21 @@ fn inspect_one(path: &Path) -> BookInfo {
         Ok(false) => {}
     }
 
-    let work = match tempdir() {
-        Ok(dir) => dir,
+    // Only the package document and the cover are read; the rest of the book
+    // stays packed.
+    let preview = match preview::read_preview(path, MAX_PREVIEW_BYTES) {
+        Ok(preview) => preview,
         Err(error) => return BookInfo::failed(path, error),
     };
-
-    if let Err(error) = package::extract_epub(path, work.path()) {
-        return BookInfo::failed(path, error);
-    }
-
-    let opf_path = match package::find_opf_path(work.path()) {
-        Ok(relative) => work.path().join(relative),
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let opf = match xml::parse_file(&opf_path) {
-        Ok(doc) => doc,
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let meta = match metadata::extract_metadata(&opf) {
-        Ok(meta) => meta,
-        Err(error) => return BookInfo::failed(path, error),
-    };
-
-    let cover = (!meta.cover_href.is_empty())
-        .then(|| {
-            let opf_dir = opf_path.parent().unwrap_or(work.path());
-            cover_data_url(&opf_dir.join(&meta.cover_href))
-        })
-        .flatten();
 
     BookInfo {
         path: path.to_string_lossy().to_string(),
         filename: file_name(path),
         size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        title: meta.title,
-        author: meta.author,
-        series: meta.series,
-        cover,
+        title: preview.metadata.title,
+        author: preview.metadata.author,
+        series: preview.metadata.series,
+        cover: preview.cover.as_ref().and_then(cover_data_url),
         error: None,
     }
 }
@@ -240,26 +233,10 @@ pub async fn optimize_books(
 ) -> Response<Vec<Outcome>> {
     tauri::async_runtime::spawn_blocking(move || {
         let destination = PathBuf::from(destination);
-        let device = settings.device_profile();
         let total = jobs.len();
         let mut outcomes = Vec::with_capacity(total);
 
         for (index, job) in jobs.iter().enumerate() {
-            let input = PathBuf::from(&job.path);
-            let options = settings.options.to_processing_options(
-                device,
-                MetadataEdits {
-                    title: job.title.clone().filter(|value| !value.trim().is_empty()),
-                    author: job.author.clone().filter(|value| !value.trim().is_empty()),
-                    language: None,
-                },
-            );
-
-            // The output name comes from the book's metadata, which is not
-            // known until the run finishes — so write beside the destination
-            // and rename once the report says what to call it.
-            let staging = destination.join(format!(".epubkit-{index}.part"));
-
             let emit = |percent: u8, message: &str| {
                 let _ = app.emit(
                     "progress",
@@ -273,40 +250,7 @@ pub async fn optimize_books(
                 );
             };
 
-            let outcome = match process_epub(&input, &staging, &options, emit) {
-                Ok(report) => {
-                    let final_path = unique_path(&destination.join(&report.output_filename));
-                    match std::fs::rename(&staging, &final_path) {
-                        Ok(()) => Outcome {
-                            path: job.path.clone(),
-                            output: Some(final_path.to_string_lossy().to_string()),
-                            summary: report.summary(),
-                            report: Some(report),
-                            error: None,
-                        },
-                        Err(error) => Outcome {
-                            path: job.path.clone(),
-                            output: None,
-                            summary: String::new(),
-                            report: None,
-                            error: Some(format!(
-                                "could not write {}: {error}",
-                                final_path.display()
-                            )),
-                        },
-                    }
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&staging);
-                    Outcome {
-                        path: job.path.clone(),
-                        output: None,
-                        summary: String::new(),
-                        report: None,
-                        error: Some(error.to_string()),
-                    }
-                }
-            };
+            let outcome = optimize_one(job, &destination, &settings, index, emit);
 
             let _ = app.emit("finished", outcome.clone());
             outcomes.push(outcome);
@@ -318,11 +262,61 @@ pub async fn optimize_books(
     .map_err(to_message)?
 }
 
-// ------------------------------------------------------------------ helpers
+/// Optimize one book into `destination`, as [`optimize_books`] does for each.
+///
+/// Apart so it can be tested without a window. `slot` keeps the staging files
+/// of one run apart.
+pub fn optimize_one(
+    job: &Job,
+    destination: &Path,
+    settings: &Settings,
+    slot: usize,
+    progress: impl FnMut(u8, &str),
+) -> Outcome {
+    let input = PathBuf::from(&job.path);
+    let options = settings.processing_options(MetadataEdits {
+        title: job.title.clone().filter(|value| !value.trim().is_empty()),
+        author: job.author.clone().filter(|value| !value.trim().is_empty()),
+        language: None,
+    });
 
-fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::tempdir()
+    // The output name comes from the book's metadata, which is not known until
+    // the run finishes — so write beside the destination and rename once the
+    // report says what to call it.
+    let staging = destination.join(format!(".epubkit-{slot}.part"));
+
+    let failed = |error: String| Outcome {
+        path: job.path.clone(),
+        output: None,
+        summary: String::new(),
+        report: None,
+        error: Some(error),
+    };
+
+    let report = match process_epub(&input, &staging, &options, progress) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return failed(error.to_string());
+        }
+    };
+
+    let final_path = metadata::unused_path(&destination.join(&report.output_filename));
+    if let Err(error) = std::fs::rename(&staging, &final_path) {
+        let _ = std::fs::remove_file(&staging);
+        return failed(format!("could not write {}: {error}", final_path.display()));
+    }
+
+    Outcome {
+        path: job.path.clone(),
+        output: Some(final_path.to_string_lossy().to_string()),
+        summary: report.summary(),
+        report: Some(report),
+        error: None,
+    }
 }
+
+// ------------------------------------------------------------------ helpers
 
 fn file_name(path: &Path) -> String {
     path.file_name()
@@ -330,49 +324,34 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Never silently overwrite a book that is already there.
-fn unique_path(preferred: &Path) -> PathBuf {
-    if !preferred.exists() {
-        return preferred.to_path_buf();
-    }
-
-    let stem = preferred
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "optimized".to_string());
-    let parent = preferred.parent().unwrap_or(Path::new("."));
-
-    (2..)
-        .map(|n| parent.join(format!("{stem} ({n}).epub")))
-        .find(|candidate| !candidate.exists())
-        .expect("an unused suffix always exists")
-}
-
-/// Encode a cover for display. Oversized covers are skipped rather than
-/// pushed through IPC — this is a thumbnail, not the artwork.
-fn cover_data_url(path: &Path) -> Option<String> {
-    const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
-
-    if std::fs::metadata(path).ok()?.len() > MAX_PREVIEW_BYTES {
-        return None;
-    }
-
-    let bytes = std::fs::read(path).ok()?;
-    let mime = match path
+/// Encode a cover for display.
+///
+/// The type written into the data URL is always one of a fixed few, never the
+/// book's own string: the page puts the URL in an `<img src>`, and a media
+/// type is whatever the book's author typed.
+fn cover_data_url(cover: &preview::Cover) -> Option<String> {
+    let extension = Path::new(&cover.path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => return None, // not a raster preview
-        _ => "image/jpeg",
+        .map(|e| e.to_ascii_lowercase());
+
+    let mime = match cover.media_type.to_ascii_lowercase().as_str() {
+        "image/png" => "image/png",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/svg+xml" => return None, // not a raster preview
+        _ => match extension.as_deref() {
+            Some("png") => "image/png",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("svg") => return None,
+            _ => "image/jpeg",
+        },
     };
 
     Some(format!(
         "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
+        base64::engine::general_purpose::STANDARD.encode(&cover.bytes)
     ))
 }

@@ -93,8 +93,11 @@ fn no_markup_is_injected_during_recovery() {
 #[test]
 fn exactly_one_xml_declaration_is_emitted() {
     let (output, _) = repair(MALFORMED);
+    // The source's own declaration must not survive in any form: libxml2 2.9
+    // keeps it as a processing instruction, 2.14 as a `<!--?xml …?-->`
+    // comment.
     assert_eq!(
-        output.matches("<?xml").count(),
+        output.matches("?xml").count(),
         1,
         "expected a single XML declaration:\n{output}"
     );
@@ -210,4 +213,18 @@ fn void_elements_stay_closed_through_recovery() {
 #[test]
 fn default_backend_is_libxml2() {
     assert_eq!(default_backend().name(), "libxml2");
+}
+
+/// An empty or blank file holds nothing to recover. Depending on the libxml2
+/// release, recovering one either fails or yields a document with no root
+/// element, which would serialize to a bare declaration: not XHTML at all.
+/// Both are refused, the same on every release.
+#[test]
+fn a_file_with_nothing_in_it_is_refused() {
+    for input in ["", "   \n", "\u{feff}"] {
+        assert!(
+            LibxmlRepair::new().repair(input.as_bytes()).is_err(),
+            "{input:?} was not refused"
+        );
+    }
 }

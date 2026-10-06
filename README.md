@@ -1,6 +1,6 @@
 # epubkit
 
-A web-based EPUB optimizer for e-ink readers. Drop in any EPUB and get back a clean, optimized file ready for your device.
+An EPUB optimizer for e-ink readers, as a desktop app and a command-line tool. Drop in any EPUB and get back a clean, optimized file ready for your device.
 
 Originally built for the [Xteink X4](https://xteink.com/) (480x800 portrait e-ink display, 4-level grayscale, SSD1677 controller, ESP32-C3). Now also supports the smaller [Xteink X3](https://www.xteink.com/products/xteink-x3) (528x792 display, same controller) via a device toggle, and works with any Xteink reader or e-ink device that supports EPUB.
 
@@ -13,22 +13,22 @@ epubkit runs this pipeline on every EPUB:
 | 1 | **DRM check** — detects DRM-protected files and stops early with a clear message |
 | 2 | **Extract** — unpacks the EPUB ZIP structure into a working directory |
 | 3 | **Parse structure** — locates the OPF package file and parses the manifest |
-| 4 | **Read metadata** — extracts title, author, series, language, cover reference |
-| 5 | **Apply metadata edits** — overwrites title/author if the user edited them in the UI |
-| 6 | **Find content files** — catalogs all XHTML, CSS, image, and font files in the EPUB |
-| 7 | **Process images** — converts all images to baseline JPEG, resizes to the device screen (480x800 for X4, 528x792 for X3; max 1024x1024), applies 4-level grayscale quantization with Floyd-Steinberg dithering, autocontrast histogram stretching, and contrast boost. Light Novel mode rotates/splits landscape images |
+| 4 | **Apply metadata edits** — overwrites title/author if you edited them in the window or passed `--title`/`--author` |
+| 5 | **Find content files** — catalogs all XHTML, CSS, image, and font files in the EPUB |
+| 6 | **Process images** — converts all images to baseline JPEG, resizes to the device screen (480x800 for X4, 528x792 for X3; max 1024x1024), applies 4-level grayscale quantization with Floyd-Steinberg dithering, autocontrast histogram stretching, and contrast boost. Light Novel mode rotates/splits landscape images. Converted images never overwrite one another |
+| 7 | **Repair HTML + strip attributes** — fixes malformed XHTML with libxml2's recovery parser (reading it as UTF-8, which EPUB requires), strips unnecessary attributes (data-\*, aria-\*, role, tabindex, etc.) to reduce parsing overhead for the 380KB RAM device. A chapter that cannot be read at all is left as it was |
 | 8 | **Fix SVG covers** — unwraps SVG-wrapped cover images (common in Gutenberg/store EPUBs) |
-| 10 | **Update references** — rewrites all internal hrefs and srcs to match renamed image files |
-| 11 | **Repair HTML + strip attributes** — fixes malformed XHTML with lxml recovery parser, strips unnecessary attributes (data-\*, aria-\*, role, tabindex, etc.) to reduce parsing overhead for the 380KB RAM device |
-| 12 | **Remove unused CSS** — collects all used classes/IDs/elements across XHTML files, then strips CSS rules that don't match anything |
-| 13 | **Remove embedded fonts** — deletes @font-face rules from CSS, removes font files (.ttf, .otf, .woff, .woff2), and cleans them from the OPF manifest |
-| 14 | **Normalize whitespace** — strips excessive empty paragraphs/divs, adds CSS page-break-before to chapter headings (h1, h2) |
-| 15 | **Text cleanup** — scans all text nodes (skipping script/style/pre/code) and fixes: double spaces, OCR ligature artifacts (fi/fl/ffi/ffl/ff), smart quotes → straight quotes, mojibake encoding errors, punctuation issues, Unicode NFC normalization |
-| 16 | **Clean metadata** — strips store-specific tags (Calibre, iBooks, Kindle, Amazon, Google Play, Kobo) |
-| 17 | **Fix TOC** — validates the Table of Contents, generates one from chapter headings if missing |
-| 18 | **Clean OS artifacts** — removes .DS_Store, Thumbs.db, __MACOSX, desktop.ini, etc. |
-| 19 | **Repackage** — rebuilds the EPUB ZIP with correct mimetype entry and deflate compression |
-| 20 | **Output filename** — generates a clean `Author - Title.epub` filename from metadata |
+| 9 | **Update references** — rewrites all internal hrefs and srcs to match renamed image files |
+| 10 | **Show reshaped pages** — in Light Novel mode, puts both halves of a split spread in the book, in reading order, and drops the sizes that described the original image |
+| 11 | **Remove unused CSS** — collects all used classes/IDs/elements across XHTML files, then strips CSS rules that don't match anything |
+| 12 | **Remove embedded fonts** — deletes @font-face rules from CSS, removes font files (.ttf, .otf, .woff, .woff2), and cleans them from the OPF manifest |
+| 13 | **Normalize whitespace** — strips excessive empty paragraphs/divs, adds CSS page-break-before to chapter headings (h1, h2) |
+| 14 | **Text cleanup** — scans all text nodes (skipping script/style/pre/code) and fixes: double spaces, OCR ligature artifacts (fi/fl/ffi/ffl/ff), smart quotes → straight quotes, mojibake encoding errors, punctuation issues, Unicode NFC normalization |
+| 15 | **Clean metadata** — strips store-specific tags (Calibre, iBooks, Kindle, Amazon, Google Play, Kobo) |
+| 16 | **Fix TOC** — validates the Table of Contents, generates one from chapter headings if missing |
+| 17 | **Clean OS artifacts** — removes .DS_Store, Thumbs.db, __MACOSX, desktop.ini, etc. |
+| 18 | **Repackage** — rebuilds the EPUB ZIP with correct mimetype entry and deflate compression |
+| 19 | **Output filename** — names the file from its metadata: `Author - Title.epub` by default, or Title - Author, Title, the original filename, or a template of your own. A file already there is never replaced |
 
 ## Usage
 
@@ -45,11 +45,18 @@ cargo build --release
 # pick a device and a preset
 ./target/release/epubkit optimize book.epub --device x3 --preset quick
 
+# name the output another way: original, title-author, author-title, title
+./target/release/epubkit optimize book.epub --filename original
+
+# or from a template
+./target/release/epubkit optimize book.epub --filename-template '{series} {series_index} - {title}'
+
 # inspect a book without changing it
 ./target/release/epubkit info book.epub
 ```
 
-Your choices are remembered between runs, so an option you turn off stays off.
+Your choices are remembered between runs, so an option you turn off stays off,
+and books keep being named the way you last chose.
 `epubkit settings show` prints the current state, and `epubkit settings save
 "My X4"` keeps it as a named preset.
 
@@ -66,13 +73,13 @@ system one.
 
 ## Processing presets
 
-| Preset | Images | Text | Fonts | CSS | Cover | Metadata | Best for |
-|--------|--------|------|-------|-----|-------|----------|----------|
-| Quick  | Yes    | Yes  | No    | No  | No    | No       | Fast image + text pass |
-| Full   | Yes    | Yes  | Yes   | Yes | Yes   | Yes      | Complete device optimization |
-| Custom | Pick   | Pick | Pick  | Pick| Pick  | Pick     | Fine-grained control |
+| Preset | Images | Text | Fonts | CSS | Metadata | Best for |
+|--------|--------|------|-------|-----|----------|----------|
+| Quick  | Yes    | Yes  | No    | No  | No       | Fast image + text pass |
+| Full   | Yes    | Yes  | Yes   | Yes | Yes      | Complete device optimization |
+| Custom | Pick   | Pick | Pick  | Pick| Pick     | Fine-grained control |
 
-The device toggle (X4/X3) works independently of the preset — it controls image dimensions and grayscale depth.
+The device toggle (X4/X3) works independently of the preset — it controls image dimensions and grayscale depth. So does the choice of output filename.
 
 ## Device specs
 
@@ -97,10 +104,10 @@ Note: stock Xteink firmware (X3 and X4 alike) does not render images inside EPUB
 - **Format**: All images converted to baseline JPEG (progressive breaks many e-ink readers)
 - **Resize**: Fit within the device screen (480x800 X4, 528x792 X3, portrait), hard clamp at 1024x1024
 - **Grayscale**: 4-level quantization matching the SSD1677 palette (0, 85, 170, 255) with Floyd-Steinberg dithering (both devices)
-- **Contrast**: Auto-histogram stretching (`ImageOps.autocontrast`) followed by 1.5x contrast boost
+- **Contrast**: Auto-histogram stretching (Pillow's `ImageOps.autocontrast`, reproduced exactly) followed by 1.5x contrast boost
 - **Subsampling**: 4:2:0 for grayscale (all RGB channels identical, saves ~15-20%), 4:4:4 for color
 - **Transparency**: Alpha composited onto white background
-- **Light Novel mode**: Landscape images rotated 90°; double-page spreads (aspect > 1.8) split into two portrait pages
+- **Light Novel mode**: Landscape images rotated 90°; double-page spreads (aspect > 1.8) split into two portrait pages, both shown in reading order
 
 ## Text cleanup details
 
@@ -108,15 +115,16 @@ Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`):
 
 - **Whitespace**: Multiple spaces/tabs → single space, removes spaces before punctuation
 - **OCR ligatures**: fi (U+FB01), fl (U+FB02), ffi (U+FB03), ffl (U+FB04), ff (U+FB00) → plain ASCII
-- **Smart quotes**: Typographic quotes/dashes → straight equivalents (configurable)
+- **Smart quotes**: Typographic quotes/dashes → straight equivalents
 - **Mojibake**: Detects and repairs common UTF-8/Latin-1 double-encoding patterns
 - **Punctuation**: 4+ dots → ellipsis, missing space after sentence-ending punctuation, duplicate commas
 - **Unicode**: NFC normalization
 
 ## Tech stack
 
-Rust, as a library plus a CLI, with a desktop front-end to follow.
+Rust: a library, a command-line tool, and a desktop app.
 
+- **[Tauri](https://tauri.app/)** — the desktop window, drawn by the system's own webview
 - **[libxml2](https://gitlab.gnome.org/GNOME/libxml2)** — XML/XHTML parsing and repair, via the `libxml` crate
 - **[image](https://crates.io/crates/image)** — decoding and Lanczos resampling
 - **[lightningcss](https://lightningcss.dev/)** — CSS parsing and cleanup
@@ -146,8 +154,10 @@ Inspired by and built on ideas from:
 
 ## About
 
-Built by [@b1rdmania](https://github.com/b1rdmania). Made because existing tools required too many steps — Calibre plugins, CLI scripts, manual image conversion. epubkit does it all in one pass through a simple web interface.
+Built by [@b1rdmania](https://github.com/b1rdmania). Made because existing tools required too many steps — Calibre plugins, CLI scripts, manual image conversion. epubkit does it all in one pass.
+
+This fork, [tohnk/epubkit-desktop](https://github.com/tohnk/epubkit-desktop), ports it from a Python web app to Rust, as a desktop app and a command-line tool.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

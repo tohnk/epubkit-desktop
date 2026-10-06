@@ -3,9 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use epubkit_core::structure::{
-    add_image_to_opf, build_rename_map, find_content_files, fix_svg_covers, fix_toc,
-    manifest_items, spine_hrefs, update_css_references, update_opf, update_opf_remove_fonts,
-    update_xhtml_references, TocOutcome,
+    add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
+    fix_toc, manifest_items, show_reshaped_pages, spine_hrefs, update_css_references, update_opf,
+    update_opf_remove_fonts, update_xhtml_references, TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -194,11 +194,11 @@ fn xhtml_image_references_follow_renames() {
     .unwrap();
 
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
-    assert_eq!(update_xhtml_references(&path, &map).unwrap(), 2);
+    assert_eq!(update_xhtml_references(dir.path(), &path, &map).unwrap(), 2);
 
     let out = fs::read_to_string(&path).unwrap();
     assert!(out.contains(r#"src="../images/plate.jpg""#), "{out}");
-    assert!(out.contains("url(../images/plate.jpg)"), "{out}");
+    assert!(out.contains("url('../images/plate.jpg')"), "{out}");
     assert!(!out.contains("plate.png"), "{out}");
 }
 
@@ -211,7 +211,10 @@ fn xhtml_untouched_by_an_empty_rename_map() {
 "#;
     fs::write(&path, original).unwrap();
 
-    assert_eq!(update_xhtml_references(&path, &BTreeMap::new()).unwrap(), 0);
+    assert_eq!(
+        update_xhtml_references(dir.path(), &path, &BTreeMap::new()).unwrap(),
+        0
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }
 
@@ -229,11 +232,166 @@ fn css_url_references_follow_renames() {
         ("images/plate.png", "images/plate.jpg"),
         ("images/other.gif", "images/other.jpg"),
     ]);
-    assert_eq!(update_css_references(&path, &map).unwrap(), 1);
+    assert_eq!(update_css_references(dir.path(), &path, &map).unwrap(), 1);
 
     let out = fs::read_to_string(&path).unwrap();
-    assert!(out.contains("url(images/plate.jpg)"), "{out}");
+    assert!(out.contains(r#"url("images/plate.jpg")"#), "{out}");
     assert!(out.contains("url(images/other.jpg)"), "{out}");
+}
+
+fn put(root: &Path, name: &str, content: impl AsRef<[u8]>) -> std::path::PathBuf {
+    let path = root.join(name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, content).unwrap();
+    path
+}
+
+fn chapter_with(body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>
+"#
+    )
+}
+
+/// Images that share a filename in different directories can be renamed
+/// differently, so each reference follows the file it actually names.
+#[test]
+fn references_follow_the_file_they_name_not_its_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        chapter_with(r#"<img src="../a/pic.png" alt=""/><img src="../b/pic.png" alt=""/>"#),
+    );
+    let css = put(
+        dir.path(),
+        "styles/main.css",
+        ".x { background: url(../b/pic.png) }",
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        2
+    );
+    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains(r#"src="../a/pic.jpg""#), "{out}");
+    assert!(out.contains(r#"src="../b/pic-2.jpg""#), "{out}");
+    let out = fs::read_to_string(&css).unwrap();
+    assert!(out.contains("url(../b/pic-2.jpg)"), "{out}");
+}
+
+/// A path that leads to a file still on disk names something that was not
+/// renamed, even if its filename matches something that was.
+#[test]
+fn a_reference_to_a_file_that_kept_its_name_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    put(dir.path(), "b/pic.png", "an image nobody renamed");
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="b/pic.png" alt=""/>"#),
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+}
+
+/// A path that leads nowhere falls back to its filename, but only when that is
+/// unambiguous — not when two images of that name were renamed differently.
+#[test]
+fn an_ambiguous_filename_is_not_guessed_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="elsewhere/pic.png" alt=""/>"#),
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="img" href="elsewhere/pic.png" media-type="image/png"/></manifest>
+  <spine/>
+</package>
+"#);
+    assert_eq!(update_opf(&doc, &map).unwrap(), 0);
+}
+
+#[test]
+fn links_to_other_sites_and_data_are_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(
+            r#"<img src="http://example.com/images/plate.png" alt=""/><img src="data:image/png;base64,AAAA" alt=""/>"#,
+        ),
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+}
+
+/// Only the filename changes: one that was percent-encoded stays encoded, and
+/// one written plainly stays plain.
+#[test]
+fn a_renamed_filename_is_written_the_way_the_reference_wrote_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(
+            r#"<img src="images/a%20plate.png" alt=""/><img src="images/b plate.png" alt=""/>"#,
+        ),
+    );
+    let map = rename_map(&[
+        ("images/a plate.png", "images/a plate.jpg"),
+        ("images/b plate.png", "images/b plate.jpg"),
+    ]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        2
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains(r#"src="images/a%20plate.jpg""#), "{out}");
+    assert!(out.contains(r#"src="images/b plate.jpg""#), "{out}");
+}
+
+/// A stylesheet is rewritten in place: a renamed url keeps its quotes, and
+/// every other url is left exactly as it was. Unquoting a url with a space in
+/// it would break the rule it sits in.
+#[test]
+fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let css = put(
+        dir.path(),
+        "main.css",
+        "@font-face { src: url(\"fonts/My Font.otf\"); }\n.x { background: url('images/plate.png'); }\n",
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+
+    let out = fs::read_to_string(&css).unwrap();
+    assert!(out.contains(r#"url("fonts/My Font.otf")"#), "{out}");
+    assert!(out.contains("url('images/plate.jpg')"), "{out}");
 }
 
 #[test]
@@ -482,4 +640,137 @@ fn an_empty_spine_is_reported_not_guessed_at() {
         fix_toc(dir.path(), &doc).unwrap(),
         TocOutcome::Skipped(_)
     ));
+}
+
+// ---------------------------------------------------- Light Novel reshaping
+
+fn split_spread() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([(
+        "images/spread_part1.jpg".to_string(),
+        vec![
+            "images/spread_part1.jpg".to_string(),
+            "images/spread_part2.jpg".to_string(),
+        ],
+    )])
+}
+
+/// The first page keeps its place; each further page follows it, shown the
+/// same way but without an id, which has to stay unique. The spread's size no
+/// longer describes either page.
+#[test]
+fn a_split_image_is_followed_by_its_other_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>
+<p><img id="spread" class="plate" epub:type="illustration" src="../images/spread_part1.jpg" alt="Both pages" width="1000" height="400"/></p>
+<p><img src="../images/other.jpg" alt="" width="10" height="20"/></p>
+</body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    let first = out.find("spread_part1.jpg").expect("first page");
+    let second = out.find("spread_part2.jpg").expect("second page");
+    assert!(first < second, "{out}");
+    assert_eq!(out.matches(r#"class="plate""#).count(), 2, "{out}");
+    assert_eq!(
+        out.matches(r#"epub:type="illustration""#).count(),
+        2,
+        "{out}"
+    );
+    assert_eq!(out.matches(r#"id="spread""#).count(), 1, "{out}");
+    assert!(!out.contains(r#"width="1000""#), "{out}");
+    assert!(
+        out.contains(r#"width="10" height="20""#),
+        "an unrelated image keeps its size: {out}"
+    );
+}
+
+/// An SVG wrapper's viewBox is sized to the old shape, so it would squash the
+/// new pages into it. It gives way to a plain image per page.
+#[test]
+fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><div class="illust">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread_part1.jpg"/></svg>
+</div></body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(!out.contains("<svg"), "{out}");
+    assert!(
+        out.contains(r#"<img src="../images/spread_part1.jpg""#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<img src="../images/spread_part2.jpg""#),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// A rotated image is one page, but no longer the shape its size describes.
+#[test]
+fn a_rotated_image_loses_the_size_it_no_longer_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="images/plate.jpg" alt="" width="800" height="600"/>"#),
+    );
+    let rotated = BTreeMap::from([(
+        "images/plate.jpg".to_string(),
+        vec!["images/plate.jpg".to_string()],
+    )]);
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &rotated).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert_eq!(out.matches("<img").count(), 1, "{out}");
+    assert!(!out.contains("width="), "{out}");
+}
+
+#[test]
+fn split_pages_are_declared_under_ids_of_their_own() {
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="plate" href="images/spread_part1.jpg" media-type="image/jpeg"/>
+    <item id="plate-2" href="images/unrelated.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine/>
+</package>
+"#);
+
+    assert_eq!(declare_reshaped_pages(&doc, &split_spread()).unwrap(), 1);
+
+    let added = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.href == "images/spread_part2.jpg")
+        .expect("the second page should be declared");
+    assert_eq!(added.id, "plate-2-2", "plate-2 was taken");
+    assert_eq!(added.media_type, "image/jpeg");
 }

@@ -21,6 +21,7 @@ pub fn run() {
             commands::select_preset,
             commands::save_preset,
             commands::delete_preset,
+            commands::check_filename_template,
             commands::inspect_books,
             commands::optimize_books,
         ])
