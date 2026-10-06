@@ -352,6 +352,17 @@ leads nowhere and the filename is unambiguous. Only the filename in a
 reference changes; its directory, fragment, percent-encoding and quotes stay
 as written, and links to other sites are left alone.
 
+### Light Novel mode keeps every page it makes
+
+The reference split a double-page spread into two images but pointed the book
+at only the last, the left half; the right half, which comes first, was
+packaged and never shown. The port declares every page in the manifest and
+shows them in reading order where the spread was, each the way the spread
+was shown, minus the `width` and `height` that described it. An SVG wrapper,
+common around full-page illustrations and sized to the spread in its viewBox,
+gives way to a plain image per page. A rotated image sheds its old size and
+wrapper the same way. The report counts a split spread as one image.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But
@@ -424,6 +435,3 @@ always produces a byte-identical archive.
   rare, and the UTF-8 fix above neither causes nor cures it. Passing the
   declared encoding to the parser would, once the `libxml` crate's `encoding`
   option is safe to use.
-- Light Novel mode splits a double-page spread into two images, but only the
-  first reaches the manifest and the page; the second is packaged and never
-  shown. The reference loses a half too (the other one).

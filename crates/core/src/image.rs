@@ -125,6 +125,9 @@ pub struct ProcessedImage {
     pub new_size: usize,
     /// Human-readable account of what was done, for the processing report.
     pub details: String,
+    /// Light Novel mode rotated or split the image, so its proportions no
+    /// longer match the source's, nor any size a document gives for it.
+    pub reshaped: bool,
 }
 
 /// Is this a file the image step should try to open?
@@ -165,6 +168,9 @@ pub fn process_image(
     // otherwise quantize to whatever the undefined colour channel held.
     let flattened = flatten_onto_white(decoded);
 
+    // Light Novel mode turns every landscape image: rotated, or split in two.
+    let reshaped = options.light_novel_mode && flattened.width() > flattened.height();
+
     let pages = if options.light_novel_mode {
         split_for_vertical_reading(flattened, options.light_novel_rotate_left)
     } else {
@@ -177,9 +183,6 @@ pub fn process_image(
     for (index, page) in pages.into_iter().enumerate() {
         let mut details = Vec::new();
 
-        if page_count > 1 {
-            details.push(format!("split part {}/{page_count}", index + 1));
-        }
         if !was_jpeg {
             let from = Path::new(filename)
                 .extension()
@@ -242,6 +245,13 @@ pub fn process_image(
             rgb
         };
 
+        // Last, so that the format change stays the first thing said.
+        if page_count > 1 {
+            details.push(format!("split part {}/{page_count}", index + 1));
+        } else if reshaped {
+            details.push("rotated".to_string());
+        }
+
         let encoded = encode_baseline_jpeg(&rgb, options.quality, options.grayscale)?;
 
         results.push(ProcessedImage {
@@ -260,6 +270,7 @@ pub fn process_image(
                 details.join(", ")
             },
             bytes: encoded,
+            reshaped,
         });
     }
 

@@ -2,7 +2,7 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -46,6 +46,9 @@ const HREF_ESCAPE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}')
     .add(b'%');
+
+/// How an image that replaces an SVG wrapper fills the page.
+const FULL_PAGE_STYLE: &str = "max-width:100%;max-height:100%;display:block;margin:auto";
 
 /// One `<item>` from the OPF manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -380,6 +383,154 @@ pub fn update_css_references(
     Ok(1)
 }
 
+/// Declare every page of each image Light Novel mode split, after the first,
+/// which already has the image's own manifest entry. `reshaped` maps the path
+/// of an image's first page to all its pages in reading order, relative to
+/// the OPF's directory. Returns how many entries were added.
+pub fn declare_reshaped_pages(
+    doc: &Document,
+    reshaped: &BTreeMap<String, Vec<String>>,
+) -> Result<usize> {
+    let items = manifest_items(doc)?;
+    let mut ids: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+    let mut added = 0;
+
+    for (first, pages) in reshaped {
+        let base = items
+            .iter()
+            .find(|item| item.decoded_href() == *first)
+            .map_or_else(|| "image".to_string(), |item| item.id.clone());
+
+        for (index, page) in pages.iter().enumerate().skip(1) {
+            let wanted = format!("{base}-{}", index + 1);
+            let id = std::iter::once(wanted.clone())
+                .chain((2..).map(|n| format!("{wanted}-{n}")))
+                .find(|candidate| !ids.contains(candidate))
+                .expect("an unused suffix always exists");
+
+            add_image_to_opf(doc, &encode(page), &id)?;
+            ids.insert(id);
+            added += 1;
+        }
+    }
+
+    Ok(added)
+}
+
+/// Show every page of each image Light Novel mode reshaped in one XHTML file.
+/// `reshaped` is as for [`declare_reshaped_pages`]; references should already
+/// point at the first page.
+///
+/// An `<img>` of a reshaped image loses its `width` and `height`, which give
+/// the old shape, and is followed by a copy for each further page. An SVG
+/// wrapper around one, its viewBox sized to the old shape too, gives way to a
+/// plain `<img>` per page. Returns how many images changed, writing the file
+/// only if any did.
+pub fn show_reshaped_pages(
+    opf_dir: &Path,
+    path: &Path,
+    reshaped: &BTreeMap<String, Vec<String>>,
+) -> Result<usize> {
+    if reshaped.is_empty() {
+        return Ok(0);
+    }
+
+    let pages_by_target: HashMap<PathBuf, Vec<String>> = reshaped
+        .iter()
+        .map(|(first, pages)| {
+            let names = pages.iter().map(|page| file_name_of(page)).collect();
+            (normalize_path(&opf_dir.join(first)), names)
+        })
+        .collect();
+    let base = path.parent().unwrap_or(opf_dir);
+
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    let content = html::parse_content(&bytes)?;
+    let mut changed = 0;
+
+    // Both lists are taken before anything changes, so the images added below
+    // are not visited in turn.
+    let svgs = xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))?;
+    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
+
+    for mut svg in svgs {
+        let inner =
+            xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
+        let [image] = inner.as_slice() else {
+            continue;
+        };
+        let href = image
+            .get_attribute_ns("href", NS_XLINK)
+            .or_else(|| image.get_attribute("href"))
+            .unwrap_or_default();
+        let Some(reference) = Reference::parse(&href) else {
+            continue;
+        };
+        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+            continue;
+        };
+        let Some(mut parent) = svg.get_parent() else {
+            continue;
+        };
+
+        let namespace = parent.get_namespace();
+        for page in pages {
+            let Ok(mut img) = parent.new_child(namespace.clone(), "img") else {
+                continue;
+            };
+            img.set_attribute("src", &reference.with_name(page)).ok();
+            img.set_attribute("alt", "").ok();
+            img.set_attribute("style", FULL_PAGE_STYLE).ok();
+            svg.add_prev_sibling(&mut img).ok();
+        }
+        svg.unlink();
+        changed += 1;
+    }
+
+    for mut image in images {
+        let src = image.get_attribute("src").unwrap_or_default();
+        let Some(reference) = Reference::parse(&src) else {
+            continue;
+        };
+        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+            continue;
+        };
+        let Some(mut parent) = image.get_parent() else {
+            continue;
+        };
+
+        image.remove_attribute("width").ok();
+        image.remove_attribute("height").ok();
+
+        // Each further page is shown the way the first is: same class, style
+        // and alt text, but no id, which must stay unique.
+        let attributes = image.get_attributes_ns();
+        let mut previous = image.clone();
+        for page in &pages[1..] {
+            let Ok(mut copy) = parent.new_child(image.get_namespace(), "img") else {
+                continue;
+            };
+            for ((name, namespace), value) in &attributes {
+                match namespace {
+                    Some(namespace) => copy.set_attribute_ns(name, value, namespace).ok(),
+                    None if name != "id" => copy.set_attribute(name, value).ok(),
+                    None => None,
+                };
+            }
+            copy.set_attribute("src", &reference.with_name(page)).ok();
+            previous.add_next_sibling(&mut copy).ok();
+            previous = copy;
+        }
+        changed += 1;
+    }
+
+    if changed > 0 {
+        fs::write(path, html::serialize_content(&content)).map_err(|e| Error::io(path, e))?;
+    }
+
+    Ok(changed)
+}
+
 /// Replace SVG-wrapped cover images with a plain `<img>`.
 ///
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
@@ -433,11 +584,7 @@ pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
             };
             img.set_attribute("src", &target).ok();
             img.set_attribute("alt", "Cover").ok();
-            img.set_attribute(
-                "style",
-                "max-width:100%;max-height:100%;display:block;margin:auto",
-            )
-            .ok();
+            img.set_attribute("style", FULL_PAGE_STYLE).ok();
 
             // `new_child` appends; move it into the SVG's position.
             svg.add_prev_sibling(&mut img).ok();
@@ -630,29 +777,62 @@ impl<'a> Renames<'a> {
     }
 }
 
-/// Rewrite one reference if the file it names was renamed, swapping only the
-/// filename: the directory, any fragment, and whether the name was
-/// percent-encoded all stay as written. `None` leaves the reference alone.
+/// A reference to a file in the book, taken apart so that its filename can be
+/// swapped while everything else stays as written.
+struct Reference<'a> {
+    directory: &'a str,
+    name: &'a str,
+    /// Any query or fragment.
+    suffix: &'a str,
+}
+
+impl<'a> Reference<'a> {
+    /// `None` for what is not a file in the book: a same-document fragment,
+    /// or anything with a scheme, such as http: or data:.
+    fn parse(reference: &'a str) -> Option<Self> {
+        if reference.starts_with('#') || has_scheme(reference) {
+            return None;
+        }
+
+        let (path, suffix) =
+            reference.split_at(reference.find(['?', '#']).unwrap_or(reference.len()));
+        let (directory, name) = path.split_at(path.rfind('/').map_or(0, |slash| slash + 1));
+
+        (!name.is_empty()).then_some(Self {
+            directory,
+            name,
+            suffix,
+        })
+    }
+
+    /// The path, percent-decoded.
+    fn path(&self) -> String {
+        decode(&format!("{}{}", self.directory, self.name))
+    }
+
+    /// The file it names, from a document in `base`.
+    fn target(&self, base: &Path) -> PathBuf {
+        normalize_path(&base.join(self.path()))
+    }
+
+    /// The same reference naming `new_name`, percent-encoded only if the
+    /// original name was.
+    fn with_name(&self, new_name: &str) -> String {
+        let new_name = if decode(self.name) == self.name {
+            new_name.to_string()
+        } else {
+            encode(new_name)
+        };
+        format!("{}{new_name}{}", self.directory, self.suffix)
+    }
+}
+
+/// Rewrite one reference if the file it names was renamed. `None` leaves it
+/// alone.
 fn rewrite_reference(reference: &str, base: &Path, renames: &Renames) -> Option<String> {
-    // Same-document fragments, and http:, data: and their kind.
-    if reference.starts_with('#') || has_scheme(reference) {
-        return None;
-    }
-
-    let (path, suffix) = reference.split_at(reference.find(['?', '#']).unwrap_or(reference.len()));
-    let (directory, name) = path.split_at(path.rfind('/').map_or(0, |slash| slash + 1));
-    if name.is_empty() {
-        return None;
-    }
-
-    let new_name = renames.new_name(base, &decode(path))?;
-    let new_name = if decode(name) == name {
-        new_name
-    } else {
-        encode(&new_name)
-    };
-
-    Some(format!("{directory}{new_name}{suffix}"))
+    let reference = Reference::parse(reference)?;
+    let new_name = renames.new_name(base, &reference.path())?;
+    Some(reference.with_name(&new_name))
 }
 
 /// Does `reference` open with a URL scheme rather than a path?

@@ -83,8 +83,11 @@ pub struct ProcessingReport {
     pub optimized_size: u64,
     pub output_filename: String,
 
+    /// Source images converted. A split spread counts once.
     pub images_converted: usize,
     pub images_total: usize,
+    /// Double-page spreads Light Novel mode split into pages.
+    pub spreads_split: usize,
     /// e.g. `{"PNG→JPEG": 5}` — how the images were transformed.
     pub image_formats: BTreeMap<String, usize>,
     pub image_details: Vec<String>,
@@ -124,6 +127,13 @@ impl ProcessingReport {
                 self.images_converted,
                 self.images_total,
                 formats.join(", ")
+            ));
+        }
+        if self.spreads_split > 0 {
+            let plural = if self.spreads_split == 1 { "" } else { "s" };
+            parts.push(format!(
+                "Split {} double-page spread{plural}",
+                self.spreads_split
             ));
         }
         if self.fonts_removed > 0 {
@@ -251,7 +261,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
     // --- images (15-60%) -------------------------------------------------
     progress(15, "Processing images...");
-    let renames = convert_images(
+    let converted = convert_images(
         &content.images,
         &opf_dir,
         options,
@@ -287,7 +297,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     report.svg_covers_fixed = structure::fix_svg_covers(&opf_dir, &opf)?;
 
     progress(68, "Updating references...");
-    let rename_map = structure::build_rename_map(&renames);
+    let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
         structure::update_opf(&opf, &rename_map)?;
         for path in &content.xhtml {
@@ -298,6 +308,18 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for path in &content.css {
             if path.is_file() {
                 structure::update_css_references(&opf_dir, path, &rename_map)?;
+            }
+        }
+    }
+
+    // A rotated image or a split spread no longer has the shape its pages
+    // describe, and a split one has pages no page shows yet.
+    if !converted.reshaped.is_empty() {
+        progress(72, "Showing reshaped pages...");
+        structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
+        for path in &content.xhtml {
+            if path.is_file() {
+                structure::show_reshaped_pages(&opf_dir, path, &converted.reshaped)?;
             }
         }
     }
@@ -413,20 +435,30 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
 // ---------------------------------------------------------------- internals
 
-/// Convert every image in the manifest, returning old path → new filename for
-/// the reference-rewriting step.
+/// What the image step leaves for the steps after it. Paths are relative to
+/// the OPF's directory.
+struct ConvertedImages {
+    /// Source path → the filename of its (first) output.
+    renames: BTreeMap<String, String>,
+    /// For each image Light Novel mode rotated or split: its pages in reading
+    /// order, keyed by the first.
+    reshaped: BTreeMap<String, Vec<String>>,
+}
+
+/// Convert every image in the manifest.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
     opf_dir: &Path,
     options: &ProcessingOptions,
     report: &mut ProcessingReport,
     progress: &mut P,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<ConvertedImages> {
     const START: f64 = 15.0;
     const SPAN: f64 = 45.0;
 
     let image_options = options.image_options();
     let mut renames = BTreeMap::new();
+    let mut reshaped = BTreeMap::new();
     let mut taken = TakenNames::default();
     report.images_total = images.len();
 
@@ -480,26 +512,40 @@ fn convert_images<P: FnMut(u8, &str)>(
         for (output, output_name) in outputs.iter().zip(&names) {
             let destination = parent.join(output_name);
             fs::write(&destination, &output.bytes).map_err(|e| Error::io(&destination, e))?;
-
-            report.images_converted += 1;
             report.image_details.push(output.details.clone());
-
-            // The leading clause of the details line is the format change,
-            // which is what the summary counts.
-            let kind = output
-                .details
-                .split(',')
-                .next()
-                .unwrap_or("processed")
-                .trim()
-                .to_string();
-            *report.image_formats.entry(kind).or_insert(0) += 1;
         }
 
+        // Counted once per source, however many pages it became. The leading
+        // clause of the details line is the format change, which is what the
+        // summary counts.
+        report.images_converted += 1;
+        if names.len() > 1 {
+            report.spreads_split += 1;
+        }
+        let kind = outputs[0]
+            .details
+            .split(',')
+            .next()
+            .unwrap_or("processed")
+            .trim()
+            .to_string();
+        *report.image_formats.entry(kind).or_insert(0) += 1;
+
         if let Ok(relative) = path.strip_prefix(opf_dir) {
-            if let Some(first) = names.first() {
-                renames.insert(relative.to_string_lossy().replace('\\', "/"), first.clone());
+            let source = relative.to_string_lossy().replace('\\', "/");
+            if outputs[0].reshaped {
+                let pages: Vec<String> = names
+                    .iter()
+                    .map(|page| {
+                        relative
+                            .with_file_name(page)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                    .collect();
+                reshaped.insert(pages[0].clone(), pages);
             }
+            renames.insert(source, names[0].clone());
         }
 
         // The source only goes once its replacement is safely written, and
@@ -509,7 +555,7 @@ fn convert_images<P: FnMut(u8, &str)>(
         }
     }
 
-    Ok(renames)
+    Ok(ConvertedImages { renames, reshaped })
 }
 
 /// Filenames in use, per directory, so that a converted image never lands on

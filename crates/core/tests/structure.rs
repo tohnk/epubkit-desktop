@@ -3,9 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use epubkit_core::structure::{
-    add_image_to_opf, build_rename_map, find_content_files, fix_svg_covers, fix_toc,
-    manifest_items, spine_hrefs, update_css_references, update_opf, update_opf_remove_fonts,
-    update_xhtml_references, TocOutcome,
+    add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
+    fix_toc, manifest_items, show_reshaped_pages, spine_hrefs, update_css_references, update_opf,
+    update_opf_remove_fonts, update_xhtml_references, TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -640,4 +640,137 @@ fn an_empty_spine_is_reported_not_guessed_at() {
         fix_toc(dir.path(), &doc).unwrap(),
         TocOutcome::Skipped(_)
     ));
+}
+
+// ---------------------------------------------------- Light Novel reshaping
+
+fn split_spread() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([(
+        "images/spread_part1.jpg".to_string(),
+        vec![
+            "images/spread_part1.jpg".to_string(),
+            "images/spread_part2.jpg".to_string(),
+        ],
+    )])
+}
+
+/// The first page keeps its place; each further page follows it, shown the
+/// same way but without an id, which has to stay unique. The spread's size no
+/// longer describes either page.
+#[test]
+fn a_split_image_is_followed_by_its_other_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>
+<p><img id="spread" class="plate" epub:type="illustration" src="../images/spread_part1.jpg" alt="Both pages" width="1000" height="400"/></p>
+<p><img src="../images/other.jpg" alt="" width="10" height="20"/></p>
+</body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    let first = out.find("spread_part1.jpg").expect("first page");
+    let second = out.find("spread_part2.jpg").expect("second page");
+    assert!(first < second, "{out}");
+    assert_eq!(out.matches(r#"class="plate""#).count(), 2, "{out}");
+    assert_eq!(
+        out.matches(r#"epub:type="illustration""#).count(),
+        2,
+        "{out}"
+    );
+    assert_eq!(out.matches(r#"id="spread""#).count(), 1, "{out}");
+    assert!(!out.contains(r#"width="1000""#), "{out}");
+    assert!(
+        out.contains(r#"width="10" height="20""#),
+        "an unrelated image keeps its size: {out}"
+    );
+}
+
+/// An SVG wrapper's viewBox is sized to the old shape, so it would squash the
+/// new pages into it. It gives way to a plain image per page.
+#[test]
+fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><div class="illust">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread_part1.jpg"/></svg>
+</div></body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(!out.contains("<svg"), "{out}");
+    assert!(
+        out.contains(r#"<img src="../images/spread_part1.jpg""#),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"<img src="../images/spread_part2.jpg""#),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// A rotated image is one page, but no longer the shape its size describes.
+#[test]
+fn a_rotated_image_loses_the_size_it_no_longer_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="images/plate.jpg" alt="" width="800" height="600"/>"#),
+    );
+    let rotated = BTreeMap::from([(
+        "images/plate.jpg".to_string(),
+        vec!["images/plate.jpg".to_string()],
+    )]);
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &rotated).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert_eq!(out.matches("<img").count(), 1, "{out}");
+    assert!(!out.contains("width="), "{out}");
+}
+
+#[test]
+fn split_pages_are_declared_under_ids_of_their_own() {
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="plate" href="images/spread_part1.jpg" media-type="image/jpeg"/>
+    <item id="plate-2" href="images/unrelated.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine/>
+</package>
+"#);
+
+    assert_eq!(declare_reshaped_pages(&doc, &split_spread()).unwrap(), 1);
+
+    let added = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.href == "images/spread_part2.jpg")
+        .expect("the second page should be declared");
+    assert_eq!(added.id, "plate-2-2", "plate-2 was taken");
+    assert_eq!(added.media_type, "image/jpeg");
 }

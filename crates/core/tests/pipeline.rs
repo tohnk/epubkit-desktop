@@ -391,8 +391,21 @@ fn solid(format: image::ImageFormat, grey: u8) -> Vec<u8> {
 /// one chapter, in a subdirectory of its own, shows each of them. Returns the
 /// unpacked output.
 fn convert_images_book(images: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
+    let body: String = images
+        .iter()
+        .map(|(href, _)| format!(r#"<p><img src="../{href}" alt=""/></p>"#))
+        .collect();
+    optimize_book(images, &body, &ProcessingOptions::default())
+}
+
+/// Optimize a book whose manifest lists `images` and whose one chapter, in a
+/// subdirectory of its own, has `body`. Returns the unpacked output.
+fn optimize_book(
+    images: &[(&str, Vec<u8>)],
+    body: &str,
+    options: &ProcessingOptions,
+) -> tempfile::TempDir {
     let mut manifest = String::new();
-    let mut body = String::new();
     for (index, (href, _)) in images.iter().enumerate() {
         let media_type = if href.to_ascii_lowercase().ends_with(".png") {
             "image/png"
@@ -402,7 +415,6 @@ fn convert_images_book(images: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
         manifest.push_str(&format!(
             r#"<item id="img{index}" href="{href}" media-type="{media_type}"/>"#
         ));
-        body.push_str(&format!(r#"<p><img src="../{href}" alt=""/></p>"#));
     }
 
     let opf = format!(
@@ -447,7 +459,7 @@ fn convert_images_book(images: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
     common::write_epub(&input, &entries);
-    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+    process_epub(&input, &output, options, |_, _| {}).unwrap();
 
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
@@ -484,7 +496,8 @@ fn shown_greys(work: &Path) -> Vec<u8> {
         .collect()
 }
 
-/// Every image in the manifest is in the archive, under an href of its own.
+/// Every image in the manifest is in the archive, under an href of its own,
+/// and every image in the archive is in the manifest.
 fn assert_manifest_matches_archive(work: &Path) {
     let opf = xml::parse_file(&work.join("OEBPS/content.opf")).unwrap();
     let hrefs: Vec<String> = structure::manifest_items(&opf)
@@ -503,6 +516,31 @@ fn assert_manifest_matches_archive(work: &Path) {
         hrefs.len(),
         "two items share a file: {hrefs:?}"
     );
+
+    let declared: std::collections::BTreeSet<std::path::PathBuf> = hrefs
+        .iter()
+        .map(|href| work.join("OEBPS").join(href))
+        .collect();
+    for file in image_files(&work.join("OEBPS")) {
+        assert!(
+            declared.contains(&file),
+            "{} is packaged but not in the manifest",
+            file.display()
+        );
+    }
+}
+
+fn image_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(image_files(&path));
+        } else if image::ImageFormat::from_path(&path).is_ok() {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// Upstream's issue #11: `image.png` and `image.jpeg` both became `image.jpg`,
@@ -572,4 +610,111 @@ fn same_named_images_in_different_directories_keep_their_own_references() {
         chapter_sources(work.path())
     );
     assert_manifest_matches_archive(work.path());
+}
+
+// ---------------------------------------------------------- Light Novel mode
+
+/// A double-page spread: black on the left, white on the right.
+fn spread() -> Vec<u8> {
+    let picture = image::GrayImage::from_fn(1000, 400, |x, _| {
+        image::Luma([if x < 500 { 0 } else { 255 }])
+    });
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(picture)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encode fixture image");
+    out
+}
+
+fn light_novel() -> ProcessingOptions {
+    ProcessingOptions {
+        light_novel_mode: true,
+        ..ProcessingOptions::default()
+    }
+}
+
+fn read_chapter(work: &Path) -> String {
+    fs::read_to_string(work.join("OEBPS/text/chapter1.xhtml")).unwrap()
+}
+
+/// Light Novel mode splits a spread into two pages, the right half first for
+/// right-to-left reading. Both pages have to reach the manifest and the
+/// chapter, or half the picture is lost.
+#[test]
+fn both_halves_of_a_split_spread_are_shown_right_half_first() {
+    let work = optimize_book(
+        &[("images/spread.png", spread())],
+        r#"<p><img src="../images/spread.png" alt="A spread" class="plate" width="1000" height="400"/></p>"#,
+        &light_novel(),
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [255, 0]);
+    assert_manifest_matches_archive(work.path());
+
+    // The second page is shown like the first, but the spread's own size
+    // describes neither half.
+    let chapter = read_chapter(work.path());
+    assert_eq!(chapter.matches(r#"class="plate""#).count(), 2, "{chapter}");
+    assert!(!chapter.contains("width="), "{chapter}");
+    assert!(!chapter.contains("height="), "{chapter}");
+}
+
+/// Full-page illustrations are often wrapped in an SVG sized to the picture.
+/// A wrapper sized for the spread would squash each half into it, so it gives
+/// way to one plain image per page.
+#[test]
+fn an_svg_wrapped_spread_becomes_one_image_per_page() {
+    let work = optimize_book(
+        &[("images/spread.png", spread())],
+        r#"<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="100%" height="100%" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread.png"/></svg></div>"#,
+        &light_novel(),
+    );
+
+    let chapter = read_chapter(work.path());
+    assert!(!chapter.contains("<svg"), "{chapter}");
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [255, 0]);
+    assert_manifest_matches_archive(work.path());
+}
+
+#[test]
+fn the_summary_counts_a_split_spread_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", DEMO_OPF.as_bytes()),
+            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/chapter2.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/styles/main.css", DEMO_CSS.as_bytes()),
+            ("OEBPS/fonts/body.otf", b"not really a font"),
+            ("OEBPS/images/cover.png", &common::png_gradient(300, 400)),
+            ("OEBPS/images/plate.png", &spread()),
+        ],
+    );
+
+    let report = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &light_novel(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.images_total, 2);
+    assert_eq!(report.images_converted, 2);
+    assert_eq!(report.spreads_split, 1);
+    let summary = report.summary();
+    assert!(summary.contains("Converted 2/2 images"), "{summary}");
+    assert!(summary.contains("Split 1 double-page spread"), "{summary}");
 }
