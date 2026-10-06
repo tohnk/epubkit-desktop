@@ -93,8 +93,11 @@ fn no_markup_is_injected_during_recovery() {
 #[test]
 fn exactly_one_xml_declaration_is_emitted() {
     let (output, _) = repair(MALFORMED);
+    // The source's own declaration must not survive in any form: libxml2 2.9
+    // keeps it as a processing instruction, 2.14 as a `<!--?xml …?-->`
+    // comment.
     assert_eq!(
-        output.matches("<?xml").count(),
+        output.matches("?xml").count(),
         1,
         "expected a single XML declaration:\n{output}"
     );

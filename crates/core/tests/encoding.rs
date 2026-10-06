@@ -158,7 +158,7 @@ fn an_encoding_named_in_the_xml_declaration_is_obeyed() {
             output.starts_with(r#"<?xml version="1.0" encoding="utf-8"?>"#),
             "{label}: {output}"
         );
-        assert_eq!(output.matches("<?xml").count(), 1, "{label}: {output}");
+        assert_eq!(output.matches("?xml").count(), 1, "{label}: {output}");
     }
 }
 

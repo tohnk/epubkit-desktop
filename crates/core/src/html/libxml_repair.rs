@@ -28,10 +28,11 @@
 //!
 //! This implementation serializes as XML, so void elements stay closed. It
 //! also strips the two artifacts libxml2's HTML *parser* leaves on the tree —
-//! a synthesized HTML 4.0 doctype and the source's XML declaration demoted to
-//! a processing instruction — then re-emits one correct declaration. The
-//! Python sidesteps those two by serializing the root element rather than the
-//! whole document, which also means it emits no XML declaration at all.
+//! a synthesized HTML 4.0 doctype and the source's XML declaration, demoted to
+//! a processing instruction or a comment — then re-emits one correct
+//! declaration. The Python sidesteps those two by serializing the root element
+//! rather than the whole document, which also means it emits no XML
+//! declaration at all.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -96,18 +97,30 @@ fn save_options(no_declaration: bool) -> SaveOptions {
 
 /// Remove the artifacts libxml2's HTML parser adds to a document that was
 /// really XHTML: a synthesized HTML 4.0 doctype, and the source's own XML
-/// declaration demoted to a processing instruction.
+/// declaration, demoted by 2.9 to a processing instruction and by 2.14, which
+/// reads `<?` as HTML5 does, to a `<!--?xml …?-->` comment.
 fn strip_html_parser_artifacts(doc: &mut Document) {
     doc.remove_internal_subset();
 
     let root = doc.as_node();
     for mut child in root.get_child_nodes() {
-        if child.get_type() == Some(NodeType::PiNode)
-            && child.get_name().eq_ignore_ascii_case("xml")
-        {
+        let declaration = match child.get_type() {
+            Some(NodeType::PiNode) => child.get_name().eq_ignore_ascii_case("xml"),
+            Some(NodeType::CommentNode) => is_demoted_declaration(&child.get_content()),
+            _ => false,
+        };
+        if declaration {
             child.unlink();
         }
     }
+}
+
+/// Whether a comment is what libxml2 2.14 makes of an XML declaration.
+fn is_demoted_declaration(comment: &str) -> bool {
+    comment
+        .get(..4)
+        .is_some_and(|start| start.eq_ignore_ascii_case("?xml"))
+        && comment[4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '?')
 }
 
 /// Prepare malformed input for the HTML parser that recovers it.
