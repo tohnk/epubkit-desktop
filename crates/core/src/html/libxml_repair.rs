@@ -110,10 +110,10 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
 /// (`libxml`'s `encoding` option would be the direct route, but 0.3.21 frees
 /// the C string it builds from it before libxml2 reads it.)
 ///
-/// Only input with something to decode gets the mark. ASCII reads the same in
-/// every encoding in question, and 2.9 looks for a mark only when at least four
-/// bytes are there to look at, so on an empty chapter it would come out as
-/// text.
+/// Only input with something to decode carries the mark, a mark of the file's
+/// own included. ASCII reads the same in every encoding in question, and 2.9
+/// looks for a mark only when at least four bytes are there to look at, so on
+/// a chapter holding nothing else it would come out as text.
 ///
 /// Input that is not UTF-8 goes through untouched, left to libxml2's own
 /// detection rather than forced into the wrong encoding.
@@ -122,11 +122,16 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
 /// byte order mark and the XML declaration, defaulting to UTF-8.
 fn prepare_for_recovery(input: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
     let utf8 = std::str::from_utf8(input).is_ok();
-
-    let bytes = if utf8 && !input.is_ascii() && !input.starts_with(UTF8_BOM) {
-        Cow::Owned([UTF8_BOM, input].concat())
+    let content = if utf8 {
+        input.strip_prefix(UTF8_BOM).unwrap_or(input)
     } else {
-        Cow::Borrowed(input)
+        input
+    };
+
+    let bytes = if utf8 && !content.is_ascii() {
+        Cow::Owned([UTF8_BOM, content].concat())
+    } else {
+        Cow::Borrowed(content)
     };
     let options = ParserOptions {
         ignore_enc: utf8,
@@ -156,6 +161,14 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     let mut doc = Parser::default_html()
         .parse_string_with_options(bytes, options)
         .map_err(|e| Error::Xml(format!("unrecoverable XHTML: {e}")))?;
+
+    // Recovering an empty or blank file yields no element at all, depending
+    // on the libxml2 release, either as a failure or as a document with no
+    // root, which would serialize to a bare declaration. Either way there was
+    // nothing to recover.
+    if doc.get_root_element().is_none() {
+        return Err(Error::Xml("unrecoverable XHTML: no content".into()));
+    }
 
     strip_html_parser_artifacts(&mut doc);
 

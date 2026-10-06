@@ -6,17 +6,84 @@
 //! `cssutils` would flatten or lose.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use lightningcss::printer::PrinterOptions;
 use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::traits::ToCss;
 
 use crate::html;
-use crate::{xml, Result};
+use crate::{xml, Error, Result};
 
 /// Selectors that must never be dropped, whatever the content looks like.
 const ALWAYS_KEEP: &[&str] = &["*", "html", "body"];
+
+/// What a stylesheet opens with to declare its encoding. CSS allows exactly
+/// this form, and only at the very start.
+const CHARSET_RULE_START: &[u8] = b"@charset \"";
+const CHARSET_RULE_END: &[u8] = b"\";";
+
+/// Read a stylesheet as text, in whatever encoding it was saved.
+pub fn read_stylesheet(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    Ok(decode_stylesheet(&bytes))
+}
+
+/// Decode a stylesheet the way browsers do: a byte order mark decides, then an
+/// `@charset` rule naming a legacy encoding. Otherwise it is UTF-8 if its
+/// bytes are valid UTF-8, and windows-1252 if not, the encoding legacy CSS
+/// overwhelmingly was; that includes one declaring a UTF-8 its bytes belie.
+///
+/// What comes back is fit to save as UTF-8, which is how everything here is
+/// saved: an `@charset` naming anything else is rewritten to name UTF-8, so a
+/// stylesheet never declares one encoding while being in another.
+pub fn decode_stylesheet(bytes: &[u8]) -> String {
+    let encoding = match Encoding::for_bom(bytes) {
+        Some((encoding, _)) => encoding,
+        None => {
+            // A stylesheet really in UTF-16 cannot spell an ASCII `@charset`,
+            // so one claiming UTF-16 is wrong; CSS reads it as UTF-8.
+            let declared = charset_label(bytes)
+                .and_then(Encoding::for_label)
+                .filter(|e| ![UTF_8, UTF_16BE, UTF_16LE].contains(e));
+            match declared {
+                Some(encoding) => encoding,
+                None if std::str::from_utf8(bytes).is_ok() => UTF_8,
+                None => WINDOWS_1252,
+            }
+        }
+    };
+
+    // `decode` strips a byte order mark, which a UTF-8 file has no need of.
+    let (text, _, _) = encoding.decode(bytes);
+    let text = text.into_owned();
+
+    let Some(rule_length) = charset_rule_length(text.as_bytes()) else {
+        return text;
+    };
+    if charset_label(text.as_bytes()).and_then(Encoding::for_label) == Some(UTF_8) {
+        return text;
+    }
+    format!("@charset \"UTF-8\";{}", &text[rule_length..])
+}
+
+/// The label in a stylesheet's opening `@charset` rule, if it has one.
+fn charset_label(bytes: &[u8]) -> Option<&[u8]> {
+    let rest = bytes.strip_prefix(CHARSET_RULE_START)?;
+    let end = rest
+        .windows(CHARSET_RULE_END.len())
+        .position(|window| window == CHARSET_RULE_END)?;
+    Some(&rest[..end])
+}
+
+/// How many bytes the opening `@charset` rule takes up, if there is one.
+fn charset_rule_length(bytes: &[u8]) -> Option<usize> {
+    charset_label(bytes)
+        .map(|label| CHARSET_RULE_START.len() + label.len() + CHARSET_RULE_END.len())
+}
 
 /// Everything a document uses that a selector could match on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

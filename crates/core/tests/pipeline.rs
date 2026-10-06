@@ -718,3 +718,91 @@ fn the_summary_counts_a_split_spread_once() {
     assert!(summary.contains("Converted 2/2 images"), "{summary}");
     assert!(summary.contains("Split 1 double-page spread"), "{summary}");
 }
+
+// ------------------------------------------------- files that cannot be read
+
+/// The demo book, with some of its files replaced.
+fn demo_epub_with(path: &Path, replacements: &[(&str, &[u8])]) {
+    let cover = common::png_gradient(300, 400);
+    let plate = common::png_gradient(240, 160);
+    let mut entries: Vec<(&str, &[u8])> = vec![
+        ("mimetype", b"application/epub+zip"),
+        ("META-INF/container.xml", common::CONTAINER_XML),
+        ("OEBPS/content.opf", DEMO_OPF.as_bytes()),
+        ("OEBPS/chapter1.xhtml", MALFORMED_CHAPTER.as_bytes()),
+        ("OEBPS/chapter2.xhtml", CLEAN_CHAPTER.as_bytes()),
+        ("OEBPS/styles/main.css", DEMO_CSS.as_bytes()),
+        (
+            "OEBPS/fonts/body.otf",
+            b"not really a font, but named like one",
+        ),
+        ("OEBPS/images/cover.png", &cover),
+        ("OEBPS/images/plate.png", &plate),
+    ];
+    for (name, bytes) in replacements {
+        let entry = entries.iter_mut().find(|(n, _)| n == name).unwrap();
+        entry.1 = bytes;
+    }
+    common::write_epub(path, &entries);
+}
+
+/// A stylesheet saved in a legacy encoding is read in it, and written back as
+/// UTF-8 that says so, rather than failing the book.
+#[test]
+fn a_stylesheet_in_a_legacy_encoding_does_not_sink_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    demo_epub_with(
+        &input,
+        &[(
+            "OEBPS/styles/main.css",
+            b"@charset \"iso-8859-1\";\n/* \xa9 Verlag */\n.lead { background: url(../images/plate.png); }\n",
+        )],
+    );
+
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
+        .expect("one stylesheet must not sink the book");
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    let css = String::from_utf8(fs::read(work.path().join("OEBPS/styles/main.css")).unwrap())
+        .expect("a rewritten stylesheet is UTF-8");
+    assert!(css.contains("\u{a9} Verlag"), "{css}");
+    assert!(css.contains("plate.jpg"), "{css}");
+    assert!(
+        !css.to_ascii_lowercase().contains("iso-8859-1"),
+        "the declaration must match the bytes: {css}"
+    );
+}
+
+/// A chapter nothing can parse, such as an empty file, is left as it was
+/// rather than failing the whole book, and the report says so.
+#[test]
+fn an_unreadable_chapter_is_left_alone_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", b"")]);
+
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
+        .expect("one chapter must not sink the book");
+
+    assert_eq!(report.documents_unreadable, 1);
+    assert!(
+        report.summary().contains("1 unreadable document"),
+        "{}",
+        report.summary()
+    );
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    assert!(fs::read(work.path().join("OEBPS/chapter2.xhtml"))
+        .unwrap()
+        .is_empty());
+    let one = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    assert!(
+        one.contains("images/plate.jpg"),
+        "the rest of the book is done: {one}"
+    );
+}

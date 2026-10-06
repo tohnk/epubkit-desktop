@@ -211,3 +211,17 @@ fn void_elements_stay_closed_through_recovery() {
 fn default_backend_is_libxml2() {
     assert_eq!(default_backend().name(), "libxml2");
 }
+
+/// An empty or blank file holds nothing to recover. Depending on the libxml2
+/// release, recovering one either fails or yields a document with no root
+/// element, which would serialize to a bare declaration: not XHTML at all.
+/// Both are refused, the same on every release.
+#[test]
+fn a_file_with_nothing_in_it_is_refused() {
+    for input in ["", "   \n", "\u{feff}"] {
+        assert!(
+            LibxmlRepair::new().repair(input.as_bytes()).is_err(),
+            "{input:?} was not refused"
+        );
+    }
+}

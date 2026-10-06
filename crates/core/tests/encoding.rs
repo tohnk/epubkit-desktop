@@ -96,7 +96,7 @@ fn a_stale_latin1_declaration_does_not_mangle_utf8() {
 fn nothing_is_added_to_the_text() {
     for chapter in ["", "   \n", "<p>x", "<p>ä", "<p>ä<br></p>"] {
         let Ok(out) = LibxmlRepair::new().repair(chapter.as_bytes()) else {
-            continue; // refusing an empty chapter is not adding to it
+            continue; // refusing a chapter is not adding to it
         };
         let text = String::from_utf8(out.bytes).unwrap();
         assert!(

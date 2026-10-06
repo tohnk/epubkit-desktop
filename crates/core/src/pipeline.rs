@@ -100,6 +100,8 @@ pub struct ProcessingReport {
     pub blank_elements_removed: usize,
     pub attributes_stripped: usize,
     pub documents_recovered: usize,
+    /// Content documents nothing could parse, left exactly as they were.
+    pub documents_unreadable: usize,
     pub text: TextCleanReport,
     pub os_artifacts_removed: usize,
 }
@@ -149,6 +151,17 @@ impl ProcessingReport {
             parts.push(format!(
                 "Fixed {} SVG cover wrappers",
                 self.svg_covers_fixed
+            ));
+        }
+        if self.documents_unreadable > 0 {
+            let n = self.documents_unreadable;
+            let (plural, as_it_was) = if n == 1 {
+                ("", "it was")
+            } else {
+                ("s", "they were")
+            };
+            parts.push(format!(
+                "Left {n} unreadable document{plural} as {as_it_was}"
             ));
         }
         if self.documents_recovered > 0 {
@@ -274,15 +287,23 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // *after* rewriting references, which meant the rewriting step silently
     // repaired the file first and the repair count came out as zero. Going
     // first also means every later step sees a well-formed tree.
+    //
+    // A chapter nothing can parse, an empty file say, is left exactly as it
+    // was rather than sinking the book; every later step works only on the
+    // chapters that did parse.
     progress(62, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
+    let mut chapters: Vec<&Path> = Vec::new();
     for path in &content.xhtml {
         if !path.is_file() {
             continue;
         }
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
 
-        let repaired = backend.repair(&bytes)?;
+        let Ok(repaired) = backend.repair(&bytes) else {
+            report.documents_unreadable += 1;
+            continue;
+        };
         if repaired.recovered {
             report.documents_recovered += 1;
         }
@@ -291,6 +312,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         report.attributes_stripped += count;
 
         fs::write(path, stripped).map_err(|e| Error::io(path, e))?;
+        chapters.push(path);
     }
 
     progress(66, "Fixing SVG covers...");
@@ -300,10 +322,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
         structure::update_opf(&opf, &rename_map)?;
-        for path in &content.xhtml {
-            if path.is_file() {
-                structure::update_xhtml_references(&opf_dir, path, &rename_map)?;
-            }
+        for &path in &chapters {
+            structure::update_xhtml_references(&opf_dir, path, &rename_map)?;
         }
         for path in &content.css {
             if path.is_file() {
@@ -317,28 +337,24 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !converted.reshaped.is_empty() {
         progress(72, "Showing reshaped pages...");
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
-        for path in &content.xhtml {
-            if path.is_file() {
-                structure::show_reshaped_pages(&opf_dir, path, &converted.reshaped)?;
-            }
+        for &path in &chapters {
+            structure::show_reshaped_pages(&opf_dir, path, &converted.reshaped)?;
         }
     }
 
     if options.remove_unused_css {
         progress(76, "Removing unused CSS...");
         let mut used = css::UsedSelectors::default();
-        for path in &content.xhtml {
-            if path.is_file() {
-                let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-                used.merge(&css::collect_used_selectors(&bytes)?);
-            }
+        for &path in &chapters {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            used.merge(&css::collect_used_selectors(&bytes)?);
         }
 
         for path in &content.css {
             if !path.is_file() {
                 continue;
             }
-            let stylesheet = read_text(path)?;
+            let stylesheet = css::read_stylesheet(path)?;
             let (cleaned, removed) = css::remove_unused_css(&stylesheet, &used);
             report.css_rules_removed += removed;
             if removed > 0 {
@@ -354,7 +370,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             if !path.is_file() {
                 continue;
             }
-            let stylesheet = read_text(path)?;
+            let stylesheet = css::read_stylesheet(path)?;
             let (cleaned, removed) = css::remove_embedded_fonts(&stylesheet);
             report.fonts_removed += removed;
             if removed > 0 {
@@ -372,10 +388,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     progress(82, "Normalizing content...");
-    for path in &content.xhtml {
-        if !path.is_file() {
-            continue;
-        }
+    for &path in &chapters {
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let (cleaned, removed) = html::normalize_whitespace(&bytes)?;
         report.blank_elements_removed += removed;
@@ -390,10 +403,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             ..TextCleanOptions::default()
         };
 
-        for path in &content.xhtml {
-            if !path.is_file() {
-                continue;
-            }
+        for &path in &chapters {
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             let (cleaned, file_report) = crate::text::clean_text_content(&bytes, &text_options)?;
             if file_report.total_fixes() > 0 {
@@ -604,11 +614,6 @@ fn fold_case(name: &str) -> String {
 
 fn same_name(a: &str, b: &str) -> bool {
     fold_case(a) == fold_case(b)
-}
-
-fn read_text(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn format_size(bytes: u64) -> String {

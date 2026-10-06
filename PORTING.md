@@ -363,6 +363,20 @@ common around full-page illustrations and sized to the spread in its viewBox,
 gives way to a plain image per page. A rotated image sheds its old size and
 wrapper the same way. The report counts a split spread as one image.
 
+### One unreadable file does not sink the book
+
+A chapter nothing can parse, an empty or blank file say, is left exactly as
+it was, as the reference left it, and the report counts it; every other step
+works on the chapters that did parse. libxml2 2.14 "recovers" an empty file
+into a document with no root element, which would serialize to a bare
+declaration, so that counts as unreadable too.
+
+Stylesheets are decoded as browsers decode them, from a byte order mark, then
+an `@charset` naming a legacy encoding; otherwise as UTF-8 if the bytes are
+valid UTF-8, and as windows-1252 if not. The reference read them as UTF-8 and
+dropped what did not fit. One the run rewrites is saved as UTF-8, its
+`@charset` rewritten to match; one it leaves alone keeps its bytes.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But

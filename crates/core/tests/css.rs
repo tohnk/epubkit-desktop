@@ -1,5 +1,6 @@
 use epubkit_core::css::{
-    collect_used_selectors, remove_embedded_fonts, remove_unused_css, UsedSelectors,
+    collect_used_selectors, decode_stylesheet, remove_embedded_fonts, remove_unused_css,
+    UsedSelectors,
 };
 
 fn used_from(body: &str) -> UsedSelectors {
@@ -197,4 +198,51 @@ fn comments_and_imports_survive() {
 
     assert!(out.contains("@import"), "{out}");
     assert!(out.contains(".lead"), "{out}");
+}
+
+// ------------------------------------------------------------- encodings
+
+#[test]
+fn a_stylesheet_that_is_not_utf8_is_read_as_windows_1252() {
+    // Latin-1 "©", and windows-1252's "€", which Latin-1 lacks.
+    let css = decode_stylesheet(b"/* \xa9 Verlag, 5 \x80 */\np { margin: 0; }\n");
+    assert_eq!(css, "/* \u{a9} Verlag, 5 \u{20ac} */\np { margin: 0; }\n");
+}
+
+/// An `@charset` naming a legacy encoding is honoured, and rewritten to name
+/// UTF-8, which is what the text will be saved as.
+#[test]
+fn a_declared_encoding_is_honoured_and_redeclared() {
+    let css = decode_stylesheet(b"@charset \"iso-8859-1\";\n/* \xa9 */\n");
+    assert_eq!(css, "@charset \"UTF-8\";\n/* \u{a9} */\n");
+
+    // Shift_JIS, for the Japanese books Light Novel mode is for.
+    let css = decode_stylesheet(
+        b"@charset \"Shift_JIS\";\np::before { content: \"\x93\xfa\x96{\x8c\xea\"; }\n",
+    );
+    assert_eq!(
+        css,
+        "@charset \"UTF-8\";\np::before { content: \"日本語\"; }\n"
+    );
+}
+
+#[test]
+fn utf8_is_read_as_it_is() {
+    let plain = "@charset \"utf-8\";\n/* © */\np { margin: 0; }\n";
+    assert_eq!(decode_stylesheet(plain.as_bytes()), plain);
+
+    // A byte order mark is dropped; a file saved as UTF-8 has no need of one.
+    let marked = [b"\xef\xbb\xbf".as_slice(), b"/* \xc2\xa9 */"].concat();
+    assert_eq!(decode_stylesheet(&marked), "/* \u{a9} */");
+}
+
+/// A declaration the bytes contradict is not believed: these bytes are not
+/// UTF-8, and an ASCII `@charset` cannot be in UTF-16.
+#[test]
+fn a_declaration_the_bytes_contradict_is_not_believed() {
+    let css = decode_stylesheet(b"@charset \"UTF-8\";\n/* \xa9 */\n");
+    assert_eq!(css, "@charset \"UTF-8\";\n/* \u{a9} */\n");
+
+    let css = decode_stylesheet(b"@charset \"utf-16\";\np { margin: 0; }\n");
+    assert_eq!(css, "@charset \"UTF-8\";\np { margin: 0; }\n");
 }

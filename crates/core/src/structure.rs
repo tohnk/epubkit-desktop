@@ -372,7 +372,7 @@ pub fn update_css_references(
     let renames = Renames::new(opf_dir, rename_map);
     let base = path.parent().unwrap_or(opf_dir);
 
-    let css = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+    let css = crate::css::read_stylesheet(path)?;
     let rewritten = rewrite_css_urls(&css, base, &renames);
 
     if rewritten == css {
