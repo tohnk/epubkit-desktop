@@ -33,7 +33,9 @@
 //! Python sidesteps those two by serializing the root element rather than the
 //! whole document, which also means it emits no XML declaration at all.
 
-use libxml::parser::Parser;
+use std::borrow::Cow;
+
+use libxml::parser::{Parser, ParserOptions};
 use libxml::tree::{Document, NodeType, SaveOptions};
 
 use super::{ContentDocument, HtmlRepair, Repaired};
@@ -41,6 +43,8 @@ use crate::xml::hardened_options;
 use crate::{Error, Result};
 
 const XML_DECLARATION: &str = r#"<?xml version="1.0" encoding="utf-8"?>"#;
+
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Repairs XHTML with libxml2, trying a strict parse before falling back to
 /// error recovery.
@@ -91,6 +95,42 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
     }
 }
 
+/// Prepare malformed input for the HTML parser that recovers it.
+///
+/// Left to itself, libxml2's HTML parser guesses the encoding, and the guess
+/// has changed between releases: 2.9 reads undeclared bytes as UTF-8, 2.14 as
+/// ISO-8859-1, so every "ä" in a malformed chapter comes back as "Ã¤". Both
+/// also obey a `<meta>` charset, and books converted from old HTML often still
+/// declare ISO-8859-1 long after their bytes were re-encoded as UTF-8.
+///
+/// EPUB content documents are UTF-8, so input that is valid UTF-8 is parsed as
+/// UTF-8 whatever it declares. Two things hold every release to that: a byte
+/// order mark, which settles the encoding before anything in the document can,
+/// and `ignore_enc`, without which 2.9 still lets a `<meta>` override the mark.
+/// (`libxml`'s `encoding` option would be the direct route, but 0.3.21 frees
+/// the C string it builds from it before libxml2 reads it.)
+///
+/// Input that is not UTF-8 goes through untouched, left to libxml2's own
+/// detection rather than forced into the wrong encoding.
+///
+/// The strict XML parse needs none of this: XML settles the encoding from the
+/// byte order mark and the XML declaration, defaulting to UTF-8.
+fn prepare_for_recovery(input: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
+    let utf8 = std::str::from_utf8(input).is_ok();
+
+    let bytes = if utf8 && !input.starts_with(UTF8_BOM) {
+        Cow::Owned([UTF8_BOM, input].concat())
+    } else {
+        Cow::Borrowed(input)
+    };
+    let options = ParserOptions {
+        ignore_enc: utf8,
+        ..hardened_options(true)
+    };
+
+    (bytes, options)
+}
+
 /// Parse an EPUB content document, recovering if it is malformed.
 ///
 /// Exposed so callers that need to *edit* a content document — rewriting image
@@ -107,8 +147,9 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     }
 
     // Malformed. The HTML parser recovers without dropping text.
+    let (bytes, options) = prepare_for_recovery(input);
     let mut doc = Parser::default_html()
-        .parse_string_with_options(input, hardened_options(true))
+        .parse_string_with_options(bytes, options)
         .map_err(|e| Error::Xml(format!("unrecoverable XHTML: {e}")))?;
 
     strip_html_parser_artifacts(&mut doc);

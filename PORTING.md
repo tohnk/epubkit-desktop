@@ -205,6 +205,21 @@ whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
 
+### Malformed chapters are read as UTF-8
+
+The reference's recovery parser left the encoding to libxml2, which obeys a
+`<meta>` charset that is often stale, and which in recent releases (2.14) reads
+a chapter declaring no charset as ISO-8859-1. Either way valid UTF-8 came out
+as mojibake: "ä" as "Ã¤". Upstream fixed this after the fork
+(b1rdmania/epubkit#8) by forcing UTF-8 whenever the bytes are valid UTF-8. The
+port does the same, so here it matches upstream rather than `7cf9a65`.
+
+It cannot do so by passing the encoding: the `libxml` crate's `encoding`
+option is unsound in 0.3.21, freeing the C string it builds before libxml2
+reads it. `html::parse_content` prefixes a byte order mark and sets
+`ignore_enc` instead. `tests/encoding.rs` pins the result, and must pass
+against libxml2 2.9 and 2.14 alike, which disagree about the default.
+
 ### Prose after `<code>` and `<pre>` is cleaned
 
 lxml stores the text *following* an element as that element's `tail`, so
@@ -368,3 +383,9 @@ always produces a byte-identical archive.
   release, since this code parses untrusted files. The parser is already
   configured to refuse network access and to leave entity references
   unexpanded; see `core::xml::hardened_options`.
+- A malformed chapter that is *not* UTF-8 and opens with an XML declaration
+  loses its accented characters under libxml2 2.14, which takes `<?xml` to
+  mean UTF-8 whatever the declaration says. EPUB requires UTF-8, so this is
+  rare, and the UTF-8 fix above neither causes nor cures it. Passing the
+  declared encoding to the parser would, once the `libxml` crate's `encoding`
+  option is safe to use.
