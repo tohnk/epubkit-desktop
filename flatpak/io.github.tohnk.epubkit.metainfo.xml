@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tohnk.epubkit</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>epubkit</name>
+  <summary>Optimize EPUB books for e-ink readers</summary>
+  <developer id="io.github.tohnk">
+    <name>tohnk</name>
+  </developer>
+
+  <description>
+    <p>
+      epubkit gets any EPUB ready for a small e-ink reader in one pass. It is
+      tuned for the Xteink X4 and X3, and the books it makes read well on any
+      EPUB reader.
+    </p>
+    <ul>
+      <li>Converts images to baseline JPEG, sized for the screen and dithered to four shades of grey</li>
+      <li>Removes embedded fonts and stylesheet rules the book never uses</li>
+      <li>Repairs broken markup and text read in the wrong encoding</li>
+      <li>Fixes the table of contents and strips store metadata</li>
+      <li>Rotates and splits double-page spreads for manga and light novels</li>
+    </ul>
+    <p>
+      Books protected by DRM are recognised and left alone. epubkit is based on
+      the original by b1rdmania.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.tohnk.epubkit.desktop</launchable>
+  <url type="homepage">https://github.com/tohnk/epubkit-desktop</url>
+  <url type="vcs-browser">https://github.com/tohnk/epubkit-desktop</url>
+
+  <content_rating type="oars-1.1" />
+
+  <requires>
+    <display_length compare="ge">520</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-06">
+      <description>
+        <p>The first release packaged as a Flatpak.</p>
+      </description>
+    </release>
+  </releases>
+</component>

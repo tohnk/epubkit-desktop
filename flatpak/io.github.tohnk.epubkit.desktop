@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=epubkit
+GenericName=EPUB Optimizer
+Comment=Optimize EPUB books for e-ink readers
+Exec=epubkit-desktop
+Icon=io.github.tohnk.epubkit
+Terminal=false
+Categories=Office;Publishing;
+Keywords=ebook;epub;e-ink;eink;xteink;kindle;kobo;
+StartupNotify=true
+StartupWMClass=epubkit-desktop

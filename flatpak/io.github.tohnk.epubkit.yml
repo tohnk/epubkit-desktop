@@ -1,0 +1,71 @@
+# The desktop app as a Flatpak, built from source.
+#
+# Tauri draws the window with WebKitGTK 4.1, which the GNOME runtime ships,
+# as it does the libxml2 the core needs. So the runtime brings everything the
+# app uses, and nothing has to be installed on the host.
+#
+# To build and install it locally, with flatpak-builder installed and the
+# Flathub remote added:
+#
+#   flatpak-builder --user --install-deps-from=flathub --install --force-clean \
+#       build-dir flatpak/io.github.tohnk.epubkit.yml
+#   flatpak run io.github.tohnk.epubkit
+#
+# Cargo fetches crates during the build, which suits a bundle made here but
+# not Flathub, whose builds are offline. Submitting to Flathub would mean
+# vendoring them with flatpak-cargo-generator instead.
+id: io.github.tohnk.epubkit
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: epubkit-desktop
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # No filesystem access: books are opened, and the output folder chosen,
+  # through the file chooser portal, and dropped files arrive through the
+  # file transfer portal.
+  #
+  # "Show" asks the desktop's file manager to point at a finished book.
+  - --talk-name=org.freedesktop.FileManager1
+  # WebKit's DMA-BUF renderer leaves the window blank with some GPU drivers,
+  # NVIDIA's mostly. A form this simple has no need of the faster path.
+  - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/epubkit/cargo
+
+modules:
+  - name: epubkit
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked -p epubkit-desktop
+      - install -Dm755 target/release/epubkit-desktop -t /app/bin
+      - install -Dm644 flatpak/io.github.tohnk.epubkit.desktop -t /app/share/applications
+      - install -Dm644 flatpak/io.github.tohnk.epubkit.metainfo.xml -t /app/share/metainfo
+      - install -Dm644 crates/desktop/icons/icon.png /app/share/icons/hicolor/512x512/apps/io.github.tohnk.epubkit.png
+    # Run with flatpak-builder --run-tests, as CI does.
+    run-tests: true
+    test-commands:
+      # Every library the window links is in the runtime.
+      - "! ldd /app/bin/epubkit-desktop | grep 'not found'"
+      # And the core behaves with the runtime's libxml2, a newer release than
+      # the copies the main CI tests against.
+      - cargo test --locked -p epubkit-core
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .flatpak-builder
+          - build-dir
+          - target

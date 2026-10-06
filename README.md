@@ -71,6 +71,32 @@ The desktop app additionally needs a webview on Linux
 (`libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`); macOS and Windows use the
 system one.
 
+### On Linux, as a Flatpak
+
+The Flatpak carries everything the desktop app needs, so nothing has to be
+installed beyond Flatpak itself, with the [Flathub](https://flathub.org/setup)
+remote added (most distributions add it for you). Every push builds one:
+download `epubkit.flatpak` from the artifacts of the latest run of the
+[Flatpak workflow](https://github.com/tohnk/epubkit-desktop/actions/workflows/flatpak.yml),
+then
+
+```sh
+flatpak install --user epubkit.flatpak   # fetches the GNOME runtime from Flathub
+flatpak run io.github.tohnk.epubkit
+```
+
+To build it yourself, with `flatpak-builder` installed and Flathub added:
+
+```sh
+flatpak-builder --user --install-deps-from=flathub --install --force-clean \
+    build-dir flatpak/io.github.tohnk.epubkit.yml
+```
+
+The sandboxed app has no access to your files beyond what you give it: books
+come in through the file picker or by dropping them on the window, and the
+output folder is the one you choose. It keeps its settings apart from the
+command line's, under `~/.var/app/io.github.tohnk.epubkit`.
+
 ## Processing presets
 
 | Preset | Images | Text | Fonts | CSS | Metadata | Best for |
