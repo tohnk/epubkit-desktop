@@ -408,6 +408,17 @@ now be named exactly as the file it came from, neither front end ever
 replaces a file that is already there; the output becomes `name (2).epub`.
 The CLI used to write over one without asking.
 
+### Paths in a book stay inside it
+
+The reference joined manifest hrefs, and the package path in
+`container.xml`, to the unpacked book as they stood. An absolute href, or one
+climbing out with `..`, let a book have the pipeline rewrite or delete files
+that were not part of it: a "font" deleted, a "chapter" repaired over. The
+port resolves every such path within the book, a leading `/` from the book's
+root as URLs inside an EPUB container resolve, and ignores one that leads out.
+A `container.xml` naming a package that is not in the book falls back to the
+search for one that is.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But

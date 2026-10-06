@@ -147,8 +147,42 @@ pub fn spine_hrefs(doc: &Document) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// Where `href`, decoded, leads from `base`, a directory inside the book's
+/// `root` — or `None` if it leads out of the book.
+///
+/// The book is untrusted, and its hrefs become paths the pipeline reads,
+/// rewrites and deletes. Joined as they stand, an absolute href would replace
+/// the base and `..` would climb out of it, handing the pipeline files that
+/// are not the book's. A leading `/` starts from the book's root instead, as
+/// a URL inside an EPUB container does.
+pub fn resolve_href(root: &Path, base: &Path, href: &str) -> Option<PathBuf> {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    let from_base = base.strip_prefix(root).ok()?;
+
+    for component in from_base.components().chain(Path::new(href).components()) {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            Component::RootDir => parts.clear(),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            // A drive or share names another filesystem altogether.
+            Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(
+        parts
+            .iter()
+            .fold(root.to_path_buf(), |path, part| path.join(part)),
+    )
+}
+
 /// Classify every manifest entry by what the pipeline needs to do with it.
-pub fn find_content_files(opf_dir: &Path, doc: &Document) -> Result<ContentFiles> {
+/// `root` is where the book was unpacked; an entry that leads out of it is
+/// left out.
+pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result<ContentFiles> {
     let mut files = ContentFiles::default();
 
     for item in manifest_items(doc)? {
@@ -156,7 +190,9 @@ pub fn find_content_files(opf_dir: &Path, doc: &Document) -> Result<ContentFiles
         if href.is_empty() {
             continue;
         }
-        let path = opf_dir.join(&href);
+        let Some(path) = resolve_href(root, opf_dir, &href) else {
+            continue;
+        };
         let media_type = item.media_type.to_ascii_lowercase();
 
         match media_type.as_str() {
@@ -536,13 +572,15 @@ pub fn show_reshaped_pages(
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
 /// which small e-ink readers render poorly or not at all. Only the first few
 /// spine entries are examined — a cover later than that is not a cover.
-pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
+pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usize> {
     const SPINE_ENTRIES_TO_CHECK: usize = 3;
 
     let mut fixed = 0;
 
     for (_, href) in spine_hrefs(doc)?.into_iter().take(SPINE_ENTRIES_TO_CHECK) {
-        let path = opf_dir.join(decode(&href));
+        let Some(path) = resolve_href(root, opf_dir, &decode(&href)) else {
+            continue;
+        };
         if !path.is_file() {
             continue;
         }
@@ -607,7 +645,7 @@ pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
 /// The reference implementation reported "Fixed N broken TOC references" while
 /// its fix-up function was an empty stub, so a book with a broken TOC kept it.
 /// Here a broken TOC is regenerated, which is what that comment intended.
-pub fn fix_toc(opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
+pub fn fix_toc(root: &Path, opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
     let spine = spine_hrefs(doc)?;
     if spine.is_empty() {
         return Ok(TocOutcome::Skipped("Empty spine".into()));
@@ -617,20 +655,22 @@ pub fn fix_toc(opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
         .into_iter()
         .find(|item| item.media_type == NCX_MEDIA_TYPE);
 
-    if let Some(item) = &existing_ncx {
-        let ncx_path = opf_dir.join(item.decoded_href());
-        if ncx_is_usable(&ncx_path)? {
-            return Ok(TocOutcome::Valid);
-        }
-    }
-
-    let chapters = extract_chapters(opf_dir, &spine);
     let ncx_href = existing_ncx
         .as_ref()
         .map(|item| item.decoded_href())
         .unwrap_or_else(|| "toc.ncx".to_string());
+    let Some(ncx_path) = resolve_href(root, opf_dir, &ncx_href) else {
+        return Ok(TocOutcome::Skipped(
+            "TOC left alone: it lies outside the book".into(),
+        ));
+    };
 
-    write_ncx(&opf_dir.join(&ncx_href), &chapters)?;
+    if existing_ncx.is_some() && ncx_is_usable(root, &ncx_path)? {
+        return Ok(TocOutcome::Valid);
+    }
+
+    let chapters = extract_chapters(root, opf_dir, &spine);
+    write_ncx(&ncx_path, &chapters)?;
 
     // A newly created NCX has to be declared, and pointed at from the spine.
     if existing_ncx.is_none() {
@@ -883,7 +923,7 @@ fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
 
 /// An NCX counts as usable when it parses, declares at least one navPoint, and
 /// every target it names exists on disk.
-fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
+fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
     if !ncx_path.is_file() {
         return Ok(false);
     }
@@ -912,7 +952,7 @@ fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
             if file.is_empty() {
                 continue;
             }
-            if !ncx_dir.join(decode(file)).exists() {
+            if !resolve_href(root, ncx_dir, &decode(file)).is_some_and(|path| path.exists()) {
                 return Ok(false);
             }
         }
@@ -923,12 +963,13 @@ fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
 
 /// Derive chapter titles from the spine, preferring `<title>` and falling back
 /// to the first heading, then to a positional name.
-fn extract_chapters(opf_dir: &Path, spine: &[(String, String)]) -> Vec<Chapter> {
+fn extract_chapters(root: &Path, opf_dir: &Path, spine: &[(String, String)]) -> Vec<Chapter> {
     spine
         .iter()
         .enumerate()
         .map(|(index, (_, href))| Chapter {
-            title: chapter_title(&opf_dir.join(decode(href)))
+            title: resolve_href(root, opf_dir, &decode(href))
+                .and_then(|path| chapter_title(&path))
                 .unwrap_or_else(|| format!("Chapter {}", index + 1)),
             href: href.clone(),
         })

@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::xml;
+use crate::{structure, xml};
 use crate::{Error, Result};
 
 pub const MIMETYPE: &str = "application/epub+zip";
@@ -282,8 +282,14 @@ pub fn find_opf_path(epub_dir: &Path) -> Result<String> {
 
     if container_path.is_file() {
         let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
-        if let Some(path) = opf_path_in_container(&bytes)? {
-            return Ok(path);
+        // A path out of the book is no use, and the pipeline would rewrite
+        // whatever it named. Neither is one to nothing in it. The search
+        // below finds the package that is there.
+        let inside = opf_path_in_container(&bytes)?
+            .and_then(|path| structure::resolve_href(epub_dir, epub_dir, &path))
+            .filter(|path| path.is_file());
+        if let Some(path) = inside {
+            return archive_name(epub_dir, &path);
         }
     }
 

@@ -279,7 +279,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         metadata::update_metadata(&opf, &options.metadata_edits)?;
     }
 
-    let content = structure::find_content_files(&opf_dir, &opf)?;
+    let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;
 
     // --- images (15-60%) -------------------------------------------------
     progress(15, "Processing images...");
@@ -325,7 +325,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     progress(66, "Fixing SVG covers...");
-    report.svg_covers_fixed = structure::fix_svg_covers(&opf_dir, &opf)?;
+    report.svg_covers_fixed = structure::fix_svg_covers(work_dir, &opf_dir, &opf)?;
 
     progress(68, "Updating references...");
     let rename_map = structure::build_rename_map(&converted.renames);
@@ -429,7 +429,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     progress(90, "Checking TOC...");
-    let toc = structure::fix_toc(&opf_dir, &opf)?;
+    let toc = structure::fix_toc(work_dir, &opf_dir, &opf)?;
     report.toc_status = toc.describe();
 
     // Every OPF edit lands in one write, rather than the reference's dozen.

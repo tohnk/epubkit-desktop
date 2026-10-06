@@ -271,7 +271,8 @@ fn info(path: &Path) -> Result<()> {
         metadata::format_filename(&meta.title, &meta.author)
     );
 
-    let files = structure::find_content_files(&opf_dir, &doc).context("reading the manifest")?;
+    let files = structure::find_content_files(work.path(), &opf_dir, &doc)
+        .context("reading the manifest")?;
     println!();
     println!(
         "content:  {} xhtml, {} css, {} images, {} fonts, {} other",

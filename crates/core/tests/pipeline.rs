@@ -844,3 +844,122 @@ fn a_bad_template_is_refused_before_anything_is_done() {
     assert_eq!(steps, 0, "no step should have started");
     assert!(!output.exists());
 }
+
+// ------------------------------------------------- paths that leave the book
+
+/// The book is untrusted, and its manifest hrefs end up in paths the pipeline
+/// reads, rewrites and deletes. An absolute href must not hand it files that
+/// are not the book's: a font it would delete, a chapter it would repair over,
+/// a table of contents it would regenerate over, an image it would convert
+/// and then delete.
+#[test]
+fn manifest_hrefs_cannot_reach_files_outside_the_book() {
+    let outside = tempfile::tempdir().unwrap();
+    let plant = |name: &str, bytes: &[u8]| {
+        let path = outside.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        (path.to_string_lossy().to_string(), bytes.to_vec())
+    };
+    let planted = [
+        plant("victim.otf", b"not a font, and not the book's"),
+        plant("victim.xhtml", b"<p>someone else's page<br></p>"),
+        plant("victim.ncx", b"someone else's notes"),
+        plant("victim.png", &solid(image::ImageFormat::Png, 128)),
+    ];
+    let [(font, _), (page, _), (toc, _), (picture, _)] = &planted;
+
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:outside</dc:identifier>
+    <dc:title>Outside</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="font" href="{font}" media-type="font/otf"/>
+    <item id="page" href="{page}" media-type="application/xhtml+xml"/>
+    <item id="toc" href="{toc}" media-type="application/x-dtbncx+xml"/>
+    <item id="picture" href="{picture}" media-type="image/png"/>
+  </manifest>
+  <spine toc="toc"><itemref idref="ch1"/><itemref idref="page"/></spine>
+</package>
+"#
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+    process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    for (path, bytes) in &planted {
+        let now = fs::read(path).ok();
+        assert!(now.as_ref() == Some(bytes), "{path} was changed or removed");
+    }
+    let left: Vec<_> = fs::read_dir(outside.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        left.len(),
+        planted.len(),
+        "files appeared beside them: {left:?}"
+    );
+}
+
+/// Nor can container.xml send the pipeline to a package document outside the
+/// book, which it would parse and then rewrite. The package inside is used.
+#[test]
+fn the_container_cannot_point_at_a_package_outside_the_book() {
+    let outside = tempfile::tempdir().unwrap();
+    let decoy = outside.path().join("victim.opf");
+    fs::write(&decoy, common::CONTENT_OPF).unwrap();
+
+    let container = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="{}" media-type="application/oebps-package+xml"/></rootfiles>
+</container>
+"#,
+        decoy.display()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", container.as_bytes()),
+            ("OEBPS/content.opf", common::CONTENT_OPF),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+    let report = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    assert!(
+        fs::read(&decoy).unwrap() == common::CONTENT_OPF,
+        "the package outside the book was rewritten"
+    );
+    assert_eq!(report.output_filename, "A Writer - Test Book.epub");
+}

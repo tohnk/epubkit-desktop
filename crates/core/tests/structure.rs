@@ -4,8 +4,8 @@ use std::path::Path;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
-    fix_toc, manifest_items, show_reshaped_pages, spine_hrefs, update_css_references, update_opf,
-    update_opf_remove_fonts, update_xhtml_references, TocOutcome,
+    fix_toc, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs, update_css_references,
+    update_opf, update_opf_remove_fonts, update_xhtml_references, TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -65,7 +65,8 @@ fn spine_skips_dangling_idrefs() {
 
 #[test]
 fn classifies_content_files_by_media_type() {
-    let files = find_content_files(Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
+    let files =
+        find_content_files(Path::new("/book"), Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
 
     assert_eq!(files.xhtml.len(), 2);
     assert_eq!(files.css, vec![Path::new("/book/styles/main.css")]);
@@ -78,7 +79,8 @@ fn classifies_content_files_by_media_type() {
 /// removal step silently leaves it in the book.
 #[test]
 fn classifies_fonts_by_extension_when_the_media_type_lies() {
-    let files = find_content_files(Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
+    let files =
+        find_content_files(Path::new("/book"), Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
     assert_eq!(
         files.fonts,
         vec![
@@ -418,7 +420,7 @@ fn svg_wrapped_covers_become_plain_images() {
 </package>
 "#);
 
-    assert_eq!(fix_svg_covers(dir.path(), &doc).unwrap(), 1);
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 1);
 
     let out = fs::read_to_string(&cover).unwrap();
     assert!(out.contains(r#"src="images/cover.jpg""#), "{out}");
@@ -454,7 +456,7 @@ fn multi_image_svgs_are_left_alone() {
 </package>
 "#);
 
-    assert_eq!(fix_svg_covers(dir.path(), &doc).unwrap(), 0);
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
     assert_eq!(fs::read_to_string(&page).unwrap(), original);
 }
 
@@ -494,7 +496,10 @@ fn a_missing_toc_is_generated_from_the_spine() {
     write_chapter(&dir.path().join("c2.xhtml"), "Second Chapter", "Two");
 
     let doc = opf(TWO_CHAPTER_OPF);
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(ncx.contains("First Chapter"), "{ncx}");
@@ -541,7 +546,10 @@ fn a_healthy_toc_is_left_alone() {
 </package>
 "#);
 
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Valid);
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Valid
+    );
 }
 
 /// The reference implementation detected broken references and then did
@@ -579,7 +587,10 @@ fn a_toc_pointing_at_missing_files_is_regenerated() {
 </package>
 "#);
 
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(!ncx.contains("deleted.xhtml"), "{ncx}");
@@ -605,7 +616,10 @@ fn chapters_without_titles_fall_back_to_headings_then_position() {
     .unwrap();
 
     let doc = opf(TWO_CHAPTER_OPF);
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(ncx.contains("Heading Only"), "{ncx}");
@@ -619,7 +633,7 @@ fn titles_needing_escapes_produce_valid_ncx() {
     write_chapter(&dir.path().join("c2.xhtml"), "A &lt;Tag&gt;", "Two");
 
     let doc = opf(TWO_CHAPTER_OPF);
-    fix_toc(dir.path(), &doc).unwrap();
+    fix_toc(dir.path(), dir.path(), &doc).unwrap();
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     xml::parse_strict(ncx.as_bytes()).expect("NCX with escaped titles should parse");
@@ -637,7 +651,7 @@ fn an_empty_spine_is_reported_not_guessed_at() {
 
     let dir = tempfile::tempdir().unwrap();
     assert!(matches!(
-        fix_toc(dir.path(), &doc).unwrap(),
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
         TocOutcome::Skipped(_)
     ));
 }
@@ -773,4 +787,28 @@ fn split_pages_are_declared_under_ids_of_their_own() {
         .expect("the second page should be declared");
     assert_eq!(added.id, "plate-2-2", "plate-2 was taken");
     assert_eq!(added.media_type, "image/jpeg");
+}
+
+/// An href leads somewhere inside the book, or nowhere. A leading slash
+/// starts from the book's root, as URLs inside an EPUB container do.
+#[test]
+fn hrefs_resolve_inside_the_book_or_not_at_all() {
+    let root = Path::new("/work");
+    let opf_dir = Path::new("/work/OEBPS");
+    let inside = |href: &str| resolve_href(root, opf_dir, href);
+
+    assert_eq!(
+        inside("Text/one.xhtml"),
+        Some("/work/OEBPS/Text/one.xhtml".into())
+    );
+    assert_eq!(inside("../Images/a.png"), Some("/work/Images/a.png".into()));
+    assert_eq!(inside("./Text/../b.css"), Some("/work/OEBPS/b.css".into()));
+    assert_eq!(
+        inside("/OEBPS/one.xhtml"),
+        Some("/work/OEBPS/one.xhtml".into())
+    );
+
+    assert_eq!(inside("../../etc/passwd"), None);
+    assert_eq!(inside("Text/../../../x"), None);
+    assert_eq!(inside("/../x"), None);
 }
