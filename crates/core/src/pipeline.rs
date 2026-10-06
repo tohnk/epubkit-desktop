@@ -10,7 +10,7 @@
 //! slow and a way to lose an edit made earlier in the run.
 
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -292,12 +292,12 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         structure::update_opf(&opf, &rename_map)?;
         for path in &content.xhtml {
             if path.is_file() {
-                structure::update_xhtml_references(path, &rename_map)?;
+                structure::update_xhtml_references(&opf_dir, path, &rename_map)?;
             }
         }
         for path in &content.css {
             if path.is_file() {
-                structure::update_css_references(path, &rename_map)?;
+                structure::update_css_references(&opf_dir, path, &rename_map)?;
             }
         }
     }
@@ -427,6 +427,7 @@ fn convert_images<P: FnMut(u8, &str)>(
 
     let image_options = options.image_options();
     let mut renames = BTreeMap::new();
+    let mut taken = TakenNames::default();
     report.images_total = images.len();
 
     for (index, path) in images.iter().enumerate() {
@@ -458,10 +459,26 @@ fn convert_images<P: FnMut(u8, &str)>(
         };
 
         let parent = path.parent().unwrap_or(opf_dir);
-        let mut renamed = false;
 
-        for output in &outputs {
-            let destination = parent.join(&output.filename);
+        // Settle every output's name before writing any. One named like its
+        // own source replaces it in place, under the source's exact spelling:
+        // a case-insensitive filesystem holds `IMG.JPG` and `IMG.jpg` as one
+        // file, so "renaming" it would delete the new image along with the
+        // old. Any other name has to be free, or writing it would destroy
+        // another image — `cover.png` and `cover.jpeg` both want `cover.jpg`.
+        let names: Vec<String> = outputs
+            .iter()
+            .map(|output| {
+                if same_name(&output.filename, &name) {
+                    name.clone()
+                } else {
+                    taken.claim(parent, &output.filename)
+                }
+            })
+            .collect();
+
+        for (output, output_name) in outputs.iter().zip(&names) {
+            let destination = parent.join(output_name);
             fs::write(&destination, &output.bytes).map_err(|e| Error::io(&destination, e))?;
 
             report.images_converted += 1;
@@ -477,28 +494,70 @@ fn convert_images<P: FnMut(u8, &str)>(
                 .trim()
                 .to_string();
             *report.image_formats.entry(kind).or_insert(0) += 1;
-
-            if output.filename != name {
-                renamed = true;
-            }
         }
 
         if let Ok(relative) = path.strip_prefix(opf_dir) {
-            if let Some(first) = outputs.first() {
-                renames.insert(
-                    relative.to_string_lossy().replace('\\', "/"),
-                    first.filename.clone(),
-                );
+            if let Some(first) = names.first() {
+                renames.insert(relative.to_string_lossy().replace('\\', "/"), first.clone());
             }
         }
 
-        // The source only goes once its replacement is safely written.
-        if renamed && path.is_file() {
+        // The source only goes once its replacement is safely written, and
+        // never when the replacement took its place.
+        if !names.contains(&name) && path.is_file() {
             fs::remove_file(path).ok();
         }
     }
 
     Ok(renames)
+}
+
+/// Filenames in use, per directory, so that a converted image never lands on
+/// another file.
+///
+/// Compared ignoring case: macOS and Windows hold `Plate.jpg` and `plate.jpg`
+/// as one file, and a book should convert the same wherever it is converted.
+#[derive(Default)]
+struct TakenNames {
+    by_directory: HashMap<PathBuf, HashSet<String>>,
+}
+
+impl TakenNames {
+    /// Claim `wanted` in `directory`, or the first free name after it in the
+    /// series `name-2.jpg`, `name-3.jpg`, ….
+    fn claim(&mut self, directory: &Path, wanted: &str) -> String {
+        let taken = self
+            .by_directory
+            .entry(structure::normalize_path(directory))
+            .or_insert_with(|| {
+                fs::read_dir(directory)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| fold_case(&entry.file_name().to_string_lossy()))
+                    .collect()
+            });
+
+        let (stem, extension) = match wanted.rfind('.') {
+            Some(dot) if dot > 0 => wanted.split_at(dot),
+            _ => (wanted, ""),
+        };
+        let name = std::iter::once(wanted.to_string())
+            .chain((2..).map(|n| format!("{stem}-{n}{extension}")))
+            .find(|candidate| !taken.contains(&fold_case(candidate)))
+            .expect("an unused suffix always exists");
+
+        taken.insert(fold_case(&name));
+        name
+    }
+}
+
+fn fold_case(name: &str) -> String {
+    name.to_lowercase()
+}
+
+fn same_name(a: &str, b: &str) -> bool {
+    fold_case(a) == fold_case(b)
 }
 
 fn read_text(path: &Path) -> Result<String> {

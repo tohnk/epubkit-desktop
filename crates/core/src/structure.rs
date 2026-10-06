@@ -2,9 +2,9 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use libxml::tree::{Document, Node};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -213,7 +213,7 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
         let Some(new_path) = rename_map
             .get(&decoded)
             .or_else(|| rename_map.get(&href))
-            .or_else(|| match_by_filename(&decoded, rename_map))
+            .or_else(|| rename_by_filename(&decoded, rename_map))
         else {
             continue;
         };
@@ -282,13 +282,22 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 /// Rewrite image references inside one XHTML file: `<img src>`, SVG
 /// `<image xlink:href>`, and `url()` in inline styles. Returns how many
 /// references changed, writing the file only if any did.
+///
+/// A reference is resolved against the file's own directory and matched by
+/// path, so two images that share a filename in different directories can be
+/// renamed differently. `opf_dir` is what the rename map's paths are relative
+/// to.
 pub fn update_xhtml_references(
+    opf_dir: &Path,
     path: &Path,
     rename_map: &BTreeMap<String, String>,
 ) -> Result<usize> {
     if rename_map.is_empty() {
         return Ok(0);
     }
+
+    let renames = Renames::new(opf_dir, rename_map);
+    let base = path.parent().unwrap_or(opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
@@ -298,8 +307,7 @@ pub fn update_xhtml_references(
         match local_name(&node).as_str() {
             "img" => {
                 let src = node.get_attribute("src").unwrap_or_default();
-                let new_src = resolve_reference(&src, rename_map);
-                if new_src != src {
+                if let Some(new_src) = rewrite_reference(&src, base, &renames) {
                     node.set_attribute("src", &new_src).ok();
                     updated += 1;
                 }
@@ -311,9 +319,8 @@ pub fn update_xhtml_references(
                 let value = xlink
                     .clone()
                     .unwrap_or_else(|| node.get_attribute("href").unwrap_or_default());
-                let new_value = resolve_reference(&value, rename_map);
 
-                if new_value != value {
+                if let Some(new_value) = rewrite_reference(&value, base, &renames) {
                     let namespace = xlink
                         .is_some()
                         .then(|| xlink_namespace(&content.doc, &node));
@@ -333,7 +340,7 @@ pub fn update_xhtml_references(
 
         let style = node.get_attribute("style").unwrap_or_default();
         if style.contains("url(") {
-            let new_style = rewrite_css_urls(&style, rename_map);
+            let new_style = rewrite_css_urls(&style, base, &renames);
             if new_style != style {
                 node.set_attribute("style", &new_style).ok();
                 updated += 1;
@@ -348,14 +355,22 @@ pub fn update_xhtml_references(
     Ok(updated)
 }
 
-/// Rewrite `url()` references in a stylesheet. Returns 1 if the file changed.
-pub fn update_css_references(path: &Path, rename_map: &BTreeMap<String, String>) -> Result<usize> {
+/// Rewrite `url()` references in a stylesheet, resolved against its own
+/// directory. Returns 1 if the file changed.
+pub fn update_css_references(
+    opf_dir: &Path,
+    path: &Path,
+    rename_map: &BTreeMap<String, String>,
+) -> Result<usize> {
     if rename_map.is_empty() {
         return Ok(0);
     }
 
+    let renames = Renames::new(opf_dir, rename_map);
+    let base = path.parent().unwrap_or(opf_dir);
+
     let css = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-    let rewritten = rewrite_css_urls(&css, rename_map);
+    let rewritten = rewrite_css_urls(&css, base, &renames);
 
     if rewritten == css {
         return Ok(0);
@@ -533,65 +548,153 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Fall back to matching on filename alone, for references written relative to
-/// a different directory than the manifest entry.
-fn match_by_filename<'a>(
-    href: &str,
+/// Resolve `.` and `..` without touching the filesystem, so that two spellings
+/// of one path compare equal.
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                }
+                // Nothing lies above the root.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normal.push(".."),
+            },
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// Find a rename by filename alone, for a path that leads nowhere — one
+/// written relative to the wrong directory, say. Only an unambiguous answer
+/// counts: images sharing a filename in different directories can be renamed
+/// differently, and then the filename cannot say which was meant.
+fn rename_by_filename<'a>(
+    path: &str,
     rename_map: &'a BTreeMap<String, String>,
 ) -> Option<&'a String> {
-    let name = file_name_of(href);
+    let name = file_name_of(path);
     if name.is_empty() {
         return None;
     }
-    rename_map
+
+    let mut candidates = rename_map
         .iter()
-        .find(|(old, _)| file_name_of(old) == name)
-        .map(|(_, new)| new)
+        .filter(|(old, _)| file_name_of(old) == name)
+        .map(|(_, new)| new);
+    let first = candidates.next()?;
+    let new_name = file_name_of(first);
+
+    candidates
+        .all(|other| file_name_of(other) == new_name)
+        .then_some(first)
 }
 
-/// Rewrite a single reference, preserving the directory prefix it was written
-/// with and only swapping the filename.
-fn resolve_reference(reference: &str, rename_map: &BTreeMap<String, String>) -> String {
-    if reference.is_empty() {
-        return reference.to_string();
-    }
+/// The rename map, indexed by the file each entry was renamed from.
+struct Renames<'a> {
+    rename_map: &'a BTreeMap<String, String>,
+    by_source: HashMap<PathBuf, &'a String>,
+}
 
-    let decoded = decode(reference);
-    let name = file_name_of(&decoded);
-
-    for (old_path, new_path) in rename_map {
-        if name == file_name_of(old_path) {
-            return decoded.replace(&name, &file_name_of(new_path));
+impl<'a> Renames<'a> {
+    fn new(opf_dir: &Path, rename_map: &'a BTreeMap<String, String>) -> Self {
+        let by_source = rename_map
+            .iter()
+            .map(|(old, new)| (normalize_path(&opf_dir.join(old)), new))
+            .collect();
+        Self {
+            rename_map,
+            by_source,
         }
     }
 
-    reference.to_string()
+    /// The new filename of the file `path` leads to from `base`, if that file
+    /// was renamed.
+    fn new_name(&self, base: &Path, path: &str) -> Option<String> {
+        let target = normalize_path(&base.join(path));
+        if let Some(new) = self.by_source.get(&target) {
+            return Some(file_name_of(new));
+        }
+
+        // A path to a file that is still there names something that was not
+        // renamed, whatever its filename shares with something that was.
+        if target.is_file() {
+            return None;
+        }
+
+        rename_by_filename(path, self.rename_map).map(|new| file_name_of(new))
+    }
 }
 
-/// Rewrite `url(...)` targets in CSS text.
-fn rewrite_css_urls(css: &str, rename_map: &BTreeMap<String, String>) -> String {
+/// Rewrite one reference if the file it names was renamed, swapping only the
+/// filename: the directory, any fragment, and whether the name was
+/// percent-encoded all stay as written. `None` leaves the reference alone.
+fn rewrite_reference(reference: &str, base: &Path, renames: &Renames) -> Option<String> {
+    // Same-document fragments, and http:, data: and their kind.
+    if reference.starts_with('#') || has_scheme(reference) {
+        return None;
+    }
+
+    let (path, suffix) = reference.split_at(reference.find(['?', '#']).unwrap_or(reference.len()));
+    let (directory, name) = path.split_at(path.rfind('/').map_or(0, |slash| slash + 1));
+    if name.is_empty() {
+        return None;
+    }
+
+    let new_name = renames.new_name(base, &decode(path))?;
+    let new_name = if decode(name) == name {
+        new_name
+    } else {
+        encode(&new_name)
+    };
+
+    Some(format!("{directory}{new_name}{suffix}"))
+}
+
+/// Does `reference` open with a URL scheme rather than a path?
+fn has_scheme(reference: &str) -> bool {
+    reference.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// Rewrite the `url(...)` targets in CSS text that name a renamed file. Every
+/// other byte, quotes included, stays as written.
+fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
 
     while let Some(start) = rest.find("url(") {
-        let (before, from_url) = rest.split_at(start);
-        out.push_str(before);
-
-        let Some(end) = from_url.find(')') else {
+        let open = start + "url(".len();
+        let Some(close) = rest[open..].find(')').map(|end| open + end) else {
             // Unterminated url( — leave the remainder untouched.
-            out.push_str(from_url);
-            return out;
+            break;
         };
+        out.push_str(&rest[..open]);
 
-        let inner = &from_url["url(".len()..end];
-        let trimmed = inner.trim().trim_matches(['\'', '"']);
-        let rewritten = resolve_reference(trimmed, rename_map);
+        let inner = &rest[open..close];
+        let trimmed = inner.trim();
+        let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let target = quote.map_or(trimmed, |q| trimmed.trim_matches(q));
 
-        out.push_str("url(");
-        out.push_str(&rewritten);
-        out.push(')');
+        match (rewrite_reference(target, base, renames), quote) {
+            (Some(new), Some(q)) => {
+                out.push(q);
+                out.push_str(&new);
+                out.push(q);
+            }
+            (Some(new), None) => out.push_str(&new),
+            (None, _) => out.push_str(inner),
+        }
 
-        rest = &from_url[end + 1..];
+        rest = &rest[close..];
     }
 
     out.push_str(rest);

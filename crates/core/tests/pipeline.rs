@@ -374,3 +374,202 @@ fn a_size_increase_is_described_as_an_increase() {
     assert!(summary.contains("increase"), "{summary}");
     assert!(!summary.contains('-'), "no negative percentages: {summary}");
 }
+
+// ------------------------------------------------------ image name collisions
+
+/// A square of one grey, so a test can tell which image ended up where.
+fn solid(format: image::ImageFormat, grey: u8) -> Vec<u8> {
+    let square = image::GrayImage::from_pixel(64, 64, image::Luma([grey]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(square)
+        .write_to(&mut std::io::Cursor::new(&mut out), format)
+        .expect("encode fixture image");
+    out
+}
+
+/// Optimize a book whose manifest lists `images` in the order given and whose
+/// one chapter, in a subdirectory of its own, shows each of them. Returns the
+/// unpacked output.
+fn convert_images_book(images: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
+    let mut manifest = String::new();
+    let mut body = String::new();
+    for (index, (href, _)) in images.iter().enumerate() {
+        let media_type = if href.to_ascii_lowercase().ends_with(".png") {
+            "image/png"
+        } else {
+            "image/jpeg"
+        };
+        manifest.push_str(&format!(
+            r#"<item id="img{index}" href="{href}" media-type="{media_type}"/>"#
+        ));
+        body.push_str(&format!(r#"<p><img src="../{href}" alt=""/></p>"#));
+    }
+
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:images</dc:identifier>
+    <dc:title>Images</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    {manifest}
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>{body}</body></html>
+"#
+    );
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".into(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".into(),
+            common::CONTAINER_XML.to_vec(),
+        ),
+        ("OEBPS/content.opf".into(), opf.into_bytes()),
+        ("OEBPS/text/chapter1.xhtml".into(), chapter.into_bytes()),
+    ];
+    for (href, bytes) in images {
+        entries.push((format!("OEBPS/{href}"), bytes.clone()));
+    }
+    let entries: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(&input, &entries);
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    work
+}
+
+/// The chapter's image references, in order.
+fn chapter_sources(work: &Path) -> Vec<String> {
+    let chapter = fs::read_to_string(work.join("OEBPS/text/chapter1.xhtml")).unwrap();
+    chapter
+        .split(r#"src=""#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// The grey of each image the chapter shows, followed through its own
+/// references, to the nearest of black, mid-grey and white.
+fn shown_greys(work: &Path) -> Vec<u8> {
+    chapter_sources(work)
+        .iter()
+        .map(|src| {
+            let path = work.join("OEBPS/text").join(src);
+            let image = image::open(&path)
+                .unwrap_or_else(|e| panic!("{src} does not lead to an image: {e}"))
+                .to_luma8();
+            let mean =
+                image.pixels().map(|p| u64::from(p[0])).sum::<u64>() / image.pixels().len() as u64;
+            [0u8, 128, 255]
+                .into_iter()
+                .min_by_key(|level| (i64::from(*level) - mean as i64).abs())
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Every image in the manifest is in the archive, under an href of its own.
+fn assert_manifest_matches_archive(work: &Path) {
+    let opf = xml::parse_file(&work.join("OEBPS/content.opf")).unwrap();
+    let hrefs: Vec<String> = structure::manifest_items(&opf)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.media_type.starts_with("image/"))
+        .map(|item| item.decoded_href())
+        .collect();
+
+    for href in &hrefs {
+        assert!(work.join("OEBPS").join(href).is_file(), "{href} is missing");
+    }
+    let unique: std::collections::BTreeSet<&String> = hrefs.iter().collect();
+    assert_eq!(
+        unique.len(),
+        hrefs.len(),
+        "two items share a file: {hrefs:?}"
+    );
+}
+
+/// Upstream's issue #11: `image.png` and `image.jpeg` both became `image.jpg`,
+/// and whichever was converted second replaced the first.
+#[test]
+fn images_that_would_share_a_name_are_both_kept() {
+    let work = convert_images_book(&[
+        ("images/image.png", solid(image::ImageFormat::Png, 0)),
+        ("images/image.jpeg", solid(image::ImageFormat::Jpeg, 255)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
+/// A converted image must not land on another image that already has the name
+/// it wants.
+#[test]
+fn a_conversion_never_overwrites_an_existing_image() {
+    let work = convert_images_book(&[
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+        ("images/plate.jpg", solid(image::ImageFormat::Jpeg, 255)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
+/// macOS and Windows hold `IMG.JPG` and `IMG.jpg` as one file, so converting
+/// `IMG.JPG` under the lowercase name and then deleting the source deleted the
+/// output with it. Replaced in place, it keeps its own name.
+#[test]
+fn an_uppercase_jpg_is_replaced_under_its_own_name() {
+    let work =
+        convert_images_book(&[("images/IMG_0001.JPG", solid(image::ImageFormat::Jpeg, 128))]);
+
+    assert_eq!(chapter_sources(work.path()), ["../images/IMG_0001.JPG"]);
+    assert_eq!(shown_greys(work.path()), [128]);
+    assert_manifest_matches_archive(work.path());
+}
+
+/// Images that share a filename in different directories can now be renamed
+/// differently, so a reference has to be followed by its path, not matched by
+/// its filename.
+#[test]
+fn same_named_images_in_different_directories_keep_their_own_references() {
+    let work = convert_images_book(&[
+        ("a/pic.png", solid(image::ImageFormat::Png, 0)),
+        ("b/pic.png", solid(image::ImageFormat::Png, 255)),
+        ("b/pic.jpg", solid(image::ImageFormat::Jpeg, 128)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [0, 255, 128],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}

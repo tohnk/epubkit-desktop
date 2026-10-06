@@ -194,11 +194,11 @@ fn xhtml_image_references_follow_renames() {
     .unwrap();
 
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
-    assert_eq!(update_xhtml_references(&path, &map).unwrap(), 2);
+    assert_eq!(update_xhtml_references(dir.path(), &path, &map).unwrap(), 2);
 
     let out = fs::read_to_string(&path).unwrap();
     assert!(out.contains(r#"src="../images/plate.jpg""#), "{out}");
-    assert!(out.contains("url(../images/plate.jpg)"), "{out}");
+    assert!(out.contains("url('../images/plate.jpg')"), "{out}");
     assert!(!out.contains("plate.png"), "{out}");
 }
 
@@ -211,7 +211,10 @@ fn xhtml_untouched_by_an_empty_rename_map() {
 "#;
     fs::write(&path, original).unwrap();
 
-    assert_eq!(update_xhtml_references(&path, &BTreeMap::new()).unwrap(), 0);
+    assert_eq!(
+        update_xhtml_references(dir.path(), &path, &BTreeMap::new()).unwrap(),
+        0
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }
 
@@ -229,11 +232,166 @@ fn css_url_references_follow_renames() {
         ("images/plate.png", "images/plate.jpg"),
         ("images/other.gif", "images/other.jpg"),
     ]);
-    assert_eq!(update_css_references(&path, &map).unwrap(), 1);
+    assert_eq!(update_css_references(dir.path(), &path, &map).unwrap(), 1);
 
     let out = fs::read_to_string(&path).unwrap();
-    assert!(out.contains("url(images/plate.jpg)"), "{out}");
+    assert!(out.contains(r#"url("images/plate.jpg")"#), "{out}");
     assert!(out.contains("url(images/other.jpg)"), "{out}");
+}
+
+fn put(root: &Path, name: &str, content: impl AsRef<[u8]>) -> std::path::PathBuf {
+    let path = root.join(name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, content).unwrap();
+    path
+}
+
+fn chapter_with(body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>
+"#
+    )
+}
+
+/// Images that share a filename in different directories can be renamed
+/// differently, so each reference follows the file it actually names.
+#[test]
+fn references_follow_the_file_they_name_not_its_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        chapter_with(r#"<img src="../a/pic.png" alt=""/><img src="../b/pic.png" alt=""/>"#),
+    );
+    let css = put(
+        dir.path(),
+        "styles/main.css",
+        ".x { background: url(../b/pic.png) }",
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        2
+    );
+    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains(r#"src="../a/pic.jpg""#), "{out}");
+    assert!(out.contains(r#"src="../b/pic-2.jpg""#), "{out}");
+    let out = fs::read_to_string(&css).unwrap();
+    assert!(out.contains("url(../b/pic-2.jpg)"), "{out}");
+}
+
+/// A path that leads to a file still on disk names something that was not
+/// renamed, even if its filename matches something that was.
+#[test]
+fn a_reference_to_a_file_that_kept_its_name_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    put(dir.path(), "b/pic.png", "an image nobody renamed");
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="b/pic.png" alt=""/>"#),
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+}
+
+/// A path that leads nowhere falls back to its filename, but only when that is
+/// unambiguous — not when two images of that name were renamed differently.
+#[test]
+fn an_ambiguous_filename_is_not_guessed_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(r#"<img src="elsewhere/pic.png" alt=""/>"#),
+    );
+    let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="img" href="elsewhere/pic.png" media-type="image/png"/></manifest>
+  <spine/>
+</package>
+"#);
+    assert_eq!(update_opf(&doc, &map).unwrap(), 0);
+}
+
+#[test]
+fn links_to_other_sites_and_data_are_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(
+            r#"<img src="http://example.com/images/plate.png" alt=""/><img src="data:image/png;base64,AAAA" alt=""/>"#,
+        ),
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        0
+    );
+}
+
+/// Only the filename changes: one that was percent-encoded stays encoded, and
+/// one written plainly stays plain.
+#[test]
+fn a_renamed_filename_is_written_the_way_the_reference_wrote_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        chapter_with(
+            r#"<img src="images/a%20plate.png" alt=""/><img src="images/b plate.png" alt=""/>"#,
+        ),
+    );
+    let map = rename_map(&[
+        ("images/a plate.png", "images/a plate.jpg"),
+        ("images/b plate.png", "images/b plate.jpg"),
+    ]);
+
+    assert_eq!(
+        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        2
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains(r#"src="images/a%20plate.jpg""#), "{out}");
+    assert!(out.contains(r#"src="images/b plate.jpg""#), "{out}");
+}
+
+/// A stylesheet is rewritten in place: a renamed url keeps its quotes, and
+/// every other url is left exactly as it was. Unquoting a url with a space in
+/// it would break the rule it sits in.
+#[test]
+fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let css = put(
+        dir.path(),
+        "main.css",
+        "@font-face { src: url(\"fonts/My Font.otf\"); }\n.x { background: url('images/plate.png'); }\n",
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+
+    let out = fs::read_to_string(&css).unwrap();
+    assert!(out.contains(r#"url("fonts/My Font.otf")"#), "{out}");
+    assert!(out.contains("url('images/plate.jpg')"), "{out}");
 }
 
 #[test]

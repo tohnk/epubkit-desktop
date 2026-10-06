@@ -327,6 +327,24 @@ reference's own fallback (`ImageFont.load_default()`) produces an unreadable
 bitmap-font cover on any machine without DejaVu or Helvetica. A book with no
 cover comes out with no cover.
 
+### Converted images never overwrite each other
+
+The reference names every converted image `stem.jpg` and writes it without
+looking, so `cover.png` and `cover.jpeg` both became `cover.jpg` and one
+silently replaced the other (upstream's issue #11), as did `plate.png` and an
+existing `plate.jpg`. A case-insensitive filesystem made it worse: `IMG.JPG`
+was written as `IMG.jpg`, which there is the same file, and then deleted as
+the old one.
+
+The port gives each output a name nothing else in its directory has,
+ignoring case, appending `-2`, `-3`… where it must, and an image that converts
+to its own name keeps its exact spelling. Since images sharing a filename can
+now be renamed differently, a reference is followed by its path from the
+document that makes it, falling back to the bare filename only when the path
+leads nowhere and the filename is unambiguous. Only the filename in a
+reference changes; its directory, fragment, percent-encoding and quotes stay
+as written, and links to other sites are left alone.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But
@@ -399,3 +417,6 @@ always produces a byte-identical archive.
   rare, and the UTF-8 fix above neither causes nor cures it. Passing the
   declared encoding to the parser would, once the `libxml` crate's `encoding`
   option is safe to use.
+- Light Novel mode splits a double-page spread into two images, but only the
+  first reaches the manifest and the page; the second is packaged and never
+  shown. The reference loses a half too (the other one).
