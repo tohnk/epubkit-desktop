@@ -111,7 +111,7 @@ fn every_step_reports_what_it_did() {
 
     assert_eq!(report.images_total, 2);
     assert_eq!(report.images_converted, 2);
-    assert!(report.fonts_removed >= 2, "css rule plus font file");
+    assert_eq!(report.fonts_removed, 1, "one font file");
     assert!(report.css_rules_removed >= 1);
     assert!(report.metadata_items_stripped >= 2, "calibre and ibooks");
     assert!(report.blank_elements_removed >= 2);
@@ -188,6 +188,49 @@ fn fonts_are_gone_from_the_archive_the_css_and_the_manifest() {
         .map(|i| i.href)
         .collect();
     assert!(!hrefs.iter().any(|h| h.contains(".otf")), "{hrefs:?}");
+}
+
+/// A font removed is removed from everywhere that names it: a stylesheet, a
+/// chapter's own `<style>`, and `encryption.xml`, which listed it as
+/// obfuscated. And it counts once, not once per place.
+#[test]
+fn nothing_is_left_naming_a_removed_font() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title>
+<style type="text/css">@font-face { font-family: Inline; src: url(fonts/body.otf) } p { margin: 0 }</style>
+</head><body><p>Text.</p></body></html>
+"#;
+    let encryption =
+        common::encryption_xml("http://www.idpf.org/2008/embedding", "OEBPS/fonts/body.otf");
+    demo_epub_with(
+        &input,
+        &[
+            ("OEBPS/chapter2.xhtml", chapter.as_bytes()),
+            ("META-INF/encryption.xml", &encryption),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    assert_eq!(report.fonts_removed, 1);
+    let names = entry_names(&output);
+    assert!(!names.iter().any(|n| n.ends_with(".otf")), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n == "META-INF/encryption.xml"),
+        "{names:?}"
+    );
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    for file in ["OEBPS/styles/main.css", "OEBPS/chapter2.xhtml"] {
+        let text = fs::read_to_string(work.path().join(file)).unwrap();
+        assert!(!text.contains("@font-face"), "{file}:\n{text}");
+    }
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter2.xhtml")).unwrap();
+    assert!(chapter.contains("p { margin: 0 }"), "{chapter}");
 }
 
 /// Every chapter in the output must parse strictly — including the one that
@@ -869,9 +912,11 @@ fn demo_epub_with(path: &Path, replacements: &[(&str, &[u8])]) {
         ("OEBPS/images/cover.png", &cover),
         ("OEBPS/images/plate.png", &plate),
     ];
-    for (name, bytes) in replacements {
-        let entry = entries.iter_mut().find(|(n, _)| n == name).unwrap();
-        entry.1 = bytes;
+    for &(name, bytes) in replacements {
+        match entries.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = bytes,
+            None => entries.push((name, bytes)),
+        }
     }
     common::write_epub(path, &entries);
 }

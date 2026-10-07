@@ -390,12 +390,21 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             }
             let stylesheet = css::read_stylesheet(path)?;
             let (cleaned, removed) = css::remove_embedded_fonts(&stylesheet);
-            report.fonts_removed += removed;
             if removed > 0 {
                 fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
             }
         }
 
+        // A chapter may declare a font in a <style> of its own.
+        for &path in &chapters {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            let (cleaned, removed) = css::remove_embedded_fonts_from_styles(&bytes)?;
+            if removed > 0 {
+                fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
+            }
+        }
+
+        // Fonts are counted, not the rules that named them.
         for path in &content.fonts {
             if path.is_file() && fs::remove_file(path).is_ok() {
                 report.fonts_removed += 1;
@@ -403,6 +412,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
 
         structure::update_opf_remove_fonts(&opf, &content.fonts)?;
+        // encryption.xml lists obfuscated fonts, which are gone now.
+        package::forget_missing_encrypted_files(work_dir)?;
     }
 
     progress(82, "Normalizing content...");

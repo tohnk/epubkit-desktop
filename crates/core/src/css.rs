@@ -15,6 +15,7 @@ use std::path::Path;
 
 use cssparser::{ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use libxml::tree::NodeType;
 
 use crate::html;
 use crate::{xml, Error, Result};
@@ -188,6 +189,35 @@ pub fn remove_embedded_fonts(css_text: &str) -> (String, usize) {
 
     let removed = fonts.len();
     (cut(css_text, &fonts), removed)
+}
+
+/// Remove `@font-face` rules from the `<style>` elements of an XHTML document,
+/// as [`remove_embedded_fonts`] does from a stylesheet. Returns the document
+/// and how many rules went; the document is untouched if none did.
+pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let content = html::parse_content(xhtml_bytes)?;
+    let mut removed = 0;
+
+    for style in xml::find_nodes(&content.doc, &format!("//{}", xml::local("style")))? {
+        for mut text in style.get_child_nodes() {
+            if !matches!(
+                text.get_type(),
+                Some(NodeType::TextNode | NodeType::CDataSectionNode)
+            ) {
+                continue;
+            }
+            let (cleaned, fonts) = remove_embedded_fonts(&text.get_content());
+            if fonts > 0 {
+                text.set_content(&cleaned).ok();
+                removed += fonts;
+            }
+        }
+    }
+
+    if removed == 0 {
+        return Ok((xhtml_bytes.to_vec(), 0));
+    }
+    Ok((html::serialize_content(&content), removed))
 }
 
 /// Where the `@font-face` rules among `rules`, and inside them, are.

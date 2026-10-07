@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use percent_encoding::percent_decode_str;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -374,6 +375,50 @@ fn read_optional_entry(epub_path: &Path, name: &str) -> Result<Option<Vec<u8>>> 
         Err(e) => Err(e.into()),
     };
     result
+}
+
+/// Drop what `META-INF/encryption.xml` says about files no longer in the
+/// unpacked book at `epub_dir`, such as the obfuscated fonts removed with
+/// the rest, and the file itself once it says nothing. A file that cannot be
+/// read is left as it is.
+pub fn forget_missing_encrypted_files(epub_dir: &Path) -> Result<()> {
+    let path = epub_dir.join(ENCRYPTION_ENTRY);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Ok(doc) = xml::parse_file(&path) else {
+        return Ok(());
+    };
+
+    let reference = format!(
+        "./{}/{}",
+        xml::local("CipherData"),
+        xml::local("CipherReference")
+    );
+    let mut kept = 0;
+    let mut forgotten = 0;
+    for mut data in xml::find_nodes(&doc, &format!("//{}", xml::local("EncryptedData")))? {
+        let uri = xml::find_nodes_under(&doc, &data, &reference)?
+            .first()
+            .and_then(|node| node.get_attribute("URI"))
+            .unwrap_or_default();
+        let decoded = percent_decode_str(&uri).decode_utf8_lossy();
+        let missing = !uri.is_empty()
+            && structure::resolve_href(epub_dir, epub_dir, &decoded)
+                .is_some_and(|file| !file.exists());
+        if missing {
+            data.unlink();
+            forgotten += 1;
+        } else {
+            kept += 1;
+        }
+    }
+
+    match (forgotten, kept) {
+        (0, _) => Ok(()),
+        (_, 0) => fs::remove_file(&path).map_err(|e| Error::io(&path, e)),
+        _ => xml::write_file(&doc, &path, false),
+    }
 }
 
 /// The algorithm of each `EncryptedData` in `encryption.xml`, and the file it
