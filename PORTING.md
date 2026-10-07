@@ -408,6 +408,37 @@ now be named exactly as the file it came from, neither front end ever
 replaces a file that is already there; the output becomes `name (2).epub`.
 The CLI used to write over one without asking.
 
+### Paths in a book stay inside it
+
+The reference joined manifest hrefs, and the package path in
+`container.xml`, to the unpacked book as they stood. An absolute href, or one
+climbing out with `..`, let a book have the pipeline rewrite or delete files
+that were not part of it: a "font" deleted, a "chapter" repaired over. The
+port resolves every such path within the book, a leading `/` from the book's
+root as URLs inside an EPUB container resolve, and ignores one that leads out.
+A `container.xml` naming a package that is not in the book falls back to the
+search for one that is.
+
+### Encryption metadata is parsed, not searched
+
+The reference decided whether a book had DRM by looking for namespace URIs in
+`META-INF/encryption.xml` read as UTF-8 text. The same file written in UTF-16,
+as XML allows, had none of them to find, and a book with encrypted chapters
+went through the pipeline as if it had none. The port parses the file and
+judges each entry by its algorithm and the file it names: only a font under the
+IDPF's or Adobe's obfuscation is let through. A file that cannot be parsed is
+taken for DRM.
+
+### Only an SVG that just shows its image is unwrapped
+
+The reference took any SVG in the first three chapters holding exactly one
+`<image>` for a cover wrapper and replaced it with a plain `<img>`. One that
+also held text or shapes, a labelled map say, lost them. The port unwraps an
+SVG only when the image is all it draws, beside a title or a description, and
+leaves an illustration alone. Light Novel mode does the same for an SVG around
+an image it split: an illustration stays, followed by the image's further
+pages.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But
@@ -451,6 +482,13 @@ it was fixed.
 
 The port regenerates the NCX from the spine in that case, which is what the
 stub's comment intended, and reports `TocOutcome::Generated`.
+
+When the reference did generate an NCX, it copied each chapter's href into it
+as the OPF wrote it: relative to the OPF. An NCX in a folder of its own,
+`Navigation/toc.ncx` say, then pointed every entry at a file that was not
+there. The port writes each link relative to the NCX. It also declares a new
+NCX under an id nothing else in the package has; the reference always used
+`ncx`, which a chapter may already be called.
 
 ### Validation collects all problems
 

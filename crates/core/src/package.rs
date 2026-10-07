@@ -2,14 +2,14 @@
 //! detection. Port of `epub_packager.py`.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::xml;
+use crate::{structure, xml};
 use crate::{Error, Result};
 
 pub const MIMETYPE: &str = "application/epub+zip";
@@ -26,13 +26,13 @@ pub const OS_ARTIFACT_DIRS: &[&str] = &["__MACOSX", ".git", ".svn"];
 const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2"];
 
 const NS_CONTAINER: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
-const NS_XMLENC: &str = "http://www.w3.org/2001/04/xmlenc#";
 
-// Substring markers, matched against raw `encryption.xml` text. See `has_drm`.
-const MARKER_XMLENC: &str = "http://www.w3.org/2001/04/xmlenc";
-const MARKER_IDPF_EMBEDDING: &str = "http://www.idpf.org/2008/embedding";
-const MARKER_ADOBE_PDF_ENC: &str = "http://ns.adobe.com/pdf/enc";
-const MARKER_ADOBE_ADEPT: &str = "http://ns.adobe.com/adept";
+/// The font obfuscation algorithms `encryption.xml` names alongside real
+/// encryption: the IDPF's, and Adobe's older one.
+const OBFUSCATION_ALGORITHMS: &[&str] = &[
+    "http://www.idpf.org/2008/embedding",
+    "http://ns.adobe.com/pdf/enc#RC",
+];
 
 /// Extract an EPUB into `dest_dir`.
 ///
@@ -82,7 +82,7 @@ pub fn extract_epub(epub_path: &Path, dest_dir: &Path) -> Result<()> {
 /// 3. Everything else, deflated, in sorted order for reproducible output.
 pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
     let out = File::create(output_path).map_err(|e| Error::io(output_path, e))?;
-    let mut zip = ZipWriter::new(out);
+    let mut zip = ZipWriter::new(BufWriter::new(out));
 
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -100,9 +100,7 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
     let container_path = source_dir.join("META-INF").join("container.xml");
     if container_path.is_file() {
         zip.start_file(CONTAINER_ENTRY, deflated)?;
-        let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
-        zip.write_all(&bytes)
-            .map_err(|e| Error::io(output_path, e))?;
+        copy_into(&mut zip, &container_path, output_path)?;
     }
 
     // 3. Everything else. Collected and sorted so the same input directory
@@ -132,12 +130,18 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
 
     for (name, path) in entries {
         zip.start_file(name, deflated)?;
-        let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
-        zip.write_all(&bytes)
-            .map_err(|e| Error::io(output_path, e))?;
+        copy_into(&mut zip, &path, output_path)?;
     }
 
-    zip.finish()?;
+    // The buffer would flush itself when dropped, but lose any error doing so.
+    zip.finish()?.flush().map_err(|e| Error::io(output_path, e))
+}
+
+/// Copy the file at `path` into the entry `zip` has started, a piece at a
+/// time: a book's largest file need not fit in memory to be packed.
+fn copy_into(zip: &mut ZipWriter<BufWriter<File>>, path: &Path, output_path: &Path) -> Result<()> {
+    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+    io::copy(&mut file, zip).map_err(|e| Error::io(output_path, e))?;
     Ok(())
 }
 
@@ -239,39 +243,32 @@ pub fn validate_epub(epub_path: &Path) -> Result<Validation> {
 
 /// Detect DRM.
 ///
-/// `META-INF/encryption.xml` alone does not mean DRM: the IDPF font
-/// obfuscation scheme (and Adobe's variant) live in the same file. The
-/// distinction is *what* is encrypted — if only fonts are, it is obfuscation
-/// and the book is processable; anything else is real DRM.
+/// `META-INF/encryption.xml` alone does not mean DRM: font obfuscation, the
+/// IDPF's scheme and Adobe's, is declared in the same file. What counts is
+/// what each entry does, and to what — a font obfuscated leaves the book
+/// processable; anything else is real DRM.
+///
+/// The file is parsed rather than searched, so it reads the same in any
+/// encoding XML allows, UTF-16 as much as UTF-8. Metadata that cannot be read
+/// could be hiding anything, so it is taken for DRM rather than handing the
+/// pipeline a book it cannot read.
 pub fn has_drm(epub_path: &Path) -> Result<bool> {
     let Some(bytes) = read_optional_entry(epub_path, ENCRYPTION_ENTRY)? else {
         return Ok(false);
     };
-    let text = String::from_utf8_lossy(&bytes);
 
-    // No XML Encryption at all.
-    if !text.contains(MARKER_XMLENC) {
+    // An empty file declares nothing encrypted.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(false);
     }
 
-    // Without an obfuscation marker, encrypted content is just encrypted.
-    let obfuscation_marker =
-        text.contains(MARKER_IDPF_EMBEDDING) || text.contains(MARKER_ADOBE_PDF_ENC);
-    if !obfuscation_marker {
+    let Ok(encrypted) = encrypted_resources(&bytes) else {
         return Ok(true);
-    }
+    };
 
-    if !(text.contains(MARKER_ADOBE_ADEPT) || text.contains("EncryptedData")) {
-        return Ok(false);
-    }
-
-    // Inspect what is actually encrypted.
-    match encrypted_uris(&bytes) {
-        Ok(uris) => Ok(uris.iter().any(|uri| !is_font_uri(uri))),
-        // Unparseable encryption metadata: assume the worst rather than
-        // handing the pipeline a book it cannot read.
-        Err(_) => Ok(true),
-    }
+    Ok(encrypted.iter().any(|(algorithm, uri)| {
+        !(OBFUSCATION_ALGORITHMS.contains(&algorithm.as_str()) && is_font_uri(uri))
+    }))
 }
 
 /// Locate the OPF package document within an extracted EPUB, relative to the
@@ -282,8 +279,14 @@ pub fn find_opf_path(epub_dir: &Path) -> Result<String> {
 
     if container_path.is_file() {
         let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
-        if let Some(path) = opf_path_in_container(&bytes)? {
-            return Ok(path);
+        // A path out of the book is no use, and the pipeline would rewrite
+        // whatever it named. Neither is one to nothing in it. The search
+        // below finds the package that is there.
+        let inside = opf_path_in_container(&bytes)?
+            .and_then(|path| structure::resolve_href(epub_dir, epub_dir, &path))
+            .filter(|path| path.is_file());
+        if let Some(path) = inside {
+            return archive_name(epub_dir, &path);
         }
     }
 
@@ -373,12 +376,33 @@ fn read_optional_entry(epub_path: &Path, name: &str) -> Result<Option<Vec<u8>>> 
     result
 }
 
-fn encrypted_uris(encryption_xml: &[u8]) -> Result<Vec<String>> {
+/// The algorithm of each `EncryptedData` in `encryption.xml`, and the file it
+/// applies to, either empty if it names none.
+///
+/// Elements are matched by local name, so that one in a namespace other than
+/// XML Encryption's still counts.
+fn encrypted_resources(encryption_xml: &[u8]) -> Result<Vec<(String, String)>> {
     let doc = xml::parse_strict(encryption_xml)?;
-    xml::attribute_values(
-        &doc,
-        "//enc:EncryptedData//enc:CipherReference",
-        "URI",
-        &[("enc", NS_XMLENC)],
-    )
+    let method = format!("./{}", xml::local("EncryptionMethod"));
+    let reference = format!(
+        "./{}/{}",
+        xml::local("CipherData"),
+        xml::local("CipherReference")
+    );
+
+    let mut encrypted = Vec::new();
+    for data in xml::find_nodes(&doc, &format!("//{}", xml::local("EncryptedData")))? {
+        let attribute = |xpath: &str, name: &str| -> Result<String> {
+            Ok(xml::find_nodes_under(&doc, &data, xpath)?
+                .first()
+                .and_then(|node| node.get_attribute(name))
+                .unwrap_or_default())
+        };
+        encrypted.push((
+            attribute(&method, "Algorithm")?,
+            attribute(&reference, "URI")?,
+        ));
+    }
+
+    Ok(encrypted)
 }

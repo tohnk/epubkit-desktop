@@ -250,7 +250,7 @@ pub async fn optimize_books(
                 );
             };
 
-            let outcome = optimize_one(job, &destination, &settings, index, emit);
+            let outcome = optimize_one(job, &destination, &settings, emit);
 
             let _ = app.emit("finished", outcome.clone());
             outcomes.push(outcome);
@@ -264,13 +264,11 @@ pub async fn optimize_books(
 
 /// Optimize one book into `destination`, as [`optimize_books`] does for each.
 ///
-/// Apart so it can be tested without a window. `slot` keeps the staging files
-/// of one run apart.
+/// Apart so it can be tested without a window.
 pub fn optimize_one(
     job: &Job,
     destination: &Path,
     settings: &Settings,
-    slot: usize,
     progress: impl FnMut(u8, &str),
 ) -> Outcome {
     let input = PathBuf::from(&job.path);
@@ -280,11 +278,6 @@ pub fn optimize_one(
         language: None,
     });
 
-    // The output name comes from the book's metadata, which is not known until
-    // the run finishes — so write beside the destination and rename once the
-    // report says what to call it.
-    let staging = destination.join(format!(".epubkit-{slot}.part"));
-
     let failed = |error: String| Outcome {
         path: job.path.clone(),
         output: None,
@@ -293,19 +286,24 @@ pub fn optimize_one(
         error: Some(error),
     };
 
-    let report = match process_epub(&input, &staging, &options, progress) {
-        Ok(report) => report,
-        Err(error) => {
-            let _ = std::fs::remove_file(&staging);
-            return failed(error.to_string());
-        }
+    // The output name comes from the book's metadata, which is not known until
+    // the run finishes — so write beside the destination and move the book
+    // into place once the report says what to call it. The staging file is
+    // this run's own, and goes with it unless the book is published.
+    let staging = match metadata::staging_file(destination) {
+        Ok(staging) => staging,
+        Err(error) => return failed(error.to_string()),
     };
 
-    let final_path = metadata::unused_path(&destination.join(&report.output_filename));
-    if let Err(error) = std::fs::rename(&staging, &final_path) {
-        let _ = std::fs::remove_file(&staging);
-        return failed(format!("could not write {}: {error}", final_path.display()));
-    }
+    let report = match process_epub(&input, staging.path(), &options, progress) {
+        Ok(report) => report,
+        Err(error) => return failed(error.to_string()),
+    };
+
+    let final_path = match metadata::publish(staging, &destination.join(&report.output_filename)) {
+        Ok(path) => path,
+        Err(error) => return failed(error.to_string()),
+    };
 
     Outcome {
         path: job.path.clone(),

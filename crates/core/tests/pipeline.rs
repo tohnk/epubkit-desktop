@@ -448,7 +448,7 @@ fn optimize_book(
         ("OEBPS/text/chapter1.xhtml".into(), chapter.into_bytes()),
     ];
     for (href, bytes) in images {
-        entries.push((format!("OEBPS/{href}"), bytes.clone()));
+        entries.push((in_archive("OEBPS", href), bytes.clone()));
     }
     let entries: Vec<(&str, &[u8])> = entries
         .iter()
@@ -464,6 +464,27 @@ fn optimize_book(
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
     work
+}
+
+/// Where `href`, from the archive directory `base`, leads in the archive,
+/// resolved as a reader resolves it: a leading `/` from the root, `..` and `.`
+/// as written, whether or not the directories they pass through exist.
+fn in_archive(base: &str, href: &str) -> String {
+    let mut parts: Vec<&str> = if href.starts_with('/') {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    for part in href.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
 }
 
 /// The chapter's image references, in order.
@@ -482,7 +503,7 @@ fn shown_greys(work: &Path) -> Vec<u8> {
     chapter_sources(work)
         .iter()
         .map(|src| {
-            let path = work.join("OEBPS/text").join(src);
+            let path = work.join(in_archive("OEBPS/text", src));
             let image = image::open(&path)
                 .unwrap_or_else(|e| panic!("{src} does not lead to an image: {e}"))
                 .to_luma8();
@@ -508,20 +529,22 @@ fn assert_manifest_matches_archive(work: &Path) {
         .collect();
 
     for href in &hrefs {
-        assert!(work.join("OEBPS").join(href).is_file(), "{href} is missing");
+        assert!(
+            work.join(in_archive("OEBPS", href)).is_file(),
+            "{href} is missing"
+        );
     }
-    let unique: std::collections::BTreeSet<&String> = hrefs.iter().collect();
+    let declared: std::collections::BTreeSet<std::path::PathBuf> = hrefs
+        .iter()
+        .map(|href| work.join(in_archive("OEBPS", href)))
+        .collect();
     assert_eq!(
-        unique.len(),
+        declared.len(),
         hrefs.len(),
         "two items share a file: {hrefs:?}"
     );
 
-    let declared: std::collections::BTreeSet<std::path::PathBuf> = hrefs
-        .iter()
-        .map(|href| work.join("OEBPS").join(href))
-        .collect();
-    for file in image_files(&work.join("OEBPS")) {
+    for file in image_files(work) {
         assert!(
             declared.contains(&file),
             "{} is packaged but not in the manifest",
@@ -612,6 +635,48 @@ fn same_named_images_in_different_directories_keep_their_own_references() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// An image beside the package's folder rather than in it, reached with `..`
+/// or from the root with `/`, is as much the book's as any other, and its
+/// references follow it when it is converted.
+#[test]
+fn an_image_outside_the_package_folder_is_converted_and_followed() {
+    let work = optimize_book(
+        &[
+            ("../Images/cover.png", solid(image::ImageFormat::Png, 0)),
+            ("/Images/plate.png", solid(image::ImageFormat::Png, 255)),
+        ],
+        r#"<p><img src="../../Images/cover.png" alt=""/></p><p><img src="../../Images/plate.png" alt=""/></p>"#,
+        &ProcessingOptions::default(),
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../../Images/cover.jpg", "../../Images/plate.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [0, 255]);
+    assert_manifest_matches_archive(work.path());
+}
+
+/// An href with `.` or `..` in it names the same file as one without. It keeps
+/// naming it once the file is renamed, even when the filename alone would not
+/// say which of two renamed images was meant.
+#[test]
+fn an_href_spelled_with_dot_segments_follows_its_image() {
+    let work = convert_images_book(&[
+        ("images/cover.jpeg", solid(image::ImageFormat::Jpeg, 255)),
+        ("images/a/../cover.png", solid(image::ImageFormat::Png, 0)),
+        ("other/./cover.png", solid(image::ImageFormat::Png, 128)),
+    ]);
+
+    assert_eq!(
+        shown_greys(work.path()),
+        [255, 0, 128],
+        "{:?}",
+        chapter_sources(work.path())
+    );
+    assert_manifest_matches_archive(work.path());
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.
@@ -682,6 +747,29 @@ fn an_svg_wrapped_spread_becomes_one_image_per_page() {
     );
     assert_eq!(shown_greys(work.path()), [255, 0]);
     assert_manifest_matches_archive(work.path());
+}
+
+/// A spread outside the package's folder, or reached by an href with `..` in
+/// it, is split and shown like any other.
+#[test]
+fn a_spread_anywhere_in_the_book_is_split_and_shown() {
+    for (href, src) in [
+        ("../Images/spread.png", "../../Images/spread.png"),
+        ("images/a/../spread.png", "../images/a/../spread.png"),
+    ] {
+        let work = optimize_book(
+            &[(href, spread())],
+            &format!(r#"<p><img src="{src}" alt="A spread"/></p>"#),
+            &light_novel(),
+        );
+
+        let pages: Vec<String> = chapter_sources(work.path());
+        assert_eq!(pages.len(), 2, "{href}: {pages:?}");
+        assert!(pages[0].ends_with("spread_part1.jpg"), "{href}: {pages:?}");
+        assert!(pages[1].ends_with("spread_part2.jpg"), "{href}: {pages:?}");
+        assert_eq!(shown_greys(work.path()), [255, 0], "{href}");
+        assert_manifest_matches_archive(work.path());
+    }
 }
 
 #[test]
@@ -843,4 +931,123 @@ fn a_bad_template_is_refused_before_anything_is_done() {
     assert!(error.to_string().contains("{publisher}"), "{error}");
     assert_eq!(steps, 0, "no step should have started");
     assert!(!output.exists());
+}
+
+// ------------------------------------------------- paths that leave the book
+
+/// The book is untrusted, and its manifest hrefs end up in paths the pipeline
+/// reads, rewrites and deletes. An absolute href must not hand it files that
+/// are not the book's: a font it would delete, a chapter it would repair over,
+/// a table of contents it would regenerate over, an image it would convert
+/// and then delete.
+#[test]
+fn manifest_hrefs_cannot_reach_files_outside_the_book() {
+    let outside = tempfile::tempdir().unwrap();
+    let plant = |name: &str, bytes: &[u8]| {
+        let path = outside.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        (path.to_string_lossy().to_string(), bytes.to_vec())
+    };
+    let planted = [
+        plant("victim.otf", b"not a font, and not the book's"),
+        plant("victim.xhtml", b"<p>someone else's page<br></p>"),
+        plant("victim.ncx", b"someone else's notes"),
+        plant("victim.png", &solid(image::ImageFormat::Png, 128)),
+    ];
+    let [(font, _), (page, _), (toc, _), (picture, _)] = &planted;
+
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:outside</dc:identifier>
+    <dc:title>Outside</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="font" href="{font}" media-type="font/otf"/>
+    <item id="page" href="{page}" media-type="application/xhtml+xml"/>
+    <item id="toc" href="{toc}" media-type="application/x-dtbncx+xml"/>
+    <item id="picture" href="{picture}" media-type="image/png"/>
+  </manifest>
+  <spine toc="toc"><itemref idref="ch1"/><itemref idref="page"/></spine>
+</package>
+"#
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+    process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    for (path, bytes) in &planted {
+        let now = fs::read(path).ok();
+        assert!(now.as_ref() == Some(bytes), "{path} was changed or removed");
+    }
+    let left: Vec<_> = fs::read_dir(outside.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        left.len(),
+        planted.len(),
+        "files appeared beside them: {left:?}"
+    );
+}
+
+/// Nor can container.xml send the pipeline to a package document outside the
+/// book, which it would parse and then rewrite. The package inside is used.
+#[test]
+fn the_container_cannot_point_at_a_package_outside_the_book() {
+    let outside = tempfile::tempdir().unwrap();
+    let decoy = outside.path().join("victim.opf");
+    fs::write(&decoy, common::CONTENT_OPF).unwrap();
+
+    let container = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="{}" media-type="application/oebps-package+xml"/></rootfiles>
+</container>
+"#,
+        decoy.display()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", container.as_bytes()),
+            ("OEBPS/content.opf", common::CONTENT_OPF),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+    let report = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .unwrap();
+
+    assert!(
+        fs::read(&decoy).unwrap() == common::CONTENT_OPF,
+        "the package outside the book was rewritten"
+    );
+    assert_eq!(report.output_filename, "A Writer - Test Book.epub");
 }

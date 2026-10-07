@@ -1,6 +1,10 @@
+use std::io::Write;
+use std::path::Path;
+
 use epubkit_core::metadata::{
-    check_template, extract_metadata, format_filename, output_filename, strip_store_metadata,
-    unused_path, update_metadata, FilenameFormat, FilenameOptions, Metadata, MetadataEdits,
+    check_template, extract_metadata, format_filename, output_filename, publish, staging_file,
+    strip_store_metadata, unused_path, update_metadata, FilenameFormat, FilenameOptions, Metadata,
+    MetadataEdits,
 };
 use epubkit_core::xml;
 
@@ -456,4 +460,105 @@ fn a_dangling_link_counts_as_taken() {
     std::os::unix::fs::symlink(dir.path().join("nowhere.epub"), &wanted).unwrap();
 
     assert_eq!(unused_path(&wanted), dir.path().join("Afternoon (2).epub"));
+
+    let published = publish(staging_file(dir.path()).unwrap(), &wanted).unwrap();
+    assert_eq!(published, dir.path().join("Afternoon (2).epub"));
+    assert!(wanted.symlink_metadata().unwrap().is_symlink());
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A finished book moves to the first free name, and leaves no staging file
+/// behind.
+#[test]
+fn a_book_is_published_under_the_first_free_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("Vale - Afternoon.epub");
+    std::fs::write(&wanted, b"the original").unwrap();
+
+    let mut staged = staging_file(dir.path()).unwrap();
+    staged.write_all(b"the book").unwrap();
+    let published = publish(staged, &wanted).unwrap();
+
+    assert_eq!(published, dir.path().join("Vale - Afternoon (2).epub"));
+    assert_eq!(std::fs::read(&published).unwrap(), b"the book");
+    assert_eq!(std::fs::read(&wanted).unwrap(), b"the original");
+    assert_eq!(
+        names_in(dir.path()),
+        ["Vale - Afternoon (2).epub", "Vale - Afternoon.epub"]
+    );
+}
+
+/// Each run stages into a file of its own, which goes if the run does not
+/// finish.
+#[test]
+fn a_staging_file_is_new_and_goes_unless_published() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".epubkit-0.part"), b"someone else's").unwrap();
+
+    let first = staging_file(dir.path()).unwrap();
+    let second = staging_file(dir.path()).unwrap();
+    assert_ne!(first.path(), second.path());
+    assert_eq!(first.path().parent(), Some(dir.path()));
+    assert_eq!(std::fs::read(first.path()).unwrap(), b"");
+
+    drop(first);
+    drop(second);
+    assert_eq!(names_in(dir.path()), [".epubkit-0.part"]);
+    assert_eq!(
+        std::fs::read(dir.path().join(".epubkit-0.part")).unwrap(),
+        b"someone else's"
+    );
+}
+
+/// Where the book cannot be renamed into place, as on a filesystem that can
+/// neither rename without replacing nor link, it is copied into a file made
+/// new, which refuses a name already taken just as the rename would. Here the
+/// rename fails because the staging file's name has gone, which takes the same
+/// path.
+#[cfg(unix)]
+#[test]
+fn a_book_that_cannot_be_renamed_into_place_is_copied_without_replacing() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("Book.epub");
+    std::fs::write(&wanted, b"another book").unwrap();
+
+    let mut staged = staging_file(dir.path()).unwrap();
+    staged.write_all(b"the book").unwrap();
+    std::fs::remove_file(staged.path()).unwrap();
+
+    let published = publish(staged, &wanted).unwrap();
+
+    assert_eq!(published, dir.path().join("Book (2).epub"));
+    assert_eq!(std::fs::read(&published).unwrap(), b"the book");
+    assert_eq!(std::fs::read(&wanted).unwrap(), b"another book");
+    assert_eq!(names_in(dir.path()), ["Book (2).epub", "Book.epub"]);
+}
+
+/// A book is as readable as any other file its owner makes, not private the
+/// way a temporary file is.
+#[cfg(unix)]
+#[test]
+fn a_published_book_has_ordinary_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ordinary = dir.path().join("ordinary");
+    std::fs::File::create(&ordinary).unwrap();
+
+    let published = publish(
+        staging_file(dir.path()).unwrap(),
+        &dir.path().join("Afternoon.epub"),
+    )
+    .unwrap();
+
+    let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&published), mode(&ordinary));
 }

@@ -4,13 +4,20 @@ use std::path::Path;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
-    fix_toc, manifest_items, show_reshaped_pages, spine_hrefs, update_css_references, update_opf,
-    update_opf_remove_fonts, update_xhtml_references, TocOutcome,
+    fix_toc, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs, update_css_references,
+    update_opf, update_opf_remove_fonts, update_xhtml_references, Renames, ReshapedPages,
+    TocOutcome,
 };
 use epubkit_core::xml;
 
 fn opf(body: &str) -> libxml::tree::Document {
     xml::parse_strict(body.as_bytes()).expect("fixture should parse")
+}
+
+/// Where a book with no files on disk is said to be unpacked, for steps that
+/// only resolve its paths.
+fn book() -> &'static Path {
+    Path::new("/book")
 }
 
 fn rename_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -65,7 +72,8 @@ fn spine_skips_dangling_idrefs() {
 
 #[test]
 fn classifies_content_files_by_media_type() {
-    let files = find_content_files(Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
+    let files =
+        find_content_files(Path::new("/book"), Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
 
     assert_eq!(files.xhtml.len(), 2);
     assert_eq!(files.css, vec![Path::new("/book/styles/main.css")]);
@@ -78,7 +86,8 @@ fn classifies_content_files_by_media_type() {
 /// removal step silently leaves it in the book.
 #[test]
 fn classifies_fonts_by_extension_when_the_media_type_lies() {
-    let files = find_content_files(Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
+    let files =
+        find_content_files(Path::new("/book"), Path::new("/book"), &opf(MIXED_MANIFEST)).unwrap();
     assert_eq!(
         files.fonts,
         vec![
@@ -111,7 +120,10 @@ fn manifest_hrefs_follow_renamed_images() {
     let doc = opf(MIXED_MANIFEST);
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
-    assert_eq!(update_opf(&doc, &map).unwrap(), 1);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
 
     let item = manifest_items(&doc)
         .unwrap()
@@ -135,7 +147,10 @@ fn percent_encoded_hrefs_are_matched_and_re_encoded() {
 "#);
 
     let map = rename_map(&[("images/a plate.png", "images/a plate.jpg")]);
-    assert_eq!(update_opf(&doc, &map).unwrap(), 1);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
 
     let item = &manifest_items(&doc).unwrap()[0];
     assert_eq!(item.href, "images/a%20plate.jpg");
@@ -194,7 +209,10 @@ fn xhtml_image_references_follow_renames() {
     .unwrap();
 
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
-    assert_eq!(update_xhtml_references(dir.path(), &path, &map).unwrap(), 2);
+    assert_eq!(
+        update_xhtml_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
+        2
+    );
 
     let out = fs::read_to_string(&path).unwrap();
     assert!(out.contains(r#"src="../images/plate.jpg""#), "{out}");
@@ -212,7 +230,11 @@ fn xhtml_untouched_by_an_empty_rename_map() {
     fs::write(&path, original).unwrap();
 
     assert_eq!(
-        update_xhtml_references(dir.path(), &path, &BTreeMap::new()).unwrap(),
+        update_xhtml_references(
+            &path,
+            &Renames::new(dir.path(), dir.path(), &BTreeMap::new())
+        )
+        .unwrap(),
         0
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -232,7 +254,10 @@ fn css_url_references_follow_renames() {
         ("images/plate.png", "images/plate.jpg"),
         ("images/other.gif", "images/other.jpg"),
     ]);
-    assert_eq!(update_css_references(dir.path(), &path, &map).unwrap(), 1);
+    assert_eq!(
+        update_css_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
+        1
+    );
 
     let out = fs::read_to_string(&path).unwrap();
     assert!(out.contains(r#"url("images/plate.jpg")"#), "{out}");
@@ -272,10 +297,13 @@ fn references_follow_the_file_they_name_not_its_filename() {
     let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         2
     );
-    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+    assert_eq!(
+        update_css_references(&css, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
+        1
+    );
 
     let out = fs::read_to_string(&chapter).unwrap();
     assert!(out.contains(r#"src="../a/pic.jpg""#), "{out}");
@@ -298,7 +326,7 @@ fn a_reference_to_a_file_that_kept_its_name_is_left_alone() {
     let map = rename_map(&[("a/pic.png", "a/pic.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 }
@@ -315,7 +343,7 @@ fn an_ambiguous_filename_is_not_guessed_at() {
     );
     let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
     assert_eq!(
-        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 
@@ -326,7 +354,10 @@ fn an_ambiguous_filename_is_not_guessed_at() {
   <spine/>
 </package>
 "#);
-    assert_eq!(update_opf(&doc, &map).unwrap(), 0);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -342,7 +373,7 @@ fn links_to_other_sites_and_data_are_left_alone() {
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 }
@@ -365,7 +396,7 @@ fn a_renamed_filename_is_written_the_way_the_reference_wrote_it() {
     ]);
 
     assert_eq!(
-        update_xhtml_references(dir.path(), &chapter, &map).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         2
     );
 
@@ -387,7 +418,10 @@ fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
     );
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
-    assert_eq!(update_css_references(dir.path(), &css, &map).unwrap(), 1);
+    assert_eq!(
+        update_css_references(&css, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
+        1
+    );
 
     let out = fs::read_to_string(&css).unwrap();
     assert!(out.contains(r#"url("fonts/My Font.otf")"#), "{out}");
@@ -418,7 +452,7 @@ fn svg_wrapped_covers_become_plain_images() {
 </package>
 "#);
 
-    assert_eq!(fix_svg_covers(dir.path(), &doc).unwrap(), 1);
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 1);
 
     let out = fs::read_to_string(&cover).unwrap();
     assert!(out.contains(r#"src="images/cover.jpg""#), "{out}");
@@ -454,7 +488,91 @@ fn multi_image_svgs_are_left_alone() {
 </package>
 "#);
 
-    assert_eq!(fix_svg_covers(dir.path(), &doc).unwrap(), 0);
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&page).unwrap(), original);
+}
+
+/// An SVG that draws more than its image, a label or a line, is an
+/// illustration, and so is one that draws its image turned; an `<img>` would
+/// lose the rest. One that adds only a title or a description is still a
+/// wrapper.
+#[test]
+fn only_an_svg_that_just_shows_its_image_is_unwrapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let svg = |inside: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 800">
+{inside}
+</svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cover = put(
+        dir.path(),
+        "cover.xhtml",
+        svg(r#"<title>Cover</title><desc>The front cover</desc>
+<image width="600" height="800" xlink:href="images/cover.jpg"/>"#),
+    );
+    let labelled = svg(
+        r#"<image width="600" height="800" xlink:href="images/map.png"/>
+<path d="M 10 10 L 590 790" stroke="black"/>
+<text x="300" y="400">ESSENTIAL MAP LABEL</text>"#,
+    );
+    let map = put(dir.path(), "map.xhtml", &labelled);
+    let turned = svg(
+        r#"<image width="600" height="800" transform="rotate(90 300 400)" xlink:href="images/plate.png"/>"#,
+    );
+    let plate = put(dir.path(), "plate.xhtml", &turned);
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="map" href="map.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="plate.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="cover"/><itemref idref="map"/><itemref idref="plate"/></spine>
+</package>
+"#);
+
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 1);
+    assert!(!fs::read_to_string(&cover).unwrap().contains("<svg"));
+    assert_eq!(fs::read_to_string(&map).unwrap(), labelled);
+    assert_eq!(fs::read_to_string(&plate).unwrap(), turned);
+}
+
+/// An SVG inside another is part of that illustration; an `<img>` in its
+/// place would not show inside an SVG at all.
+#[test]
+fn an_svg_inside_another_is_left_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 800">
+<svg x="100" y="100" width="400" height="600"><image width="400" height="600" xlink:href="images/inset.jpg"/></svg>
+<text x="300" y="50">Caption</text>
+</svg>
+</body>
+</html>
+"#;
+    let page = put(dir.path(), "page.xhtml", original);
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="p" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="p"/></spine>
+</package>
+"#);
+
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
     assert_eq!(fs::read_to_string(&page).unwrap(), original);
 }
 
@@ -494,7 +612,10 @@ fn a_missing_toc_is_generated_from_the_spine() {
     write_chapter(&dir.path().join("c2.xhtml"), "Second Chapter", "Two");
 
     let doc = opf(TWO_CHAPTER_OPF);
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(ncx.contains("First Chapter"), "{ncx}");
@@ -541,7 +662,10 @@ fn a_healthy_toc_is_left_alone() {
 </package>
 "#);
 
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Valid);
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Valid
+    );
 }
 
 /// The reference implementation detected broken references and then did
@@ -579,7 +703,10 @@ fn a_toc_pointing_at_missing_files_is_regenerated() {
 </package>
 "#);
 
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(!ncx.contains("deleted.xhtml"), "{ncx}");
@@ -605,7 +732,10 @@ fn chapters_without_titles_fall_back_to_headings_then_position() {
     .unwrap();
 
     let doc = opf(TWO_CHAPTER_OPF);
-    assert_eq!(fix_toc(dir.path(), &doc).unwrap(), TocOutcome::Generated(2));
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     assert!(ncx.contains("Heading Only"), "{ncx}");
@@ -619,11 +749,132 @@ fn titles_needing_escapes_produce_valid_ncx() {
     write_chapter(&dir.path().join("c2.xhtml"), "A &lt;Tag&gt;", "Two");
 
     let doc = opf(TWO_CHAPTER_OPF);
-    fix_toc(dir.path(), &doc).unwrap();
+    fix_toc(dir.path(), dir.path(), &doc).unwrap();
 
     let ncx = fs::read_to_string(dir.path().join("toc.ncx")).unwrap();
     xml::parse_strict(ncx.as_bytes()).expect("NCX with escaped titles should parse");
     assert!(ncx.contains("Cause &amp; Effect"), "{ncx}");
+}
+
+/// Chapter links in the OPF are relative to the OPF; in a generated NCX they
+/// have to be relative to the NCX, which need not sit beside it.
+#[test]
+fn a_regenerated_ncx_links_its_chapters_from_where_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = dir.path().join("OPS");
+    fs::create_dir_all(ops.join("Navigation")).unwrap();
+    fs::create_dir_all(ops.join("Text")).unwrap();
+    write_chapter(&ops.join("chapter.xhtml"), "First", "One");
+    write_chapter(&ops.join("Text").join("Part Two.xhtml"), "Second", "Two");
+    fs::write(ops.join("Navigation").join("toc.ncx"), "not an NCX").unwrap();
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="Text/Part%20Two.xhtml" media-type="application/xhtml+xml"/>
+    <item id="toc" href="Navigation/toc.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="toc">
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>
+"#);
+
+    assert_eq!(
+        fix_toc(dir.path(), &ops, &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
+
+    let ncx = fs::read_to_string(ops.join("Navigation").join("toc.ncx")).unwrap();
+    assert!(ncx.contains(r#"src="../chapter.xhtml""#), "{ncx}");
+    assert!(ncx.contains(r#"src="../Text/Part%20Two.xhtml""#), "{ncx}");
+    // What was written is a table of contents the same check now accepts.
+    assert_eq!(fix_toc(dir.path(), &ops, &doc).unwrap(), TocOutcome::Valid);
+}
+
+/// A chapter outside the book has no place in its table of contents, and a
+/// spine with nothing else gives it nothing to list.
+#[test]
+fn a_toc_lists_no_chapter_outside_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book");
+    fs::create_dir(&book).unwrap();
+    write_chapter(&book.join("c1.xhtml"), "Inside", "One");
+    write_chapter(&dir.path().join("c2.xhtml"), "Outside", "Two");
+
+    let doc = opf(&TWO_CHAPTER_OPF.replace("c2.xhtml", "../c2.xhtml"));
+    assert_eq!(
+        fix_toc(&book, &book, &doc).unwrap(),
+        TocOutcome::Generated(1)
+    );
+    let ncx = fs::read_to_string(book.join("toc.ncx")).unwrap();
+    assert!(!ncx.contains("c2.xhtml"), "{ncx}");
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let doc = opf(&TWO_CHAPTER_OPF
+        .replace("c1.xhtml", "../c1.xhtml")
+        .replace("c2.xhtml", "../c2.xhtml"));
+    assert!(matches!(
+        fix_toc(elsewhere.path(), elsewhere.path(), &doc).unwrap(),
+        TocOutcome::Skipped(_)
+    ));
+    assert!(!elsewhere.path().join("toc.ncx").exists());
+}
+
+/// IDs are unique across the whole package document, so a generated NCX
+/// takes one nothing else has, and the spine points at it by that.
+#[test]
+fn a_generated_ncx_takes_an_id_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    write_chapter(&dir.path().join("c1.xhtml"), "First", "One");
+    write_chapter(&dir.path().join("c2.xhtml"), "Second", "Two");
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="ncx-2">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="ncx-2">urn:uuid:demo</dc:identifier>
+    <dc:title>T</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="c1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="c2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ncx"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>
+"#);
+
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
+
+    let ids: Vec<String> = xml::find_nodes(&doc, "//*[@id]")
+        .unwrap()
+        .iter()
+        .map(|node| node.get_attribute("id").unwrap())
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+
+    let ncx = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.media_type == "application/x-dtbncx+xml")
+        .expect("the NCX is declared");
+    let spine = xml::find_first(&doc, "//*[local-name()='spine']")
+        .unwrap()
+        .unwrap();
+    assert_eq!(spine.get_attribute("toc"), Some(ncx.id));
+    assert_eq!(
+        spine_hrefs(&doc).unwrap()[0],
+        ("ncx".to_string(), "c1.xhtml".to_string())
+    );
 }
 
 #[test]
@@ -637,7 +888,7 @@ fn an_empty_spine_is_reported_not_guessed_at() {
 
     let dir = tempfile::tempdir().unwrap();
     assert!(matches!(
-        fix_toc(dir.path(), &doc).unwrap(),
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
         TocOutcome::Skipped(_)
     ));
 }
@@ -672,7 +923,11 @@ fn a_split_image_is_followed_by_its_other_pages() {
     );
 
     assert_eq!(
-        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
         1
     );
 
@@ -710,7 +965,11 @@ fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
     );
 
     assert_eq!(
-        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
         1
     );
 
@@ -724,6 +983,44 @@ fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
         out.contains(r#"<img src="../images/spread_part2.jpg""#),
         "{out}"
     );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// An illustration drawn around a split image keeps everything it draws, and
+/// the image's further pages follow it.
+#[test]
+fn an_illustration_around_a_split_image_is_kept_and_followed_by_its_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><div class="illust">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread_part1.jpg"/><text x="500" y="200">ESSENTIAL MAP LABEL</text></svg>
+</div></body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains("ESSENTIAL MAP LABEL"), "{out}");
+    assert!(
+        out.contains(r#"xlink:href="../images/spread_part1.jpg""#),
+        "{out}"
+    );
+    let svg_end = out.find("</svg>").expect("the illustration is kept");
+    let second = out
+        .find(r#"<img src="../images/spread_part2.jpg""#)
+        .expect("the second page is shown");
+    assert!(second > svg_end, "{out}");
     xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
 }
 
@@ -742,7 +1039,11 @@ fn a_rotated_image_loses_the_size_it_no_longer_has() {
     )]);
 
     assert_eq!(
-        show_reshaped_pages(dir.path(), &chapter, &rotated).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &rotated)
+        )
+        .unwrap(),
         1
     );
 
@@ -754,8 +1055,11 @@ fn a_rotated_image_loses_the_size_it_no_longer_has() {
 #[test]
 fn split_pages_are_declared_under_ids_of_their_own() {
     let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="plate-2-2">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="plate-2-2">urn:uuid:demo</dc:identifier>
+    <dc:title>T</dc:title>
+  </metadata>
   <manifest>
     <item id="plate" href="images/spread_part1.jpg" media-type="image/jpeg"/>
     <item id="plate-2" href="images/unrelated.jpg" media-type="image/jpeg"/>
@@ -771,6 +1075,33 @@ fn split_pages_are_declared_under_ids_of_their_own() {
         .into_iter()
         .find(|item| item.href == "images/spread_part2.jpg")
         .expect("the second page should be declared");
-    assert_eq!(added.id, "plate-2-2", "plate-2 was taken");
+    assert_eq!(
+        added.id, "plate-2-3",
+        "plate-2 was taken in the manifest, plate-2-2 in the metadata"
+    );
     assert_eq!(added.media_type, "image/jpeg");
+}
+
+/// An href leads somewhere inside the book, or nowhere. A leading slash
+/// starts from the book's root, as URLs inside an EPUB container do.
+#[test]
+fn hrefs_resolve_inside_the_book_or_not_at_all() {
+    let root = Path::new("/work");
+    let opf_dir = Path::new("/work/OEBPS");
+    let inside = |href: &str| resolve_href(root, opf_dir, href);
+
+    assert_eq!(
+        inside("Text/one.xhtml"),
+        Some("/work/OEBPS/Text/one.xhtml".into())
+    );
+    assert_eq!(inside("../Images/a.png"), Some("/work/Images/a.png".into()));
+    assert_eq!(inside("./Text/../b.css"), Some("/work/OEBPS/b.css".into()));
+    assert_eq!(
+        inside("/OEBPS/one.xhtml"),
+        Some("/work/OEBPS/one.xhtml".into())
+    );
+
+    assert_eq!(inside("../../etc/passwd"), None);
+    assert_eq!(inside("Text/../../../x"), None);
+    assert_eq!(inside("/../x"), None);
 }

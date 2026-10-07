@@ -147,8 +147,42 @@ pub fn spine_hrefs(doc: &Document) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// Where `href`, decoded, leads from `base`, a directory inside the book's
+/// `root` — or `None` if it leads out of the book.
+///
+/// The book is untrusted, and its hrefs become paths the pipeline reads,
+/// rewrites and deletes. Joined as they stand, an absolute href would replace
+/// the base and `..` would climb out of it, handing the pipeline files that
+/// are not the book's. A leading `/` starts from the book's root instead, as
+/// a URL inside an EPUB container does.
+pub fn resolve_href(root: &Path, base: &Path, href: &str) -> Option<PathBuf> {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    let from_base = base.strip_prefix(root).ok()?;
+
+    for component in from_base.components().chain(Path::new(href).components()) {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            Component::RootDir => parts.clear(),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            // A drive or share names another filesystem altogether.
+            Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(
+        parts
+            .iter()
+            .fold(root.to_path_buf(), |path, part| path.join(part)),
+    )
+}
+
 /// Classify every manifest entry by what the pipeline needs to do with it.
-pub fn find_content_files(opf_dir: &Path, doc: &Document) -> Result<ContentFiles> {
+/// `root` is where the book was unpacked; an entry that leads out of it is
+/// left out.
+pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result<ContentFiles> {
     let mut files = ContentFiles::default();
 
     for item in manifest_items(doc)? {
@@ -156,7 +190,9 @@ pub fn find_content_files(opf_dir: &Path, doc: &Document) -> Result<ContentFiles
         if href.is_empty() {
             continue;
         }
-        let path = opf_dir.join(&href);
+        let Some(path) = resolve_href(root, opf_dir, &href) else {
+            continue;
+        };
         let media_type = item.media_type.to_ascii_lowercase();
 
         match media_type.as_str() {
@@ -198,8 +234,11 @@ pub fn build_rename_map(processed: &BTreeMap<String, String>) -> BTreeMap<String
 
 /// Point renamed images' manifest entries at their new files. Returns how many
 /// entries changed.
-pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Result<usize> {
-    if rename_map.is_empty() {
+///
+/// An entry is matched by the file its href leads to, however it is spelled,
+/// and gets the new file's path as the rename map writes it.
+pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
@@ -211,13 +250,7 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
     let mut updated = 0;
     for mut node in nodes {
         let href = node.get_attribute("href").unwrap_or_default();
-        let decoded = decode(&href);
-
-        let Some(new_path) = rename_map
-            .get(&decoded)
-            .or_else(|| rename_map.get(&href))
-            .or_else(|| rename_by_filename(&decoded, rename_map))
-        else {
+        let Some(new_path) = renames.new_path(renames.opf_dir, &decode(&href)) else {
             continue;
         };
 
@@ -288,19 +321,13 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 ///
 /// A reference is resolved against the file's own directory and matched by
 /// path, so two images that share a filename in different directories can be
-/// renamed differently. `opf_dir` is what the rename map's paths are relative
-/// to.
-pub fn update_xhtml_references(
-    opf_dir: &Path,
-    path: &Path,
-    rename_map: &BTreeMap<String, String>,
-) -> Result<usize> {
-    if rename_map.is_empty() {
+/// renamed differently.
+pub fn update_xhtml_references(path: &Path, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
-    let renames = Renames::new(opf_dir, rename_map);
-    let base = path.parent().unwrap_or(opf_dir);
+    let base = path.parent().unwrap_or(renames.opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
@@ -310,7 +337,7 @@ pub fn update_xhtml_references(
         match local_name(&node).as_str() {
             "img" => {
                 let src = node.get_attribute("src").unwrap_or_default();
-                if let Some(new_src) = rewrite_reference(&src, base, &renames) {
+                if let Some(new_src) = rewrite_reference(&src, base, renames) {
                     node.set_attribute("src", &new_src).ok();
                     updated += 1;
                 }
@@ -323,7 +350,7 @@ pub fn update_xhtml_references(
                     .clone()
                     .unwrap_or_else(|| node.get_attribute("href").unwrap_or_default());
 
-                if let Some(new_value) = rewrite_reference(&value, base, &renames) {
+                if let Some(new_value) = rewrite_reference(&value, base, renames) {
                     let namespace = xlink
                         .is_some()
                         .then(|| xlink_namespace(&content.doc, &node));
@@ -343,7 +370,7 @@ pub fn update_xhtml_references(
 
         let style = node.get_attribute("style").unwrap_or_default();
         if style.contains("url(") {
-            let new_style = rewrite_css_urls(&style, base, &renames);
+            let new_style = rewrite_css_urls(&style, base, renames);
             if new_style != style {
                 node.set_attribute("style", &new_style).ok();
                 updated += 1;
@@ -360,20 +387,15 @@ pub fn update_xhtml_references(
 
 /// Rewrite `url()` references in a stylesheet, resolved against its own
 /// directory. Returns 1 if the file changed.
-pub fn update_css_references(
-    opf_dir: &Path,
-    path: &Path,
-    rename_map: &BTreeMap<String, String>,
-) -> Result<usize> {
-    if rename_map.is_empty() {
+pub fn update_css_references(path: &Path, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
-    let renames = Renames::new(opf_dir, rename_map);
-    let base = path.parent().unwrap_or(opf_dir);
+    let base = path.parent().unwrap_or(renames.opf_dir);
 
     let css = crate::css::read_stylesheet(path)?;
-    let rewritten = rewrite_css_urls(&css, base, &renames);
+    let rewritten = rewrite_css_urls(&css, base, renames);
 
     if rewritten == css {
         return Ok(0);
@@ -392,7 +414,7 @@ pub fn declare_reshaped_pages(
     reshaped: &BTreeMap<String, Vec<String>>,
 ) -> Result<usize> {
     let items = manifest_items(doc)?;
-    let mut ids: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+    let mut ids = ids_in(doc)?;
     let mut added = 0;
 
     for (first, pages) in reshaped {
@@ -402,12 +424,7 @@ pub fn declare_reshaped_pages(
             .map_or_else(|| "image".to_string(), |item| item.id.clone());
 
         for (index, page) in pages.iter().enumerate().skip(1) {
-            let wanted = format!("{base}-{}", index + 1);
-            let id = std::iter::once(wanted.clone())
-                .chain((2..).map(|n| format!("{wanted}-{n}")))
-                .find(|candidate| !ids.contains(candidate))
-                .expect("an unused suffix always exists");
-
+            let id = unused_id(&ids, &format!("{base}-{}", index + 1));
             add_image_to_opf(doc, &encode(page), &id)?;
             ids.insert(id);
             added += 1;
@@ -418,73 +435,87 @@ pub fn declare_reshaped_pages(
 }
 
 /// Show every page of each image Light Novel mode reshaped in one XHTML file.
-/// `reshaped` is as for [`declare_reshaped_pages`]; references should already
-/// point at the first page.
+/// References should already point at the first page.
 ///
 /// An `<img>` of a reshaped image loses its `width` and `height`, which give
 /// the old shape, and is followed by a copy for each further page. An SVG
 /// wrapper around one, its viewBox sized to the old shape too, gives way to a
-/// plain `<img>` per page. Returns how many images changed, writing the file
-/// only if any did.
-pub fn show_reshaped_pages(
-    opf_dir: &Path,
-    path: &Path,
-    reshaped: &BTreeMap<String, Vec<String>>,
-) -> Result<usize> {
+/// plain `<img>` per page. An SVG that draws more than the image is an
+/// illustration, and stays as it is, followed by the image's further pages.
+/// Returns how many images changed, writing the file only if any did.
+pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usize> {
     if reshaped.is_empty() {
         return Ok(0);
     }
 
-    let pages_by_target: HashMap<PathBuf, Vec<String>> = reshaped
-        .iter()
-        .map(|(first, pages)| {
-            let names = pages.iter().map(|page| file_name_of(page)).collect();
-            (normalize_path(&opf_dir.join(first)), names)
-        })
-        .collect();
-    let base = path.parent().unwrap_or(opf_dir);
+    let base = path.parent().unwrap_or(reshaped.opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
     let mut changed = 0;
 
-    // Both lists are taken before anything changes, so the images added below
-    // are not visited in turn.
-    let svgs = xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))?;
-    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
-
-    for mut svg in svgs {
-        let inner =
-            xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
-        let [image] = inner.as_slice() else {
-            continue;
-        };
+    // What would show each page of the image an SVG `<image>` shows, if that
+    // was reshaped.
+    let page_sources = |image: &Node| -> Option<Vec<String>> {
         let href = image
             .get_attribute_ns("href", NS_XLINK)
             .or_else(|| image.get_attribute("href"))
             .unwrap_or_default();
-        let Some(reference) = Reference::parse(&href) else {
-            continue;
-        };
-        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
-            continue;
-        };
+        let reference = Reference::parse(&href)?;
+        let pages = reshaped.pages(base, &reference.path())?;
+        Some(pages.iter().map(|page| reference.with_name(page)).collect())
+    };
+
+    // Both lists are taken before anything changes, so the images added below
+    // are not visited in turn.
+    let svgs = xml::find_nodes(&content.doc, &outermost_svgs())?;
+    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
+
+    for mut svg in svgs {
         let Some(mut parent) = svg.get_parent() else {
             continue;
         };
-
         let namespace = parent.get_namespace();
-        for page in pages {
-            let Ok(mut img) = parent.new_child(namespace.clone(), "img") else {
-                continue;
-            };
-            img.set_attribute("src", &reference.with_name(page)).ok();
+        let mut page_image = |src: &str| {
+            let mut img = parent.new_child(namespace.clone(), "img").ok()?;
+            img.set_attribute("src", src).ok();
             img.set_attribute("alt", "").ok();
             img.set_attribute("style", FULL_PAGE_STYLE).ok();
-            svg.add_prev_sibling(&mut img).ok();
+            Some(img)
+        };
+
+        // A wrapper gives way to its image's pages.
+        if let Some(image) = wrapped_image(&svg) {
+            let Some(sources) = page_sources(&image) else {
+                continue;
+            };
+            for src in &sources {
+                if let Some(mut img) = page_image(src) {
+                    svg.add_prev_sibling(&mut img).ok();
+                }
+            }
+            svg.unlink();
+            changed += 1;
+            continue;
         }
-        svg.unlink();
-        changed += 1;
+
+        // An illustration stays as it is. The pages after the first of an
+        // image it draws, which it cannot show, follow it.
+        let drawn =
+            xml::find_nodes_under(&content.doc, &svg, &format!(".//{}", xml::local("image")))?;
+        let mut previous = svg.clone();
+        for image in drawn {
+            let Some(sources) = page_sources(&image).filter(|sources| sources.len() > 1) else {
+                continue;
+            };
+            for src in &sources[1..] {
+                if let Some(mut img) = page_image(src) {
+                    previous.add_next_sibling(&mut img).ok();
+                    previous = img;
+                }
+            }
+            changed += 1;
+        }
     }
 
     for mut image in images {
@@ -492,7 +523,7 @@ pub fn show_reshaped_pages(
         let Some(reference) = Reference::parse(&src) else {
             continue;
         };
-        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+        let Some(pages) = reshaped.pages(base, &reference.path()) else {
             continue;
         };
         let Some(mut parent) = image.get_parent() else {
@@ -535,14 +566,17 @@ pub fn show_reshaped_pages(
 ///
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
 /// which small e-ink readers render poorly or not at all. Only the first few
-/// spine entries are examined — a cover later than that is not a cover.
-pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
+/// spine entries are examined — a cover later than that is not a cover — and
+/// only an SVG that does nothing but show its image is replaced.
+pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usize> {
     const SPINE_ENTRIES_TO_CHECK: usize = 3;
 
     let mut fixed = 0;
 
     for (_, href) in spine_hrefs(doc)?.into_iter().take(SPINE_ENTRIES_TO_CHECK) {
-        let path = opf_dir.join(decode(&href));
+        let Some(path) = resolve_href(root, opf_dir, &decode(&href)) else {
+            continue;
+        };
         if !path.is_file() {
             continue;
         }
@@ -553,17 +587,10 @@ pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
         };
 
         let mut fixed_here = 0;
-        for mut svg in xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))? {
-            let images =
-                xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
-
-            // A wrapper holds exactly one image. More than that is a real
-            // illustration and must be left alone.
-            if images.len() != 1 {
+        for mut svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
+            let Some(image) = wrapped_image(&svg) else {
                 continue;
-            }
-
-            let image = &images[0];
+            };
             let target = image
                 .get_attribute_ns("href", NS_XLINK)
                 .or_else(|| image.get_attribute("href"))
@@ -607,7 +634,7 @@ pub fn fix_svg_covers(opf_dir: &Path, doc: &Document) -> Result<usize> {
 /// The reference implementation reported "Fixed N broken TOC references" while
 /// its fix-up function was an empty stub, so a book with a broken TOC kept it.
 /// Here a broken TOC is regenerated, which is what that comment intended.
-pub fn fix_toc(opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
+pub fn fix_toc(root: &Path, opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
     let spine = spine_hrefs(doc)?;
     if spine.is_empty() {
         return Ok(TocOutcome::Skipped("Empty spine".into()));
@@ -617,20 +644,28 @@ pub fn fix_toc(opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
         .into_iter()
         .find(|item| item.media_type == NCX_MEDIA_TYPE);
 
-    if let Some(item) = &existing_ncx {
-        let ncx_path = opf_dir.join(item.decoded_href());
-        if ncx_is_usable(&ncx_path)? {
-            return Ok(TocOutcome::Valid);
-        }
-    }
-
-    let chapters = extract_chapters(opf_dir, &spine);
     let ncx_href = existing_ncx
         .as_ref()
         .map(|item| item.decoded_href())
         .unwrap_or_else(|| "toc.ncx".to_string());
+    let Some(ncx_path) = resolve_href(root, opf_dir, &ncx_href) else {
+        return Ok(TocOutcome::Skipped(
+            "TOC left alone: it lies outside the book".into(),
+        ));
+    };
 
-    write_ncx(&opf_dir.join(&ncx_href), &chapters)?;
+    if existing_ncx.is_some() && ncx_is_usable(root, &ncx_path)? {
+        return Ok(TocOutcome::Valid);
+    }
+
+    let ncx_dir = ncx_path.parent().unwrap_or(root);
+    let chapters = extract_chapters(root, opf_dir, ncx_dir, &spine);
+    if chapters.is_empty() {
+        return Ok(TocOutcome::Skipped(
+            "TOC left alone: no chapter lies inside the book".into(),
+        ));
+    }
+    write_ncx(&ncx_path, &chapters)?;
 
     // A newly created NCX has to be declared, and pointed at from the spine.
     if existing_ncx.is_none() {
@@ -656,6 +691,35 @@ fn item_from_node(node: &Node) -> ManifestItem {
         media_type: node.get_attribute("media-type").unwrap_or_default(),
         properties: node.get_attribute("properties").unwrap_or_default(),
     }
+}
+
+/// Every `<svg>` that is not part of another. One that is belongs to the
+/// illustration it is in, and an `<img>` would not show there at all.
+fn outermost_svgs() -> String {
+    format!("//{svg}[not(ancestor::{svg})]", svg = xml::local("svg"))
+}
+
+/// The image an SVG wraps, if showing it is all the SVG does: the image is
+/// its one element apart from a title, a description or metadata, and is not
+/// drawn transformed, clipped, masked or filtered.
+///
+/// Anything more, a label, a line, a second image, makes the SVG an
+/// illustration, and an `<img>` in its place would lose the rest.
+fn wrapped_image(svg: &Node) -> Option<Node> {
+    let mut image = None;
+    for child in svg.get_child_elements() {
+        match local_name(&child).as_str() {
+            "title" | "desc" | "metadata" => {}
+            "image" if image.is_none() => image = Some(child),
+            _ => return None,
+        }
+    }
+
+    let image = image?;
+    let drawn_as_is = ["transform", "clip-path", "mask", "filter"]
+        .into_iter()
+        .all(|attribute| image.get_attribute(attribute).is_none());
+    drawn_as_is.then_some(image)
 }
 
 /// The xlink namespace as declared in scope at `node`, if it is.
@@ -716,64 +780,140 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normal
 }
 
-/// Find a rename by filename alone, for a path that leads nowhere — one
-/// written relative to the wrong directory, say. Only an unambiguous answer
-/// counts: images sharing a filename in different directories can be renamed
-/// differently, and then the filename cannot say which was meant.
-fn rename_by_filename<'a>(
-    path: &str,
-    rename_map: &'a BTreeMap<String, String>,
-) -> Option<&'a String> {
-    let name = file_name_of(path);
-    if name.is_empty() {
-        return None;
+/// Each renamed file's new path by its old filename alone, for a path that
+/// leads nowhere — one written relative to the wrong directory, say. Only an
+/// unambiguous answer counts: images sharing a filename in different
+/// directories can be renamed differently, and then the filename cannot say
+/// which was meant, so it maps to `None`.
+fn renames_by_filename(rename_map: &BTreeMap<String, String>) -> HashMap<String, Option<&String>> {
+    let mut by_name: HashMap<String, Option<&String>> = HashMap::new();
+
+    for (old, new) in rename_map {
+        let name = file_name_of(old);
+        if name.is_empty() {
+            continue;
+        }
+        by_name
+            .entry(name)
+            .and_modify(|first| {
+                if first.is_some_and(|first| file_name_of(first) != file_name_of(new)) {
+                    *first = None;
+                }
+            })
+            .or_insert(Some(new));
     }
 
-    let mut candidates = rename_map
-        .iter()
-        .filter(|(old, _)| file_name_of(old) == name)
-        .map(|(_, new)| new);
-    let first = candidates.next()?;
-    let new_name = file_name_of(first);
-
-    candidates
-        .all(|other| file_name_of(other) == new_name)
-        .then_some(first)
+    by_name
 }
 
-/// The rename map, indexed by the file each entry was renamed from.
-struct Renames<'a> {
-    rename_map: &'a BTreeMap<String, String>,
+/// The images the image step renamed, from [`build_rename_map`], indexed once
+/// for every document whose references to them are rewritten.
+///
+/// Files are told apart by where their paths lead, resolved as
+/// [`resolve_href`] resolves them, so two spellings of one path name one file.
+pub struct Renames<'a> {
+    /// The unpacked book.
+    root: &'a Path,
+    /// What the rename map's paths are relative to.
+    opf_dir: &'a Path,
+    /// Each renamed file's new path, by the file it was.
     by_source: HashMap<PathBuf, &'a String>,
+    by_name: HashMap<String, Option<&'a String>>,
 }
 
 impl<'a> Renames<'a> {
-    fn new(opf_dir: &Path, rename_map: &'a BTreeMap<String, String>) -> Self {
+    /// `rename_map`'s paths are relative to `opf_dir`, in the book unpacked at
+    /// `root`.
+    pub fn new(
+        root: &'a Path,
+        opf_dir: &'a Path,
+        rename_map: &'a BTreeMap<String, String>,
+    ) -> Self {
         let by_source = rename_map
             .iter()
-            .map(|(old, new)| (normalize_path(&opf_dir.join(old)), new))
+            .filter_map(|(old, new)| Some((resolve_href(root, opf_dir, old)?, new)))
             .collect();
+
         Self {
-            rename_map,
+            root,
+            opf_dir,
             by_source,
+            by_name: renames_by_filename(rename_map),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_source.is_empty()
+    }
+
+    /// The new path, relative to the OPF, of the file `path` leads to from
+    /// `base`, if that file was renamed.
+    fn new_path(&self, base: &Path, path: &str) -> Option<&'a String> {
+        if let Some(target) = resolve_href(self.root, base, path) {
+            if let Some(new) = self.by_source.get(&target) {
+                return Some(new);
+            }
+
+            // A path to a file that is still there names something that was
+            // not renamed, whatever its filename shares with something that
+            // was.
+            if target.is_file() {
+                return None;
+            }
+        }
+
+        self.by_name.get(&file_name_of(path)).copied().flatten()
     }
 
     /// The new filename of the file `path` leads to from `base`, if that file
     /// was renamed.
     fn new_name(&self, base: &Path, path: &str) -> Option<String> {
-        let target = normalize_path(&base.join(path));
-        if let Some(new) = self.by_source.get(&target) {
-            return Some(file_name_of(new));
-        }
+        self.new_path(base, path).map(|new| file_name_of(new))
+    }
+}
 
-        // A path to a file that is still there names something that was not
-        // renamed, whatever its filename shares with something that was.
-        if target.is_file() {
-            return None;
-        }
+/// The pages of each image Light Novel mode reshaped, indexed once for every
+/// document that shows them.
+pub struct ReshapedPages<'a> {
+    /// The unpacked book.
+    root: &'a Path,
+    /// What the pages' paths are relative to.
+    opf_dir: &'a Path,
+    /// The filename of each page, by the file of the first.
+    by_target: HashMap<PathBuf, Vec<String>>,
+}
 
-        rename_by_filename(path, self.rename_map).map(|new| file_name_of(new))
+impl<'a> ReshapedPages<'a> {
+    /// `reshaped` is as for [`declare_reshaped_pages`], its paths relative to
+    /// `opf_dir`, in the book unpacked at `root`.
+    pub fn new(
+        root: &'a Path,
+        opf_dir: &'a Path,
+        reshaped: &BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        let by_target = reshaped
+            .iter()
+            .filter_map(|(first, pages)| {
+                let names = pages.iter().map(|page| file_name_of(page)).collect();
+                Some((resolve_href(root, opf_dir, first)?, names))
+            })
+            .collect();
+
+        Self {
+            root,
+            opf_dir,
+            by_target,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_target.is_empty()
+    }
+
+    /// The filename of each page of the image `path` leads to from `base`, if
+    /// that image was reshaped.
+    fn pages(&self, base: &Path, path: &str) -> Option<&Vec<String>> {
+        self.by_target.get(&resolve_href(self.root, base, path)?)
     }
 }
 
@@ -808,11 +948,6 @@ impl<'a> Reference<'a> {
     /// The path, percent-decoded.
     fn path(&self) -> String {
         decode(&format!("{}{}", self.directory, self.name))
-    }
-
-    /// The file it names, from a document in `base`.
-    fn target(&self, base: &Path) -> PathBuf {
-        normalize_path(&base.join(self.path()))
     }
 
     /// The same reference naming `new_name`, percent-encoded only if the
@@ -883,7 +1018,7 @@ fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
 
 /// An NCX counts as usable when it parses, declares at least one navPoint, and
 /// every target it names exists on disk.
-fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
+fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
     if !ncx_path.is_file() {
         return Ok(false);
     }
@@ -912,7 +1047,7 @@ fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
             if file.is_empty() {
                 continue;
             }
-            if !ncx_dir.join(decode(file)).exists() {
+            if !resolve_href(root, ncx_dir, &decode(file)).is_some_and(|path| path.exists()) {
                 return Ok(false);
             }
         }
@@ -923,16 +1058,67 @@ fn ncx_is_usable(ncx_path: &Path) -> Result<bool> {
 
 /// Derive chapter titles from the spine, preferring `<title>` and falling back
 /// to the first heading, then to a positional name.
-fn extract_chapters(opf_dir: &Path, spine: &[(String, String)]) -> Vec<Chapter> {
+///
+/// The spine's hrefs are relative to the OPF, in `opf_dir`; each chapter's is
+/// rewritten relative to `ncx_dir`, where the NCX naming it goes. A chapter
+/// outside the book is left out.
+fn extract_chapters(
+    root: &Path,
+    opf_dir: &Path,
+    ncx_dir: &Path,
+    spine: &[(String, String)],
+) -> Vec<Chapter> {
     spine
         .iter()
         .enumerate()
-        .map(|(index, (_, href))| Chapter {
-            title: chapter_title(&opf_dir.join(decode(href)))
-                .unwrap_or_else(|| format!("Chapter {}", index + 1)),
-            href: href.clone(),
+        .filter_map(|(index, (_, href))| {
+            let (file, fragment) = match href.split_once('#') {
+                Some((file, fragment)) => (file, Some(fragment)),
+                None => (href.as_str(), None),
+            };
+            let path = resolve_href(root, opf_dir, &decode(file))?;
+
+            let mut href = relative_href(root, ncx_dir, &path)?;
+            if let Some(fragment) = fragment {
+                href.push('#');
+                href.push_str(fragment);
+            }
+
+            Some(Chapter {
+                title: chapter_title(&path).unwrap_or_else(|| format!("Chapter {}", index + 1)),
+                href,
+            })
         })
         .collect()
+}
+
+/// The path that leads from the directory `from` to `to`, both resolved inside
+/// the book's `root`: `/`-separated, with `..` where `to` is not below
+/// `from`, and not percent-encoded.
+pub fn relative_path(root: &Path, from: &Path, to: &Path) -> Option<String> {
+    Some(relative_parts(root, from, to)?.join("/"))
+}
+
+/// [`relative_path`] as an href, each part percent-encoded.
+fn relative_href(root: &Path, from: &Path, to: &Path) -> Option<String> {
+    let parts: Vec<String> = relative_parts(root, from, to)?
+        .iter()
+        .map(|part| encode(part))
+        .collect();
+    Some(parts.join("/"))
+}
+
+fn relative_parts(root: &Path, from: &Path, to: &Path) -> Option<Vec<String>> {
+    let from: Vec<Component> = from.strip_prefix(root).ok()?.components().collect();
+    let to: Vec<Component> = to.strip_prefix(root).ok()?.components().collect();
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+
+    let up = std::iter::repeat_n("..".to_string(), from.len() - shared);
+    let down = to[shared..]
+        .iter()
+        .map(|part| part.as_os_str().to_string_lossy().to_string());
+
+    Some(up.chain(down).collect())
 }
 
 fn chapter_title(path: &Path) -> Option<String> {
@@ -994,20 +1180,40 @@ fn add_ncx_to_opf(doc: &Document, ncx_href: &str) -> Result<()> {
         return Err(Error::InvalidEpub("OPF has no manifest".into()));
     };
 
+    // A book may already use "ncx" for something else.
+    let id = unused_id(&ids_in(doc)?, "ncx");
+
     let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add NCX to manifest: {e}")))?;
-    item.set_attribute("id", "ncx").ok();
+    item.set_attribute("id", &id).ok();
     item.set_attribute("href", ncx_href).ok();
     item.set_attribute("media-type", NCX_MEDIA_TYPE).ok();
 
     // EPUB 2 readers find the NCX through the spine's toc attribute.
     if let Some(mut spine) = xml::find_first(doc, &format!("//{}", xml::local("spine")))? {
-        spine.set_attribute("toc", "ncx").ok();
+        spine.set_attribute("toc", &id).ok();
     }
 
     Ok(())
+}
+
+/// Every `id` in the package document. One must be unique across all of it,
+/// not only among the manifest's items.
+fn ids_in(doc: &Document) -> Result<HashSet<String>> {
+    Ok(xml::find_nodes(doc, "//*[@id]")?
+        .iter()
+        .filter_map(|node| node.get_attribute("id"))
+        .collect())
+}
+
+/// `wanted`, or the first of `wanted-2`, `wanted-3`, … that is not in `ids`.
+fn unused_id(ids: &HashSet<String>, wanted: &str) -> String {
+    std::iter::once(wanted.to_string())
+        .chain((2..).map(|n| format!("{wanted}-{n}")))
+        .find(|candidate| !ids.contains(candidate))
+        .expect("an unused suffix always exists")
 }
 
 fn escape_xml_text(text: &str) -> String {

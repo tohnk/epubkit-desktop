@@ -271,7 +271,8 @@ fn info(path: &Path) -> Result<()> {
         metadata::format_filename(&meta.title, &meta.author)
     );
 
-    let files = structure::find_content_files(&opf_dir, &doc).context("reading the manifest")?;
+    let files = structure::find_content_files(work.path(), &opf_dir, &doc)
+        .context("reading the manifest")?;
     println!();
     println!(
         "content:  {} xhtml, {} css, {} images, {} fonts, {} other",
@@ -380,11 +381,13 @@ fn repair(path: &Path, output: Option<&Path>) -> Result<()> {
 
 fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> Result<()> {
     // The output name comes from the book's metadata, which is not known until
-    // the run finishes — so write to a temporary file and move it into place.
-    let staging = tempfile::Builder::new()
-        .suffix(".epub")
-        .tempfile()
-        .context("creating a staging file")?;
+    // the run finishes — so write beside where the book is going, and move it
+    // into place at the end.
+    let directory = output
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging = metadata::staging_file(directory).context("creating a staging file")?;
 
     let mut last_percent = u8::MAX;
     let report = process_epub(input, staging.path(), &options, |percent, message| {
@@ -396,17 +399,19 @@ fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> 
     .with_context(|| format!("optimizing {}", input.display()))?;
 
     let destination = match output {
-        Some(path) => path.to_path_buf(),
+        // Asked for by name, so whatever is there is replaced.
+        Some(path) => {
+            staging
+                .persist(path)
+                .map_err(|failed| failed.error)
+                .with_context(|| format!("writing {}", path.display()))?;
+            path.to_path_buf()
+        }
         // A name of the book's own choosing may already be taken — by the book
         // itself, when it keeps its original name.
-        None => metadata::unused_path(Path::new(&report.output_filename)),
+        None => metadata::publish(staging, Path::new(&report.output_filename))
+            .context("writing the book")?,
     };
-
-    // `persist` fails across filesystems, so fall back to a copy.
-    if let Err(error) = staging.persist(&destination) {
-        std::fs::copy(error.file.path(), &destination)
-            .with_context(|| format!("writing {}", destination.display()))?;
-    }
 
     println!();
     println!("{}", destination.display());
