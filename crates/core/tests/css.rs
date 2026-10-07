@@ -196,8 +196,79 @@ fn comments_and_imports_survive() {
 
     let (out, _) = remove_unused_css(css, &used);
 
+    assert!(out.contains("/* chapter styles */"), "{out}");
     assert!(out.contains("@import"), "{out}");
     assert!(out.contains(".lead"), "{out}");
+}
+
+/// What stays is left exactly as the book wrote it. Reprinted by a CSS
+/// library, media queries and colours came back in syntax older reading
+/// engines do not read, `(width <= 600px)` and `#0000`. Comments and the
+/// `@charset` went, and a minified sheet came back laid out at length.
+#[test]
+fn what_is_kept_is_kept_exactly_as_written() {
+    let used = used_from(r#"<p class="lead">x</p><p class="end">y</p>"#);
+    let before = "@charset \"UTF-8\";\n\
+                  /*! licence */\n\
+                  @import url(\"print.css\") screen and (max-width: 500px);\n\
+                  @media screen and (max-width: 600px) { .lead { color: transparent } }\n\
+                  .lead{color:rgba(0,0,0,0.6);font-family:\"Default Sans\";quotes:\"\\201C\" \"\\201D\"}\n";
+    let after = ".end{border-bottom:1px solid transparent}\n";
+    let css = format!("{before}.orphan {{ color: hsla(0,0%,50%,.5) }}\n{after}");
+
+    let (out, removed) = remove_unused_css(&css, &used);
+
+    assert_eq!(removed, 1);
+    assert_eq!(out, format!("{before}{after}"));
+}
+
+/// A font declared inside an `@media` block, or in a stylesheet with an old
+/// browser hack in it, is as much a font as any. Its file is deleted with the
+/// rest, so its rule has to go too.
+#[test]
+fn every_font_face_rule_goes_wherever_it_is() {
+    let css = ".a { *zoom: 1; color: red }\n\
+               @font-face { font-family: Top; src: url(top.ttf) }\n\
+               @media screen {\n  @font-face { font-family: Nested; src: url(nested.ttf) }\n  p { margin: 0 }\n}\n\
+               @supports (display: grid) { @media print { @font-face { font-family: Deep; src: url(deep.ttf) } } }\n";
+
+    let (out, removed) = remove_embedded_fonts(css);
+
+    assert_eq!(removed, 3, "{out}");
+    assert!(!out.contains("@font-face"), "{out}");
+    assert!(out.starts_with(".a { *zoom: 1; color: red }\n"), "{out}");
+    assert!(out.contains("p { margin: 0 }"), "{out}");
+}
+
+/// A stylesheet nested thousands deep, which no book needs but any book can
+/// contain, is read without running out of stack, even on a thread with as
+/// little as the desktop app's workers.
+#[test]
+fn deeply_nested_css_does_not_exhaust_the_stack() {
+    let depth = 20_000;
+    let css = format!(
+        "{}.inner {{ color: red }}{}\n.orphan {{ color: blue }}\n@font-face {{ font-family: F; src: url(f.ttf) }}\n",
+        "@media screen { ".repeat(depth),
+        " }".repeat(depth)
+    );
+
+    let ((unused, removed_rules), (fonts, removed_fonts)) = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            (
+                remove_unused_css(&css, &UsedSelectors::default()),
+                remove_embedded_fonts(&css),
+            )
+        })
+        .unwrap()
+        .join()
+        .expect("reading the stylesheet should not overflow the stack");
+
+    assert_eq!(removed_rules, 1);
+    assert!(!unused.contains("orphan"));
+    assert!(unused.contains(".inner"));
+    assert_eq!(removed_fonts, 1);
+    assert!(!fonts.contains("@font-face"));
 }
 
 // ------------------------------------------------------------- encodings

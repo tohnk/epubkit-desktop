@@ -127,7 +127,7 @@ Rust: a library, a command-line tool, and a desktop app.
 - **[Tauri](https://tauri.app/)** — the desktop window, drawn by the system's own webview
 - **[libxml2](https://gitlab.gnome.org/GNOME/libxml2)** — XML/XHTML parsing and repair, via the `libxml` crate
 - **[image](https://crates.io/crates/image)** — decoding and Lanczos resampling
-- **[lightningcss](https://lightningcss.dev/)** — CSS parsing and cleanup
+- **[cssparser](https://crates.io/crates/cssparser)** — CSS tokenizing, to clean stylesheets without rewriting what stays
 - **[zip](https://crates.io/crates/zip)** — EPUB container handling
 
 This began as a Python/FastAPI web app. The port is described in

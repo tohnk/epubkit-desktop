@@ -254,23 +254,31 @@ The table is upstream's current one (b1rdmania/epubkit#8), which adds UTF-8
 punctuation, "ß", the acute vowels and the capital umlauts to what `7cf9a65`
 had.
 
-### CSS goes through a real parser
+### CSS is edited in place, not reprinted
 
-`cssutils` is prone to dropping comments and reformatting at-rules. The port
-uses `lightningcss`, so comments, `@import` and `@media` blocks survive a
-round-trip. Rule *selection* is unchanged in outline: only top-level style
-rules are considered for removal, a rule survives if any part of any of its
-selectors is in use, and anything with a pseudo-class, pseudo-element or
+`cssutils` is prone to dropping comments and reformatting at-rules, and any
+library that parses a stylesheet and prints it back rewords it. An earlier
+version of the port did that with `lightningcss`, which printed for current
+browsers: `(max-width: 600px)` came back as `(width <= 600px)` and
+`transparent` as `#0000`, syntax older reading engines do not read, so the
+rules using it stopped applying. Comments and the `@charset` were dropped, and
+a minified sheet came back laid out at length.
+
+The port finds rules with `cssparser`'s tokenizer and cuts the ones that go
+out of the text where they stand. Everything else is left byte for byte as
+the book wrote it. Rule *selection* is unchanged in outline: only top-level
+style rules are considered for removal, a rule survives if any part of any of
+its selectors is in use, and anything with a pseudo-class, pseudo-element or
 attribute selector is kept outright.
 
-Two details differ. Names are read as CSS defines them, so one may begin with
-a non-ASCII character; the reference wanted ASCII there, and removed a rule
-like `.überschrift` while the book was using it. And a selector with an
+Three details differ. Names are read as CSS defines them, so one may begin
+with a non-ASCII character; the reference wanted ASCII there, and removed a
+rule like `.überschrift` while the book was using it. A selector with an
 escaped name, such as `.\31 st` for the class `1st`, is kept outright too,
-since reading escapes is beyond this scan.
-
-Note that `lightningcss` is pre-1.0 (currently an alpha), so its API may move
-under a future upgrade. It is confined to `core::css`.
+since reading escapes is beyond this scan, and so is anything else that is
+not plain names and combinators. And removing fonts reaches into `@media`
+and other grouping rules, where the reference left `@font-face` rules
+pointing at the files it deleted.
 
 ### Empty paragraphs are collapsed among siblings
 

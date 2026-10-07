@@ -1,25 +1,44 @@
 //! Stylesheet cleanup: dropping rules nothing in the book matches, and
 //! removing embedded fonts. The CSS half of `html_cleaner.py`.
 //!
-//! The reference used `cssutils`; this uses `lightningcss`, a real CSS parser,
-//! so `@media` blocks, nested rules and comments survive a round-trip that
-//! `cssutils` would flatten or lose.
+//! Rules are found with `cssparser`, the tokenizer of Firefox's and Servo's
+//! style engines, and cut out of the text where they stand. Nothing else is
+//! touched: what the reading engine gets is the book's own CSS, comments,
+//! hacks and spelling included, less the rules that went. Reprinting a parsed
+//! stylesheet rewords it — `cssutils`, which the reference used, into what it
+//! understood, a modern CSS library into syntax older engines do not read.
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 
+use cssparser::{ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
-use lightningcss::printer::PrinterOptions;
-use lightningcss::rules::CssRule;
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ToCss;
 
 use crate::html;
 use crate::{xml, Error, Result};
 
 /// Selectors that must never be dropped, whatever the content looks like.
 const ALWAYS_KEEP: &[&str] = &["*", "html", "body"];
+
+/// At-rules whose blocks hold rules rather than declarations, and which can
+/// hold an `@font-face`.
+const GROUPING_RULES: &[&str] = &[
+    "media",
+    "supports",
+    "document",
+    "-moz-document",
+    "layer",
+    "container",
+    "scope",
+    "starting-style",
+];
+
+/// How deep into grouping rules to look for fonts. Real books nest a level or
+/// two. One nested deeper is left as it is there, rather than followed down a
+/// stack that has to end somewhere.
+const MAX_NESTING: usize = 16;
 
 /// What a stylesheet opens with to declare its encoding. CSS allows exactly
 /// this form, and only at the very start.
@@ -141,57 +160,178 @@ pub fn collect_used_selectors(xhtml_bytes: &[u8]) -> Result<UsedSelectors> {
 /// its selectors is in use, and anything with a pseudo-class, pseudo-element or
 /// attribute selector is kept outright. Over-keeping costs a few bytes;
 /// over-removing silently changes how the book looks.
+///
+/// Only top-level rules are considered. Anything inside an `@media` block is
+/// left alone rather than filtered against markup that may not represent the
+/// conditions the block applies to.
 pub fn remove_unused_css(css_text: &str, used: &UsedSelectors) -> (String, usize) {
-    let Ok(mut stylesheet) = StyleSheet::parse(css_text, ParserOptions::default()) else {
-        // Unparseable CSS is left exactly as found rather than mangled.
-        return (css_text.to_string(), 0);
-    };
-
-    let mut removed = 0;
-    stylesheet.rules.0.retain(|rule| match rule {
-        CssRule::Style(style) => {
-            let keep = match style.selectors.to_css_string(PrinterOptions::default()) {
-                Ok(selector_text) => selector_matches_used(&selector_text, used),
-                // If a selector will not serialize, keep the rule.
-                Err(_) => true,
-            };
-            if !keep {
-                removed += 1;
+    let unused: Vec<Range<usize>> = rules(css_text, 0)
+        .into_iter()
+        .filter_map(|rule| match rule.kind {
+            RuleKind::Style { selectors } => {
+                (!selector_matches_used(&css_text[selectors], used)).then_some(rule.span)
             }
-            keep
-        }
-        _ => true,
-    });
+            RuleKind::At { .. } => None,
+        })
+        .collect();
 
-    match stylesheet.to_css(PrinterOptions::default()) {
-        Ok(result) => (result.code, removed),
-        Err(_) => (css_text.to_string(), 0),
+    let removed = unused.len();
+    (cut(css_text, &unused), removed)
+}
+
+/// Remove `@font-face` rules, those inside `@media` and other grouping rules
+/// included. Returns the cleaned stylesheet and how many went.
+pub fn remove_embedded_fonts(css_text: &str) -> (String, usize) {
+    let mut fonts = Vec::new();
+    font_faces(rules(css_text, MAX_NESTING), &mut fonts);
+    fonts.sort_by_key(|span| span.start);
+
+    let removed = fonts.len();
+    (cut(css_text, &fonts), removed)
+}
+
+/// Where the `@font-face` rules among `rules`, and inside them, are.
+fn font_faces(rules: Vec<Rule>, found: &mut Vec<Range<usize>>) {
+    for rule in rules {
+        if let RuleKind::At { name, children } = rule.kind {
+            if name == "font-face" {
+                found.push(rule.span);
+            } else {
+                font_faces(children, found);
+            }
+        }
     }
 }
 
-/// Remove `@font-face` rules. Returns the cleaned stylesheet and how many went.
-pub fn remove_embedded_fonts(css_text: &str) -> (String, usize) {
-    let Ok(mut stylesheet) = StyleSheet::parse(css_text, ParserOptions::default()) else {
-        return (css_text.to_string(), 0);
-    };
-
-    let mut removed = 0;
-    stylesheet.rules.0.retain(|rule| {
-        let is_font_face = matches!(rule, CssRule::FontFace(_));
-        if is_font_face {
-            removed += 1;
-        }
-        !is_font_face
-    });
-
-    if removed == 0 {
-        return (css_text.to_string(), 0);
+/// `css` without the bytes in `spans`, which are in order and do not overlap.
+/// Each goes with the blanks after it, up to and including one line break, so
+/// a rule on a line of its own does not leave an empty line behind.
+fn cut(css: &str, spans: &[Range<usize>]) -> String {
+    if spans.is_empty() {
+        return css.to_string();
     }
 
-    match stylesheet.to_css(PrinterOptions::default()) {
-        Ok(result) => (result.code, removed),
-        Err(_) => (css_text.to_string(), 0),
+    let mut out = String::with_capacity(css.len());
+    let mut kept_from = 0;
+    for span in spans {
+        out.push_str(&css[kept_from..span.start]);
+
+        let rest = &css[span.end..];
+        let blanks = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let line_break = match &rest[blanks..] {
+            line if line.starts_with("\r\n") => 2,
+            line if line.starts_with('\n') => 1,
+            _ => 0,
+        };
+        kept_from = span.end + blanks + line_break;
     }
+    out.push_str(&css[kept_from..]);
+    out
+}
+
+/// One rule of a stylesheet, where it stands in the text.
+struct Rule {
+    /// From its first token through its closing `}` or `;`, in bytes.
+    span: Range<usize>,
+    kind: RuleKind,
+}
+
+enum RuleKind {
+    /// A style rule, and where its selectors are written.
+    Style { selectors: Range<usize> },
+    /// An at-rule, its name lowercased, and the rules inside it, if it is a
+    /// grouping rule read into.
+    At { name: String, children: Vec<Rule> },
+}
+
+/// The rules of `css`, reading into grouping rules `depth` levels deep.
+///
+/// CSS's own error recovery applies: something a browser would drop is a rule
+/// like any other, which the selector test then keeps, so nothing is lost that
+/// was not understood. Blocks not read into are skipped without recursion,
+/// however deep they go.
+fn rules(css: &str, depth: usize) -> Vec<Rule> {
+    let mut input = ParserInput::new(css);
+    let mut parser = Parser::new(&mut input);
+    rules_in(&mut parser, depth)
+}
+
+fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
+    let mut rules = Vec::new();
+
+    loop {
+        parser.skip_whitespace();
+        let start = parser.position().byte_index();
+        let Ok(first) = parser.next().cloned() else {
+            break;
+        };
+
+        let kind = match first {
+            // HTML comment markers mean nothing to CSS between rules.
+            Token::CDO | Token::CDC => continue,
+            Token::AtKeyword(name) => {
+                let name = name.to_ascii_lowercase();
+                let mut children = Vec::new();
+                loop {
+                    match parser.next() {
+                        Ok(Token::CurlyBracketBlock) => {
+                            if depth > 0 && GROUPING_RULES.contains(&name.as_str()) {
+                                children = read_block(parser, |inner| rules_in(inner, depth - 1));
+                            } else {
+                                skip_block(parser);
+                            }
+                            break;
+                        }
+                        Ok(Token::Semicolon) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                RuleKind::At { name, children }
+            }
+            first => {
+                // A style rule's selectors run up to its block. Skipping the
+                // blanks before each token also gets past the inside of a
+                // bracket the last one opened, so the selectors end after it.
+                let mut selectors_end = start;
+                let mut token = first;
+                loop {
+                    if matches!(token, Token::CurlyBracketBlock) {
+                        skip_block(parser);
+                        break;
+                    }
+                    parser.skip_whitespace();
+                    selectors_end = parser.position().byte_index();
+                    match parser.next() {
+                        Ok(next) => token = next.clone(),
+                        Err(_) => break,
+                    }
+                }
+                RuleKind::Style {
+                    selectors: start..selectors_end,
+                }
+            }
+        };
+
+        rules.push(Rule {
+            span: start..parser.position().byte_index(),
+            kind,
+        });
+    }
+
+    rules
+}
+
+/// Read the block `parser` has just opened with `read`, leaving the parser
+/// after its end.
+fn read_block<T: Default>(parser: &mut Parser<'_, '_>, read: impl FnOnce(&mut Parser) -> T) -> T {
+    parser
+        .parse_nested_block(|inner| Ok::<_, ParseError<()>>(read(inner)))
+        .unwrap_or_default()
+}
+
+/// Skip the block `parser` has just opened.
+fn skip_block(parser: &mut Parser<'_, '_>) {
+    read_block(parser, |_| ());
 }
 
 // ---------------------------------------------------------------- internals
@@ -214,8 +354,10 @@ fn single_selector_matches(selector: &str, used: &UsedSelectors) -> bool {
 
     // State-dependent and attribute selectors are beyond what a static scan of
     // the markup can decide, so they stay. So does an escaped name, which this
-    // scan would misread: `.\31 st` is the class `1st`.
-    if selector.contains(':') || selector.contains('[') || selector.contains('\\') {
+    // scan would misread: `.\31 st` is the class `1st`. So does anything else
+    // that is not a plain run of names and combinators, a comment, a
+    // namespace or something that is not a selector at all.
+    if !selector.chars().all(is_plain_selector_char) {
         return true;
     }
 
@@ -284,6 +426,14 @@ fn selector_names(selector: &str) -> Vec<(NameKind, &str)> {
     }
 
     names
+}
+
+/// What a selector made only of names, `*` and combinators is written with.
+fn is_plain_selector_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || !c.is_ascii()
+        || matches!(c, '-' | '_' | '.' | '#' | '*' | '>' | '+' | '~')
+        || c.is_ascii_whitespace()
 }
 
 /// Every byte of a multi-byte UTF-8 character is non-ASCII, so testing bytes
