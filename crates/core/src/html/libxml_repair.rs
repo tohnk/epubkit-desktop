@@ -87,6 +87,113 @@ const MAX_ENTITY_GROWTH: usize = 1 << 20;
 
 const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
+/// SVG's element names that are not all lowercase, from the HTML standard's
+/// table for putting back what its parser lowercased.
+const SVG_ELEMENTS: &[&str] = &[
+    "altGlyph",
+    "altGlyphDef",
+    "altGlyphItem",
+    "animateColor",
+    "animateMotion",
+    "animateTransform",
+    "clipPath",
+    "feBlend",
+    "feColorMatrix",
+    "feComponentTransfer",
+    "feComposite",
+    "feConvolveMatrix",
+    "feDiffuseLighting",
+    "feDisplacementMap",
+    "feDistantLight",
+    "feDropShadow",
+    "feFlood",
+    "feFuncA",
+    "feFuncB",
+    "feFuncG",
+    "feFuncR",
+    "feGaussianBlur",
+    "feImage",
+    "feMerge",
+    "feMergeNode",
+    "feMorphology",
+    "feOffset",
+    "fePointLight",
+    "feSpecularLighting",
+    "feSpotLight",
+    "feTile",
+    "feTurbulence",
+    "foreignObject",
+    "glyphRef",
+    "linearGradient",
+    "radialGradient",
+    "textPath",
+];
+
+/// SVG's attribute names that are not all lowercase, likewise.
+const SVG_ATTRIBUTES: &[&str] = &[
+    "attributeName",
+    "attributeType",
+    "baseFrequency",
+    "baseProfile",
+    "calcMode",
+    "clipPathUnits",
+    "diffuseConstant",
+    "edgeMode",
+    "filterUnits",
+    "glyphRef",
+    "gradientTransform",
+    "gradientUnits",
+    "kernelMatrix",
+    "kernelUnitLength",
+    "keyPoints",
+    "keySplines",
+    "keyTimes",
+    "lengthAdjust",
+    "limitingConeAngle",
+    "markerHeight",
+    "markerUnits",
+    "markerWidth",
+    "maskContentUnits",
+    "maskUnits",
+    "numOctaves",
+    "pathLength",
+    "patternContentUnits",
+    "patternTransform",
+    "patternUnits",
+    "pointsAtX",
+    "pointsAtY",
+    "pointsAtZ",
+    "preserveAlpha",
+    "preserveAspectRatio",
+    "primitiveUnits",
+    "refX",
+    "refY",
+    "repeatCount",
+    "repeatDur",
+    "requiredExtensions",
+    "requiredFeatures",
+    "specularConstant",
+    "specularExponent",
+    "spreadMethod",
+    "startOffset",
+    "stdDeviation",
+    "stitchTiles",
+    "surfaceScale",
+    "systemLanguage",
+    "tableValues",
+    "targetX",
+    "targetY",
+    "textLength",
+    "viewBox",
+    "viewTarget",
+    "xChannelSelector",
+    "yChannelSelector",
+    "zoomAndPan",
+];
+
+/// MathML's, likewise.
+const MATHML_ATTRIBUTES: &[&str] = &["definitionURL"];
+
 /// How UTF-16 XML without a byte order mark begins: `<?` in two-byte units.
 const UTF16LE_START: &[u8] = b"<\0?\0";
 const UTF16BE_START: &[u8] = b"\0<\0?";
@@ -144,6 +251,42 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
             child.unlink();
         }
     }
+}
+
+/// Put back the capitals the HTML parser took out of SVG and MathML names.
+///
+/// HTML is case-insensitive, and its parser lowercases every name. SVG's and
+/// MathML's are not: `viewbox` and `<lineargradient>` mean nothing to an SVG
+/// renderer, so a recovered illustration lost its scaling and gradients.
+fn restore_case(doc: &Document) -> Result<()> {
+    let inside = |root: &str| format!("//*[local-name()='{root}']/descendant-or-self::*");
+
+    for (root, elements, attributes) in [
+        ("svg", SVG_ELEMENTS, SVG_ATTRIBUTES),
+        ("math", &[][..], MATHML_ATTRIBUTES),
+    ] {
+        for mut element in xml::find_nodes(doc, &inside(root))? {
+            let name = element.get_name();
+            if let Some(proper) = elements
+                .iter()
+                .find(|proper| proper.to_ascii_lowercase() == name)
+            {
+                element.set_name(proper).ok();
+            }
+            for (name, value) in element.get_attributes() {
+                let Some(proper) = attributes
+                    .iter()
+                    .find(|proper| proper.to_ascii_lowercase() == name)
+                else {
+                    continue;
+                };
+                element.remove_attribute(&name).ok();
+                element.set_attribute(proper, &value).ok();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Make what the HTML parser recovered legal XML.
@@ -579,6 +722,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
 
     strip_html_parser_artifacts(&mut doc);
     restore_namespace(&doc);
+    restore_case(&doc)?;
     make_legal_xml(&doc)?;
 
     let content = ContentDocument {

@@ -411,3 +411,31 @@ h1 { margin: 0 }
     assert!(style.trim_start().starts_with("p.first"), "{style:?}");
     assert!(style.contains("h1 { margin: 0 }"), "{style:?}");
 }
+
+/// HTML is case-insensitive and its parser lowercases every name, but SVG's
+/// are camelCase. `viewbox` and `<lineargradient>` mean nothing to an SVG
+/// renderer, so a recovered illustration lost its scaling and gradients.
+#[test]
+fn svg_and_mathml_names_keep_their_case_through_recovery() {
+    let (out, recovered) = repair(
+        br#"<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&nbsp;</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50" preserveAspectRatio="xMidYMid meet"><defs><linearGradient id="g" gradientUnits="userSpaceOnUse"><stop offset="0"/></linearGradient><clipPath id="c"><rect width="1" height="1"/></clipPath></defs><foreignObject width="1" height="1"/><text textLength="10">x</text></svg>
+<math xmlns="http://www.w3.org/1998/Math/MathML"><csymbol definitionURL="http://example.org/f">f</csymbol></math>
+</body></html>"#,
+    );
+    assert!(recovered);
+
+    for name in [
+        "viewBox=",
+        "preserveAspectRatio=",
+        "<linearGradient ",
+        "gradientUnits=",
+        "<clipPath ",
+        "<foreignObject ",
+        "textLength=",
+        "definitionURL=",
+    ] {
+        assert!(out.contains(name), "{name} lost its case:\n{out}");
+    }
+    assert_well_formed(&out);
+}
