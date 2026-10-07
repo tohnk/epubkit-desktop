@@ -331,12 +331,14 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
         structure::update_opf(&opf, &rename_map)?;
+        // Indexed once, not for each document.
+        let renames = structure::Renames::new(&opf_dir, &rename_map);
         for &path in &chapters {
-            structure::update_xhtml_references(&opf_dir, path, &rename_map)?;
+            structure::update_xhtml_references(path, &renames)?;
         }
         for path in &content.css {
             if path.is_file() {
-                structure::update_css_references(&opf_dir, path, &rename_map)?;
+                structure::update_css_references(path, &renames)?;
             }
         }
     }
@@ -346,8 +348,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !converted.reshaped.is_empty() {
         progress(72, "Showing reshaped pages...");
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
+        let reshaped = structure::ReshapedPages::new(&opf_dir, &converted.reshaped);
         for &path in &chapters {
-            structure::show_reshaped_pages(&opf_dir, path, &converted.reshaped)?;
+            structure::show_reshaped_pages(path, &reshaped)?;
         }
     }
 

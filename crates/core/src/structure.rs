@@ -243,6 +243,7 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
         doc,
         &format!("//{}/{}", xml::local("manifest"), xml::local("item")),
     )?;
+    let by_name = renames_by_filename(rename_map);
 
     let mut updated = 0;
     for mut node in nodes {
@@ -252,7 +253,7 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
         let Some(new_path) = rename_map
             .get(&decoded)
             .or_else(|| rename_map.get(&href))
-            .or_else(|| rename_by_filename(&decoded, rename_map))
+            .or_else(|| by_name.get(&file_name_of(&decoded)).copied().flatten())
         else {
             continue;
         };
@@ -324,19 +325,13 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 ///
 /// A reference is resolved against the file's own directory and matched by
 /// path, so two images that share a filename in different directories can be
-/// renamed differently. `opf_dir` is what the rename map's paths are relative
-/// to.
-pub fn update_xhtml_references(
-    opf_dir: &Path,
-    path: &Path,
-    rename_map: &BTreeMap<String, String>,
-) -> Result<usize> {
-    if rename_map.is_empty() {
+/// renamed differently.
+pub fn update_xhtml_references(path: &Path, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
-    let renames = Renames::new(opf_dir, rename_map);
-    let base = path.parent().unwrap_or(opf_dir);
+    let base = path.parent().unwrap_or(renames.opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
@@ -346,7 +341,7 @@ pub fn update_xhtml_references(
         match local_name(&node).as_str() {
             "img" => {
                 let src = node.get_attribute("src").unwrap_or_default();
-                if let Some(new_src) = rewrite_reference(&src, base, &renames) {
+                if let Some(new_src) = rewrite_reference(&src, base, renames) {
                     node.set_attribute("src", &new_src).ok();
                     updated += 1;
                 }
@@ -359,7 +354,7 @@ pub fn update_xhtml_references(
                     .clone()
                     .unwrap_or_else(|| node.get_attribute("href").unwrap_or_default());
 
-                if let Some(new_value) = rewrite_reference(&value, base, &renames) {
+                if let Some(new_value) = rewrite_reference(&value, base, renames) {
                     let namespace = xlink
                         .is_some()
                         .then(|| xlink_namespace(&content.doc, &node));
@@ -379,7 +374,7 @@ pub fn update_xhtml_references(
 
         let style = node.get_attribute("style").unwrap_or_default();
         if style.contains("url(") {
-            let new_style = rewrite_css_urls(&style, base, &renames);
+            let new_style = rewrite_css_urls(&style, base, renames);
             if new_style != style {
                 node.set_attribute("style", &new_style).ok();
                 updated += 1;
@@ -396,20 +391,15 @@ pub fn update_xhtml_references(
 
 /// Rewrite `url()` references in a stylesheet, resolved against its own
 /// directory. Returns 1 if the file changed.
-pub fn update_css_references(
-    opf_dir: &Path,
-    path: &Path,
-    rename_map: &BTreeMap<String, String>,
-) -> Result<usize> {
-    if rename_map.is_empty() {
+pub fn update_css_references(path: &Path, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
-    let renames = Renames::new(opf_dir, rename_map);
-    let base = path.parent().unwrap_or(opf_dir);
+    let base = path.parent().unwrap_or(renames.opf_dir);
 
     let css = crate::css::read_stylesheet(path)?;
-    let rewritten = rewrite_css_urls(&css, base, &renames);
+    let rewritten = rewrite_css_urls(&css, base, renames);
 
     if rewritten == css {
         return Ok(0);
@@ -449,8 +439,7 @@ pub fn declare_reshaped_pages(
 }
 
 /// Show every page of each image Light Novel mode reshaped in one XHTML file.
-/// `reshaped` is as for [`declare_reshaped_pages`]; references should already
-/// point at the first page.
+/// References should already point at the first page.
 ///
 /// An `<img>` of a reshaped image loses its `width` and `height`, which give
 /// the old shape, and is followed by a copy for each further page. An SVG
@@ -458,23 +447,13 @@ pub fn declare_reshaped_pages(
 /// plain `<img>` per page. An SVG that draws more than the image is an
 /// illustration, and stays as it is, followed by the image's further pages.
 /// Returns how many images changed, writing the file only if any did.
-pub fn show_reshaped_pages(
-    opf_dir: &Path,
-    path: &Path,
-    reshaped: &BTreeMap<String, Vec<String>>,
-) -> Result<usize> {
+pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usize> {
     if reshaped.is_empty() {
         return Ok(0);
     }
 
-    let pages_by_target: HashMap<PathBuf, Vec<String>> = reshaped
-        .iter()
-        .map(|(first, pages)| {
-            let names = pages.iter().map(|page| file_name_of(page)).collect();
-            (normalize_path(&opf_dir.join(first)), names)
-        })
-        .collect();
-    let base = path.parent().unwrap_or(opf_dir);
+    let pages_by_target = &reshaped.by_target;
+    let base = path.parent().unwrap_or(reshaped.opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
@@ -806,47 +785,59 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normal
 }
 
-/// Find a rename by filename alone, for a path that leads nowhere — one
-/// written relative to the wrong directory, say. Only an unambiguous answer
-/// counts: images sharing a filename in different directories can be renamed
-/// differently, and then the filename cannot say which was meant.
-fn rename_by_filename<'a>(
-    path: &str,
-    rename_map: &'a BTreeMap<String, String>,
-) -> Option<&'a String> {
-    let name = file_name_of(path);
-    if name.is_empty() {
-        return None;
+/// Each renamed file's new path by its old filename alone, for a path that
+/// leads nowhere — one written relative to the wrong directory, say. Only an
+/// unambiguous answer counts: images sharing a filename in different
+/// directories can be renamed differently, and then the filename cannot say
+/// which was meant, so it maps to `None`.
+fn renames_by_filename(rename_map: &BTreeMap<String, String>) -> HashMap<String, Option<&String>> {
+    let mut by_name: HashMap<String, Option<&String>> = HashMap::new();
+
+    for (old, new) in rename_map {
+        let name = file_name_of(old);
+        if name.is_empty() {
+            continue;
+        }
+        by_name
+            .entry(name)
+            .and_modify(|first| {
+                if first.is_some_and(|first| file_name_of(first) != file_name_of(new)) {
+                    *first = None;
+                }
+            })
+            .or_insert(Some(new));
     }
 
-    let mut candidates = rename_map
-        .iter()
-        .filter(|(old, _)| file_name_of(old) == name)
-        .map(|(_, new)| new);
-    let first = candidates.next()?;
-    let new_name = file_name_of(first);
-
-    candidates
-        .all(|other| file_name_of(other) == new_name)
-        .then_some(first)
+    by_name
 }
 
-/// The rename map, indexed by the file each entry was renamed from.
-struct Renames<'a> {
-    rename_map: &'a BTreeMap<String, String>,
+/// The images the image step renamed, from [`build_rename_map`], indexed once
+/// for every document whose references to them are rewritten.
+pub struct Renames<'a> {
+    /// What the rename map's paths are relative to.
+    opf_dir: &'a Path,
+    /// Each renamed file's new path, by the file it was.
     by_source: HashMap<PathBuf, &'a String>,
+    by_name: HashMap<String, Option<&'a String>>,
 }
 
 impl<'a> Renames<'a> {
-    fn new(opf_dir: &Path, rename_map: &'a BTreeMap<String, String>) -> Self {
+    /// `rename_map`'s paths are relative to `opf_dir`.
+    pub fn new(opf_dir: &'a Path, rename_map: &'a BTreeMap<String, String>) -> Self {
         let by_source = rename_map
             .iter()
             .map(|(old, new)| (normalize_path(&opf_dir.join(old)), new))
             .collect();
+
         Self {
-            rename_map,
+            opf_dir,
             by_source,
+            by_name: renames_by_filename(rename_map),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_source.is_empty()
     }
 
     /// The new filename of the file `path` leads to from `base`, if that file
@@ -863,7 +854,40 @@ impl<'a> Renames<'a> {
             return None;
         }
 
-        rename_by_filename(path, self.rename_map).map(|new| file_name_of(new))
+        self.by_name
+            .get(&file_name_of(path))
+            .copied()
+            .flatten()
+            .map(|new| file_name_of(new))
+    }
+}
+
+/// The pages of each image Light Novel mode reshaped, indexed once for every
+/// document that shows them.
+pub struct ReshapedPages<'a> {
+    /// What the pages' paths are relative to.
+    opf_dir: &'a Path,
+    /// The filename of each page, by the file of the first.
+    by_target: HashMap<PathBuf, Vec<String>>,
+}
+
+impl<'a> ReshapedPages<'a> {
+    /// `reshaped` is as for [`declare_reshaped_pages`], its paths relative to
+    /// `opf_dir`.
+    pub fn new(opf_dir: &'a Path, reshaped: &BTreeMap<String, Vec<String>>) -> Self {
+        let by_target = reshaped
+            .iter()
+            .map(|(first, pages)| {
+                let names = pages.iter().map(|page| file_name_of(page)).collect();
+                (normalize_path(&opf_dir.join(first)), names)
+            })
+            .collect();
+
+        Self { opf_dir, by_target }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_target.is_empty()
     }
 }
 
