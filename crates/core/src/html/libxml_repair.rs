@@ -66,11 +66,17 @@ static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
 });
 
-/// A general entity a DOCTYPE's internal subset declares with a plain value:
-/// not a parameter entity, and not one fetched from elsewhere.
-static ENTITY_DECLARED: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>"#).unwrap()
-});
+/// An entity's name, where a text starts.
+static ENTITY_NAME: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^[A-Za-z_:][\w.:-]*").unwrap());
+
+/// A reference to a parameter entity, where a text starts.
+static PARAMETER_REFERENCE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^%([A-Za-z_:][\w.:-]*);").unwrap());
+
+/// A character reference, as XML writes one.
+static NUMERIC_REFERENCE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"&#(?:x([0-9A-Fa-f]+)|([0-9]+));").unwrap());
 
 /// What a chapter's source has besides its text, for [`kept_the_text`].
 static COMMENTS: LazyLock<regex::Regex> =
@@ -604,39 +610,168 @@ fn well_formed_doctype_length(text: &str) -> Option<usize> {
     }
 }
 
-/// Where the comments and processing instructions of a DOCTYPE are, which
-/// declare nothing. Those in a quoted value are the value's text.
-fn doctype_asides(doctype: &str) -> Vec<std::ops::Range<usize>> {
+/// Where the internal subset of `doctype` starts, if it has one: past the
+/// `[` after its name and identifiers, a `[` in a quoted identifier aside.
+fn internal_subset(doctype: &str) -> Option<&str> {
     let bytes = doctype.as_bytes();
-    let after = |from: usize, needle: &[u8]| {
-        bytes[from..]
-            .windows(needle.len())
-            .position(|window| window == needle)
-            .map_or(bytes.len(), |at| from + at + needle.len())
-    };
-
-    let mut asides = Vec::new();
     let mut at = 2;
     while at < bytes.len() {
-        let rest = &bytes[at..];
-        if rest.starts_with(b"<!--") {
-            let end = after(at + 4, b"-->");
-            asides.push(at..end);
-            at = end;
-        } else if rest.starts_with(b"<?") {
-            let end = after(at + 2, b"?>");
-            asides.push(at..end);
-            at = end;
-        } else if let quote @ (b'"' | b'\'') = rest[0] {
-            at += 1 + rest[1..]
-                .iter()
-                .position(|&byte| byte == quote)
-                .map_or(rest.len() - 1, |length| length + 1);
-        } else {
-            at += 1;
+        match bytes[at] {
+            b'[' => return Some(&doctype[at + 1..]),
+            b'>' => return None,
+            quote @ (b'"' | b'\'') => {
+                at += bytes[at + 1..].iter().position(|&byte| byte == quote)? + 2;
+            }
+            _ => at += 1,
         }
     }
-    asides
+    None
+}
+
+/// What an internal subset declares: the entities it names, general and
+/// parameter, each with its value, or with none if that is in a file, which
+/// is never read.
+#[derive(Default)]
+struct Declarations {
+    general: HashMap<String, Option<String>>,
+    parameters: HashMap<String, Option<String>>,
+    /// What reading parameter entities has cost, as [`MAX_ENTITY_COST`]
+    /// counts it.
+    spent: usize,
+}
+
+/// The general entities the internal subset `subset` starts with declares,
+/// read as XML reads a subset: declaration by declaration, so that what a
+/// comment, a processing instruction or a quoted value holds declares
+/// nothing, though it be written as a declaration; with a parameter entity's
+/// value read where the entity is used, as declarations of its own; and, of
+/// two declarations for one name, the first. One that is never read does not
+/// stop the rest, as libxml2 reads them.
+fn declared_entities(subset: &str) -> HashMap<String, Option<String>> {
+    let mut declarations = Declarations::default();
+    read_declarations(subset, 0, &mut declarations);
+    declarations.general
+}
+
+/// Read the declarations in `text` into `declarations`: to the `]` that ends
+/// the subset, at `depth` 0, or to the end of a parameter entity's value.
+fn read_declarations(text: &str, depth: usize, declarations: &mut Declarations) {
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            at += comment.find("-->").map_or(rest.len(), |end| 4 + end + 3);
+        } else if let Some(instruction) = rest.strip_prefix("<?") {
+            at += instruction.find("?>").map_or(rest.len(), |end| 2 + end + 2);
+        } else if rest.starts_with("<!") {
+            let length = markup_declaration_length(rest);
+            declare(&rest[..length], declarations);
+            at += length;
+        } else if let Some(reference) = PARAMETER_REFERENCE.captures(rest) {
+            at += reference[0].len();
+            let value = declarations
+                .parameters
+                .get(&reference[1])
+                .cloned()
+                .flatten();
+            if let Some(value) = value {
+                let cost = value.len() + 1;
+                if depth < MAX_ENTITY_DEPTH && declarations.spent + cost <= MAX_ENTITY_COST {
+                    declarations.spent += cost;
+                    read_declarations(&value, depth + 1, declarations);
+                }
+            }
+        } else if depth == 0 && rest.starts_with(']') {
+            return;
+        } else {
+            // Anything else is passed over, to where something could start.
+            let first = rest.chars().next().map_or(1, char::len_utf8);
+            at += first
+                + rest[first..]
+                    .find(['<', '%', ']'])
+                    .unwrap_or(rest.len() - first);
+        }
+    }
+}
+
+/// How long the markup declaration `text` starts with is: to its `>`, one in
+/// a quoted value aside, or to the end if it never ends.
+fn markup_declaration_length(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = 2;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'>' => return at + 1,
+            quote @ (b'"' | b'\'') => {
+                match bytes[at + 1..].iter().position(|&byte| byte == quote) {
+                    Some(length) => at += length + 2,
+                    None => return bytes.len(),
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Note the entity the markup declaration `declaration` declares, if it is an
+/// entity's and its name is not declared already. Its value's character
+/// references are replaced as it is read, as XML replaces them, so that
+/// `&#38;word;` stands for a reference to `word`; the entities it refers to
+/// are left for when it is filled in.
+fn declare(declaration: &str, declarations: &mut Declarations) {
+    /// What follows the white space `text` starts with, if it does.
+    fn after_space(text: &str) -> Option<&str> {
+        const SPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+        text.starts_with(SPACE)
+            .then(|| text.trim_start_matches(SPACE))
+    }
+
+    let Some(rest) = declaration.strip_prefix("<!ENTITY").and_then(after_space) else {
+        return;
+    };
+    let (parameter, rest) = match rest.strip_prefix('%').and_then(after_space) {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let Some(name) = ENTITY_NAME.find(rest) else {
+        return;
+    };
+    let Some(rest) = after_space(&rest[name.end()..]) else {
+        return;
+    };
+    // A value in quotes, or else the identifier of the file that holds it.
+    let value = match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => match rest[1..].find(quote) {
+            Some(end) => Some(without_character_references(&rest[1..1 + end])),
+            None => return,
+        },
+        _ => None,
+    };
+
+    let entities = if parameter {
+        &mut declarations.parameters
+    } else {
+        &mut declarations.general
+    };
+    entities.entry(name.as_str().to_string()).or_insert(value);
+}
+
+/// `value` with each character reference in it replaced by the character it
+/// stands for. One for a character XML forbids is left as written.
+fn without_character_references(value: &str) -> String {
+    NUMERIC_REFERENCE
+        .replace_all(value, |reference: &regex::Captures| {
+            let code = match (reference.get(1), reference.get(2)) {
+                (Some(hex), _) => u32::from_str_radix(hex.as_str(), 16).ok(),
+                (_, Some(decimal)) => decimal.as_str().parse().ok(),
+                _ => None,
+            };
+            code.and_then(char::from_u32)
+                .filter(|&c| !is_forbidden_in_xml(c))
+                .map_or_else(|| reference[0].to_string(), String::from)
+        })
+        .into_owned()
 }
 
 /// `text` without its DOCTYPE, if that has an internal subset, and with the
@@ -645,8 +780,9 @@ fn doctype_asides(doctype: &str) -> Vec<std::ops::Range<usize>> {
 ///
 /// libxml2's HTML parser cannot read an internal subset. It stops the DOCTYPE
 /// at the subset's first `>`, and the rest of the declarations become text.
-/// Only plain values are filled in, and only so far, so a subset cannot blow a
-/// chapter up. The strict XML parse needs none of this: it reads subsets.
+/// The subset is read as XML reads it ([`declared_entities`]), and only values
+/// it gives are filled in, only so far, so that a subset cannot blow a chapter
+/// up. The strict XML parse needs none of this: it reads subsets.
 fn without_internal_subset(text: &str) -> Cow<'_, str> {
     let root = root_start(text);
     let Some(start) = text[..root].find("<!DOCTYPE") else {
@@ -655,38 +791,22 @@ fn without_internal_subset(text: &str) -> Cow<'_, str> {
     let Some(length) = doctype_length(&text[start..]) else {
         return Cow::Borrowed(text);
     };
-    let doctype = &text[start..start + length];
-    if !doctype.contains('[') {
+    let Some(subset) = internal_subset(&text[start..start + length]) else {
         return Cow::Borrowed(text);
-    }
+    };
 
-    // As XML reads a subset: a declaration in a comment or processing
-    // instruction declares nothing, and of two for one name the first counts.
-    let asides = doctype_asides(doctype);
-    let mut entities: HashMap<&str, &str> = HashMap::new();
-    for declared in ENTITY_DECLARED.captures_iter(doctype) {
-        // The asides are in order, so the one a declaration could be in is
-        // found by a search.
-        let at = declared.get(0).expect("always matched").start();
-        let aside = asides.partition_point(|aside| aside.end <= at);
-        if asides.get(aside).is_some_and(|aside| aside.contains(&at)) {
-            continue;
-        }
-        if let (Some(name), Some(value)) = (declared.get(1), declared.get(2).or(declared.get(3))) {
-            entities.entry(name.as_str()).or_insert(value.as_str());
-        }
-    }
-
+    let entities = declared_entities(subset);
     let mut filled = text[..start].to_string();
     fill_entities(&text[start + length..], &entities, &mut 0, 0, &mut filled);
     Cow::Owned(filled)
 }
 
 /// Write `text` to `out` with the references to `entities` in it filled in,
-/// and those in what they stand for in turn, as XML fills them in: not in a
-/// CDATA section, comment or processing instruction, whose text they are. One
-/// that never ends is taken for none, since the HTML parser reads on past
-/// where some of them start.
+/// and those in what they stand for in turn, as XML fills them in: in text and
+/// attribute values, but not in a CDATA section, comment or processing
+/// instruction, whose text they are. One that never ends is taken for none,
+/// since the HTML parser reads on past where some of them start, and a
+/// `<!--` in a quoted attribute value is the value's text.
 ///
 /// A reference in the chapter, at `depth` 0, is filled in whole or stays as
 /// written, so that a "billion laughs" stays a few references, and one to an
@@ -697,7 +817,7 @@ fn without_internal_subset(text: &str) -> Cow<'_, str> {
 /// in, one that cannot be filled in stops the rest: `false`.
 fn fill_entities(
     text: &str,
-    entities: &HashMap<&str, &str>,
+    entities: &HashMap<String, Option<String>>,
     spent: &mut usize,
     depth: usize,
     out: &mut String,
@@ -707,10 +827,20 @@ fn fill_entities(
     // What never ends from one place on ends nowhere after it either, so each
     // kind is looked for to the end once.
     let mut endless = [false; LITERAL_TEXT.len()];
+    // Where the tag being read ends. What a quoted value in it holds is the
+    // value's text, a `<!--` and all, and its entities are filled in.
+    let mut tag_end = 0;
     while let Some(offset) = text[at..].find(['<', '&']) {
         let from = at + offset;
         let rest = &text[from..];
         at = from + 1;
+        if from < tag_end && rest.starts_with('<') {
+            continue;
+        }
+        if opens_tag(rest) {
+            tag_end = from + tag_length(rest);
+            continue;
+        }
         if let Some(kind) = LITERAL_TEXT
             .iter()
             .position(|(open, _)| rest.starts_with(open))
@@ -728,7 +858,7 @@ fn fill_entities(
         let Some(reference) = ENTITY_REFERENCE.captures(rest) else {
             continue;
         };
-        let Some(value) = entities.get(&reference[1]) else {
+        let Some(Some(value)) = entities.get(&reference[1]) else {
             continue;
         };
 
@@ -1331,6 +1461,19 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(meta_charset(text.as_bytes()), *expected, "{text}");
         }
+    }
+
+    /// A subset is read declaration by declaration: what stands between them,
+    /// a letter that is not ASCII say, is passed over, and what a comment or
+    /// another declaration's quoted value holds declares nothing.
+    #[test]
+    fn a_subset_is_read_declaration_by_declaration() {
+        let subset = r#"<!ENTITY a "x">é <!-- <!ENTITY b 'no'> --> <!ENTITY % p "<!ENTITY c 'z'>"> <!ATTLIST p title CDATA "<!ENTITY d 'no'>"> %p; ]>"#;
+        let entities = declared_entities(subset);
+        assert_eq!(entities.get("a"), Some(&Some("x".to_string())));
+        assert_eq!(entities.get("c"), Some(&Some("z".to_string())));
+        assert!(!entities.contains_key("b"), "{entities:?}");
+        assert!(!entities.contains_key("d"), "{entities:?}");
     }
 
     /// A DOCTYPE ends at its own `>`, not one in a quoted value, a comment or

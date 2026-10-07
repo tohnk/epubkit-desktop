@@ -367,6 +367,97 @@ fn entities_are_filled_in_where_xml_fills_them_in() {
     assert_well_formed(&out);
 }
 
+/// The text of the first element named `name` in `out`, entities and all, as
+/// XML reads it.
+fn text_of(out: &str, name: &str) -> String {
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    let found = epubkit_core::xml::find_nodes(&doc, &format!("//*[local-name()='{name}']"))
+        .expect("a query that runs");
+    found
+        .first()
+        .unwrap_or_else(|| panic!("no {name} in {out}"))
+        .get_content()
+}
+
+/// A subset declares what XML reads it to declare, recovered or not: a
+/// declaration in a parameter entity's value declares nothing until the
+/// entity is used, and then declares it there, first; a character reference
+/// in a value is replaced as the declaration is read, so `&#38;word;` refers
+/// to `word` where `&amp;word;` reads "&word;"; and a declaration after a
+/// parameter entity that is never read still counts, as libxml2 counts it.
+/// Found in the subset's text, the declaration written in an unused
+/// parameter entity's value counted first, and `&#38;word;` was read as text.
+#[test]
+fn a_subset_declares_what_xml_reads_it_to_declare() {
+    let cases = [
+        (
+            r#"<!ENTITY % unused "<!ENTITY author 'Wrong'>"> <!ENTITY author "Right">"#,
+            "Right",
+        ),
+        (
+            r#"<!ENTITY % used "<!ENTITY author 'First'>"> %used; <!ENTITY author "Second">"#,
+            "First",
+        ),
+        (
+            r#"<!ENTITY % a "<!ENTITY author 'Nested'>"> <!ENTITY % b "&#37;a;"> %b;"#,
+            "Nested",
+        ),
+        (
+            r#"<!ENTITY % far SYSTEM "far.dtd"> %far; <!ENTITY author "After">"#,
+            "After",
+        ),
+        (
+            r#"<!ENTITY word "Right"> <!ENTITY author "&#38;word;">"#,
+            "Right",
+        ),
+        (
+            r#"<!ENTITY word "Wrong"> <!ENTITY author "&amp;word;">"#,
+            "&word;",
+        ),
+    ];
+    for (subset, expected) in cases {
+        // Well-formed, libxml2 reads the subset; with a markup error, recovery does.
+        for markup_error in [false, true] {
+            let br = if markup_error { "<br>" } else { "<br/>" };
+            let chapter = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [{subset}]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&author;{br}</p></body></html>
+"#
+            );
+            let (out, recovered) = repair(chapter.as_bytes());
+            assert_eq!(recovered, markup_error, "{subset}");
+            assert_eq!(text_of(&out, "p"), expected, "{subset}{br}: {out}");
+        }
+    }
+}
+
+/// In a chapter the HTML parser recovers, a `<!--`, a `<![CDATA[` or a `<?`
+/// in a quoted attribute value is the value's text, and an entity beside it
+/// is filled in as in any value. Taken for the start of a comment, it kept
+/// `&word;` from being filled in, and the value read "<!-- &word; -->".
+#[test]
+fn an_entity_in_an_attribute_is_filled_in_whatever_the_value_holds() {
+    for value in ["<!-- &word; -->", "<![CDATA[&word;]]>", "<? &word; ?>"] {
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [<!ENTITY word "Right">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p title="{value}">Body<br></p></body></html>
+"#
+        );
+        let (out, recovered) = repair(chapter.as_bytes());
+        assert!(recovered, "{value}");
+        let doc = epubkit_core::xml::parse_strict(out.as_bytes()).expect("well-formed");
+        let p = epubkit_core::xml::find_nodes(&doc, "//*[local-name()='p']").unwrap();
+        assert_eq!(
+            p[0].get_attribute("title").as_deref(),
+            Some(value.replace("&word;", "Right").as_str()),
+            "{out}"
+        );
+    }
+}
+
 /// A CDATA section or processing instruction that never ends holds nothing,
 /// and the HTML parser reads on past it, entities and all. Each kind is looked
 /// for to its end once: from every one that never ended, the time to fill a

@@ -226,12 +226,14 @@ leaves it as it was.
 
 Nor can the HTML parser read a DOCTYPE's internal subset: it ends the
 DOCTYPE at the subset's first `>`, and the rest of the declarations become
-text. The port reads the subset as XML does, and fills in the entities it
-declares where the chapter uses them, those they refer to in turn too, but
-not in a CDATA section, a comment or a processing instruction, whose text a
-reference there is. Each reference is filled in whole or stays as written,
-within a bound on what filling in may cost, so a "billion laughs" stays a few
-references.
+text. The port reads the subset as XML does, declaration by declaration,
+reading a parameter entity's declarations where it is used and replacing a
+value's character references as it goes. It fills in the entities the subset
+declares where the chapter uses them, in text and attribute values, those
+they refer to in turn too, but not in a CDATA section, a comment or a
+processing instruction, whose text a reference there is. Each reference is
+filled in whole or stays as written, within a bound on what filling in may
+cost, so a "billion laughs" stays a few references.
 
 ### Malformed chapters are read as UTF-8
 
