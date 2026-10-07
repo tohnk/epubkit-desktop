@@ -225,16 +225,26 @@ anything non-ASCII to decode, prefixes a byte order mark. `tests/encoding.rs`
 pins the result, and must pass against libxml2 2.9 and 2.14 alike, which
 disagree about the default.
 
-A malformed chapter whose bytes are not UTF-8 is decoded before the parser
-sees it, and is parsed as UTF-8 in turn. A byte order mark decides, then an
-encoding named in the XML declaration, then one named in a `<meta>`, and
-otherwise windows-1252, which is also what browsers take a declared
-ISO-8859-1 to mean. Upstream still leaves such a chapter to libxml2, whose
-HTML parser ignores an encoding named in an XML declaration: 2.9 reads on as
-Latin-1 and 2.14 as UTF-8, so a Shift_JIS or windows-1251 chapter came out as
-nonsense, and under 2.14 Latin-1 accents came out as replacement characters.
-Both releases also read windows-1252's curly quotes and dashes as Latin-1's
-invisible control characters.
+A chapter whose bytes are not UTF-8 is decoded before either parser sees it,
+and is parsed as UTF-8 in turn, with its XML declaration and any `<meta>`
+charset saying so. A byte order mark decides, then an encoding named in the
+XML declaration, then one named in a `<meta>`, and otherwise the bytes are
+taken for UTF-8 with stray bytes pasted in, each read as windows-1252. That
+is also what browsers take a declared ISO-8859-1 to mean, and it reads a
+chapter that is windows-1252 throughout the same way. Upstream still leaves
+such a chapter to libxml2, whose HTML parser ignores an encoding named in an
+XML declaration: 2.9 reads on as Latin-1 and 2.14 as UTF-8, so a Shift_JIS or
+windows-1251 chapter came out as nonsense, and under 2.14 Latin-1 accents came
+out as replacement characters. Both releases also read windows-1252's curly
+quotes and dashes as Latin-1's invisible control characters.
+
+The same decision now holds for well-formed chapters, which the port first
+left to libxml2's XML parser. That parser obeys the declaration: a chapter
+declaring ISO-8859-1 kept Word's quotes and dashes as control characters, and
+one whose declaration had outlived a re-encoding to UTF-8 came out as "Ã¼".
+So a chapter reads the same with or without a markup error in it. And one
+stray byte no longer sends a whole UTF-8 chapter through windows-1252, which
+had turned every Cyrillic letter into two Latin ones.
 
 ### Prose after `<code>` and `<pre>` is cleaned
 

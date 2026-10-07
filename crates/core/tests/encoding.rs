@@ -233,6 +233,81 @@ fn a_declaration_that_cannot_be_right_is_passed_over() {
     }
 }
 
+/// Repair a chapter that may or may not need recovering.
+fn read(input: &[u8]) -> String {
+    let out = LibxmlRepair::new()
+        .repair(input)
+        .expect("repair should succeed");
+    String::from_utf8(out.bytes).expect("utf-8 output")
+}
+
+/// One stray byte that is not UTF-8, pasted into a UTF-8 chapter, is just that
+/// byte; the rest is still UTF-8. Reading the whole chapter as windows-1252
+/// because of it turned every Cyrillic letter into two Latin ones.
+#[test]
+fn a_stray_byte_leaves_the_rest_of_a_utf8_chapter_alone() {
+    let mut chapter = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>{RUSSIAN}</title></head><body><p>{RUSSIAN}, "#
+    )
+    .into_bytes();
+    chapter.extend(b"it\x92s here</p></body></html>");
+
+    let output = read(&chapter);
+
+    assert_eq!(output.matches(RUSSIAN).count(), 2, "{output}");
+    assert!(output.contains("it\u{2019}s here"), "{output}");
+}
+
+/// A well-formed chapter is read as one with a markup error in it is.
+/// Declared ISO-8859-1, which browsers take to mean windows-1252, its curly
+/// quotes and dashes are not invisible control characters. Declared
+/// ISO-8859-1 over bytes that are UTF-8, its accents are not mangled.
+#[test]
+fn a_well_formed_chapter_is_decoded_as_a_malformed_one_is() {
+    let chapter = |text: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="iso-8859-1"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>{text}</p></body></html>"#
+        )
+    };
+
+    let output = read(&encoded(WINDOWS_1252, &chapter(PUNCTUATION)));
+    assert!(output.contains(PUNCTUATION), "{output}");
+    assert!(
+        !output.chars().any(|c| ('\u{80}'..='\u{9f}').contains(&c)),
+        "{output}"
+    );
+
+    let output = read(chapter(GERMAN).as_bytes());
+    assert!(output.contains(GERMAN), "{output}");
+    assert_not_mangled(&output);
+}
+
+/// Once a chapter is UTF-8, nothing in it says otherwise.
+#[test]
+fn a_chapter_says_it_is_the_utf8_it_now_is() {
+    let chapter = format!(
+        r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1251"/></head><body><p>{RUSSIAN}<br></p></body></html>"#
+    );
+    let output = repaired(&encoded(WINDOWS_1251, &chapter));
+
+    assert!(output.contains(RUSSIAN), "{output}");
+    assert!(output.contains("charset=utf-8"), "{output}");
+    assert!(!output.contains("1251"), "{output}");
+}
+
+/// XML may be UTF-16 without a byte order mark; its declaration's first bytes
+/// say so.
+#[test]
+fn a_utf16_chapter_without_a_byte_order_mark_is_read_as_utf16() {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>{GERMAN}</p></body></html>"#
+    );
+    let bytes: Vec<u8> = chapter.encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+    let output = read(&bytes);
+    assert!(output.contains(GERMAN), "{output}");
+}
+
 // Every pass that reads a chapter shares the repair step's parse, so each must
 // keep UTF-8 intact on its own, not only after repair has run.
 
