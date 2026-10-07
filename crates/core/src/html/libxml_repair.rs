@@ -78,16 +78,18 @@ impl LibxmlRepair {
 /// Serialization tuned for EPUB content documents.
 ///
 /// `format` must stay off: it re-indents the tree, which inserts whitespace
-/// into mixed content and visibly alters prose. `xhtml` must stay off too —
-/// libxml2's XHTML serializer helpfully injects a `<meta http-equiv=
-/// "Content-Type">` into every `<head>`, which is content the book did not ask
-/// for.
+/// into mixed content and visibly alters prose. libxml2's XHTML serializer
+/// must stay out too. It injects a `<meta http-equiv="Content-Type">` into
+/// every `<head>`, copies each `<a name>` into an `id` that can duplicate
+/// another, and mirrors `lang` into `xml:lang`. Leaving `xhtml` off is not
+/// enough to keep it out, since libxml2 picks it for any XHTML 1.0 doctype;
+/// `no_xhtml` is.
 fn save_options(no_declaration: bool) -> SaveOptions {
     SaveOptions {
         format: false,
         no_declaration,
         no_empty_tags: false,
-        no_xhtml: false,
+        no_xhtml: true,
         xhtml: false,
         as_xml: true,
         as_html: false,

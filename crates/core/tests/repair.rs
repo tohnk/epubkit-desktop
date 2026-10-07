@@ -228,3 +228,24 @@ fn a_file_with_nothing_in_it_is_refused() {
         );
     }
 }
+
+/// libxml2 has a serializer of its own for XHTML 1.0, chosen by the doctype
+/// alone. It injects a `<meta http-equiv>`, copies each `<a name>` into an
+/// `id` that duplicates the heading's, and mirrors `lang` into `xml:lang`. A
+/// well-formed chapter comes back as it was.
+#[test]
+fn an_xhtml_1_0_chapter_is_not_rewritten_as_xhtml_1_0_would_be_served() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>T</title></head><body><h2 id="chap01"><a name="chap01"></a>One</h2><p>Text.<br/>More.</p></body></html>
+"#;
+
+    let repaired = LibxmlRepair::new().repair(input).unwrap();
+    let out = String::from_utf8(repaired.bytes).unwrap();
+
+    assert!(!repaired.recovered);
+    assert!(!out.contains("http-equiv"), "{out}");
+    assert_eq!(out.matches(r#"id="chap01""#).count(), 1, "{out}");
+    assert!(!out.contains("xml:lang"), "{out}");
+    assert!(out.contains("<br/>"), "{out}");
+}
