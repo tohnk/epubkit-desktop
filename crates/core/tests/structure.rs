@@ -460,6 +460,90 @@ fn multi_image_svgs_are_left_alone() {
     assert_eq!(fs::read_to_string(&page).unwrap(), original);
 }
 
+/// An SVG that draws more than its image, a label or a line, is an
+/// illustration, and so is one that draws its image turned; an `<img>` would
+/// lose the rest. One that adds only a title or a description is still a
+/// wrapper.
+#[test]
+fn only_an_svg_that_just_shows_its_image_is_unwrapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let svg = |inside: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 800">
+{inside}
+</svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cover = put(
+        dir.path(),
+        "cover.xhtml",
+        svg(r#"<title>Cover</title><desc>The front cover</desc>
+<image width="600" height="800" xlink:href="images/cover.jpg"/>"#),
+    );
+    let labelled = svg(
+        r#"<image width="600" height="800" xlink:href="images/map.png"/>
+<path d="M 10 10 L 590 790" stroke="black"/>
+<text x="300" y="400">ESSENTIAL MAP LABEL</text>"#,
+    );
+    let map = put(dir.path(), "map.xhtml", &labelled);
+    let turned = svg(
+        r#"<image width="600" height="800" transform="rotate(90 300 400)" xlink:href="images/plate.png"/>"#,
+    );
+    let plate = put(dir.path(), "plate.xhtml", &turned);
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="map" href="map.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="plate.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="cover"/><itemref idref="map"/><itemref idref="plate"/></spine>
+</package>
+"#);
+
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 1);
+    assert!(!fs::read_to_string(&cover).unwrap().contains("<svg"));
+    assert_eq!(fs::read_to_string(&map).unwrap(), labelled);
+    assert_eq!(fs::read_to_string(&plate).unwrap(), turned);
+}
+
+/// An SVG inside another is part of that illustration; an `<img>` in its
+/// place would not show inside an SVG at all.
+#[test]
+fn an_svg_inside_another_is_left_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 800">
+<svg x="100" y="100" width="400" height="600"><image width="400" height="600" xlink:href="images/inset.jpg"/></svg>
+<text x="300" y="50">Caption</text>
+</svg>
+</body>
+</html>
+"#;
+    let page = put(dir.path(), "page.xhtml", original);
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="p" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="p"/></spine>
+</package>
+"#);
+
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&page).unwrap(), original);
+}
+
 fn write_chapter(path: &Path, title: &str, heading: &str) {
     fs::write(
         path,
@@ -859,6 +943,40 @@ fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
         out.contains(r#"<img src="../images/spread_part2.jpg""#),
         "{out}"
     );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// An illustration drawn around a split image keeps everything it draws, and
+/// the image's further pages follow it.
+#[test]
+fn an_illustration_around_a_split_image_is_kept_and_followed_by_its_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><div class="illust">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/spread_part1.jpg"/><text x="500" y="200">ESSENTIAL MAP LABEL</text></svg>
+</div></body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(dir.path(), &chapter, &split_spread()).unwrap(),
+        1
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(out.contains("ESSENTIAL MAP LABEL"), "{out}");
+    assert!(
+        out.contains(r#"xlink:href="../images/spread_part1.jpg""#),
+        "{out}"
+    );
+    let svg_end = out.find("</svg>").expect("the illustration is kept");
+    let second = out
+        .find(r#"<img src="../images/spread_part2.jpg""#)
+        .expect("the second page is shown");
+    assert!(second > svg_end, "{out}");
     xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
 }
 

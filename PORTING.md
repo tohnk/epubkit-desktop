@@ -429,6 +429,16 @@ judges each entry by its algorithm and the file it names: only a font under the
 IDPF's or Adobe's obfuscation is let through. A file that cannot be parsed is
 taken for DRM.
 
+### Only an SVG that just shows its image is unwrapped
+
+The reference took any SVG in the first three chapters holding exactly one
+`<image>` for a cover wrapper and replaced it with a plain `<img>`. One that
+also held text or shapes, a labelled map say, lost them. The port unwraps an
+SVG only when the image is all it draws, beside a title or a description, and
+leaves an illustration alone. Light Novel mode does the same for an SVG around
+an image it split: an illustration stays, followed by the image's further
+pages.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But

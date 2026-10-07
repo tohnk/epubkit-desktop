@@ -455,8 +455,9 @@ pub fn declare_reshaped_pages(
 /// An `<img>` of a reshaped image loses its `width` and `height`, which give
 /// the old shape, and is followed by a copy for each further page. An SVG
 /// wrapper around one, its viewBox sized to the old shape too, gives way to a
-/// plain `<img>` per page. Returns how many images changed, writing the file
-/// only if any did.
+/// plain `<img>` per page. An SVG that draws more than the image is an
+/// illustration, and stays as it is, followed by the image's further pages.
+/// Returns how many images changed, writing the file only if any did.
 pub fn show_reshaped_pages(
     opf_dir: &Path,
     path: &Path,
@@ -479,43 +480,68 @@ pub fn show_reshaped_pages(
     let content = html::parse_content(&bytes)?;
     let mut changed = 0;
 
-    // Both lists are taken before anything changes, so the images added below
-    // are not visited in turn.
-    let svgs = xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))?;
-    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
-
-    for mut svg in svgs {
-        let inner =
-            xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
-        let [image] = inner.as_slice() else {
-            continue;
-        };
+    // What would show each page of the image an SVG `<image>` shows, if that
+    // was reshaped.
+    let page_sources = |image: &Node| -> Option<Vec<String>> {
         let href = image
             .get_attribute_ns("href", NS_XLINK)
             .or_else(|| image.get_attribute("href"))
             .unwrap_or_default();
-        let Some(reference) = Reference::parse(&href) else {
-            continue;
-        };
-        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
-            continue;
-        };
+        let reference = Reference::parse(&href)?;
+        let pages = pages_by_target.get(&reference.target(base))?;
+        Some(pages.iter().map(|page| reference.with_name(page)).collect())
+    };
+
+    // Both lists are taken before anything changes, so the images added below
+    // are not visited in turn.
+    let svgs = xml::find_nodes(&content.doc, &outermost_svgs())?;
+    let images = xml::find_nodes(&content.doc, &format!("//{}", xml::local("img")))?;
+
+    for mut svg in svgs {
         let Some(mut parent) = svg.get_parent() else {
             continue;
         };
-
         let namespace = parent.get_namespace();
-        for page in pages {
-            let Ok(mut img) = parent.new_child(namespace.clone(), "img") else {
-                continue;
-            };
-            img.set_attribute("src", &reference.with_name(page)).ok();
+        let mut page_image = |src: &str| {
+            let mut img = parent.new_child(namespace.clone(), "img").ok()?;
+            img.set_attribute("src", src).ok();
             img.set_attribute("alt", "").ok();
             img.set_attribute("style", FULL_PAGE_STYLE).ok();
-            svg.add_prev_sibling(&mut img).ok();
+            Some(img)
+        };
+
+        // A wrapper gives way to its image's pages.
+        if let Some(image) = wrapped_image(&svg) {
+            let Some(sources) = page_sources(&image) else {
+                continue;
+            };
+            for src in &sources {
+                if let Some(mut img) = page_image(src) {
+                    svg.add_prev_sibling(&mut img).ok();
+                }
+            }
+            svg.unlink();
+            changed += 1;
+            continue;
         }
-        svg.unlink();
-        changed += 1;
+
+        // An illustration stays as it is. The pages after the first of an
+        // image it draws, which it cannot show, follow it.
+        let drawn =
+            xml::find_nodes_under(&content.doc, &svg, &format!(".//{}", xml::local("image")))?;
+        let mut previous = svg.clone();
+        for image in drawn {
+            let Some(sources) = page_sources(&image).filter(|sources| sources.len() > 1) else {
+                continue;
+            };
+            for src in &sources[1..] {
+                if let Some(mut img) = page_image(src) {
+                    previous.add_next_sibling(&mut img).ok();
+                    previous = img;
+                }
+            }
+            changed += 1;
+        }
     }
 
     for mut image in images {
@@ -566,7 +592,8 @@ pub fn show_reshaped_pages(
 ///
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
 /// which small e-ink readers render poorly or not at all. Only the first few
-/// spine entries are examined — a cover later than that is not a cover.
+/// spine entries are examined — a cover later than that is not a cover — and
+/// only an SVG that does nothing but show its image is replaced.
 pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usize> {
     const SPINE_ENTRIES_TO_CHECK: usize = 3;
 
@@ -586,17 +613,10 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         };
 
         let mut fixed_here = 0;
-        for mut svg in xml::find_nodes(&content.doc, &format!("//{}", xml::local("svg")))? {
-            let images =
-                xml::find_nodes_under(&content.doc, &svg, &format!("./{}", xml::local("image")))?;
-
-            // A wrapper holds exactly one image. More than that is a real
-            // illustration and must be left alone.
-            if images.len() != 1 {
+        for mut svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
+            let Some(image) = wrapped_image(&svg) else {
                 continue;
-            }
-
-            let image = &images[0];
+            };
             let target = image
                 .get_attribute_ns("href", NS_XLINK)
                 .or_else(|| image.get_attribute("href"))
@@ -697,6 +717,35 @@ fn item_from_node(node: &Node) -> ManifestItem {
         media_type: node.get_attribute("media-type").unwrap_or_default(),
         properties: node.get_attribute("properties").unwrap_or_default(),
     }
+}
+
+/// Every `<svg>` that is not part of another. One that is belongs to the
+/// illustration it is in, and an `<img>` would not show there at all.
+fn outermost_svgs() -> String {
+    format!("//{svg}[not(ancestor::{svg})]", svg = xml::local("svg"))
+}
+
+/// The image an SVG wraps, if showing it is all the SVG does: the image is
+/// its one element apart from a title, a description or metadata, and is not
+/// drawn transformed, clipped, masked or filtered.
+///
+/// Anything more, a label, a line, a second image, makes the SVG an
+/// illustration, and an `<img>` in its place would lose the rest.
+fn wrapped_image(svg: &Node) -> Option<Node> {
+    let mut image = None;
+    for child in svg.get_child_elements() {
+        match local_name(&child).as_str() {
+            "title" | "desc" | "metadata" => {}
+            "image" if image.is_none() => image = Some(child),
+            _ => return None,
+        }
+    }
+
+    let image = image?;
+    let drawn_as_is = ["transform", "clip-path", "mask", "filter"]
+        .into_iter()
+        .all(|attribute| image.get_attribute(attribute).is_none());
+    drawn_as_is.then_some(image)
 }
 
 /// The xlink namespace as declared in scope at `node`, if it is.
