@@ -2,7 +2,8 @@
 //! filenames. Port of `metadata_handler.py`.
 
 use std::collections::BTreeSet;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -335,7 +336,8 @@ pub fn unused_path(preferred: &Path) -> PathBuf {
 ///
 /// The name of a finished book comes from its metadata, which is not known
 /// until the run is over. Writing in the folder the book is going to lets
-/// [`publish`] move it there without copying it.
+/// [`publish`] move it there rather than copy it, wherever the filesystem
+/// allows.
 ///
 /// The file is made for this run alone — never one that was already there, nor
 /// a link to one — and is deleted when it is dropped unpublished, so a run
@@ -361,29 +363,51 @@ pub fn staging_file(directory: &Path) -> Result<NamedTempFile> {
 /// something is already there, to the first free `name (2).epub`,
 /// `name (3).epub`, … beside it. Returns where it went.
 ///
-/// Each name is claimed in the same step as the move, so a file that appears
-/// there in the meantime — another run's book, or anything else — is never
-/// replaced: the book moves on to the next name instead.
+/// Each name is claimed in the same step as the book goes there, so a file
+/// there already, or one that appears in the meantime — another run's book,
+/// or anything else — is never replaced: the book moves on to the next name.
 pub fn publish(mut staged: NamedTempFile, preferred: &Path) -> Result<PathBuf> {
-    for candidate in candidates(preferred).filter(|candidate| !taken(candidate)) {
-        match staged.persist_noclobber(&candidate) {
+    for candidate in candidates(preferred) {
+        let claimed = match staged.persist_noclobber(&candidate) {
             Ok(_) => return Ok(candidate),
-            Err(refused) if refused.error.kind() == io::ErrorKind::AlreadyExists => {
-                staged = refused.file;
-            }
-            // Some filesystems cannot refuse to replace a file as they rename
-            // one. The name was looked at just before, which is the best they
-            // allow.
             Err(refused) => {
-                return match refused.file.persist(&candidate) {
-                    Ok(_) => Ok(candidate),
-                    Err(failed) => Err(Error::io(&candidate, failed.error)),
-                };
+                staged = refused.file;
+                if refused.error.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                // Some filesystems can neither rename a file without replacing
+                // another nor link one. Any can make a file only if no file is
+                // there, and the book is copied into that instead.
+                copy_into_new_file(&mut staged, &candidate)
             }
+        };
+
+        match claimed {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::io(&candidate, error)),
         }
     }
 
     unreachable!("an unused suffix always exists")
+}
+
+/// Copy `staged` into a new file at `path`, made only if nothing is there. A
+/// copy that fails takes its file with it: the file is this run's own.
+fn copy_into_new_file(staged: &mut NamedTempFile, path: &Path) -> io::Result<()> {
+    let mut out = OpenOptions::new().write(true).create_new(true).open(path)?;
+
+    let source = staged.as_file_mut();
+    let copied = source
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| io::copy(source, &mut out))
+        .and_then(|_| out.sync_all());
+
+    if copied.is_err() {
+        drop(out);
+        let _ = fs::remove_file(path);
+    }
+    copied
 }
 
 // ---------------------------------------------------------------- internals

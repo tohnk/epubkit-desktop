@@ -518,6 +518,30 @@ fn a_staging_file_is_new_and_goes_unless_published() {
     );
 }
 
+/// Where the book cannot be renamed into place, as on a filesystem that can
+/// neither rename without replacing nor link, it is copied into a file made
+/// new, which refuses a name already taken just as the rename would. Here the
+/// rename fails because the staging file's name has gone, which takes the same
+/// path.
+#[cfg(unix)]
+#[test]
+fn a_book_that_cannot_be_renamed_into_place_is_copied_without_replacing() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("Book.epub");
+    std::fs::write(&wanted, b"another book").unwrap();
+
+    let mut staged = staging_file(dir.path()).unwrap();
+    staged.write_all(b"the book").unwrap();
+    std::fs::remove_file(staged.path()).unwrap();
+
+    let published = publish(staged, &wanted).unwrap();
+
+    assert_eq!(published, dir.path().join("Book (2).epub"));
+    assert_eq!(std::fs::read(&published).unwrap(), b"the book");
+    assert_eq!(std::fs::read(&wanted).unwrap(), b"another book");
+    assert_eq!(names_in(dir.path()), ["Book (2).epub", "Book.epub"]);
+}
+
 /// A book is as readable as any other file its owner makes, not private the
 /// way a temporary file is.
 #[cfg(unix)]
