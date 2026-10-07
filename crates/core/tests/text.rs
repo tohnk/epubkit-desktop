@@ -1,4 +1,8 @@
-use epubkit_core::text::{clean_text_content, TextCleanOptions, TextCleanReport};
+mod common;
+
+use std::time::Duration;
+
+use epubkit_core::text::{clean_string, clean_text_content, TextCleanOptions, TextCleanReport};
 
 fn wrap(body: &str) -> Vec<u8> {
     format!(
@@ -483,4 +487,27 @@ fn control_characters_where_punctuation_belongs_are_read_as_windows_1252() {
         "{out}"
     );
     assert_eq!(report.encoding_issues_fixed, 5);
+}
+
+/// A word the run-on pattern finds in again and again is looked at once. It
+/// was read through again for every find, so 36 KB of "word.Word" took ten
+/// seconds, four times as long for twice the text. The words after it are
+/// still looked at.
+#[test]
+fn a_long_run_on_word_is_read_once() {
+    let word = "word.Word".repeat(50_000);
+    let text = format!("{word} ended.Then");
+
+    let (out, report) = common::finishes_within(Duration::from_secs(20), move || {
+        let mut report = TextCleanReport::default();
+        let out = clean_string(&text, &TextCleanOptions::default(), &mut report);
+        (out, report)
+    });
+
+    assert!(
+        out == format!("{word} ended. Then"),
+        "{}",
+        &out[out.len() - 40..]
+    );
+    assert_eq!(report.punctuation_fixed, 1);
 }

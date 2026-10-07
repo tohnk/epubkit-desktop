@@ -495,21 +495,25 @@ fn fold_quotes(text: String, count: &mut usize) -> String {
 fn add_missing_sentence_spaces(text: String, count: &mut usize) -> String {
     let mut out = String::new();
     let mut kept_from = 0;
+    let mut from = 0;
 
-    // Only a word the pattern finds in is looked at. The pattern holds no
-    // blanks, so each find is inside one word, and the first in it.
-    for found in MISSING_SENTENCE_SPACE.captures_iter(&text) {
+    // Only a word the pattern finds in is looked at, once, where it first
+    // finds in it: the pattern holds no blanks, so a find is inside one word.
+    // The search goes on after that word, so a long one with many finds in it
+    // is not read through again for each.
+    while let Some(found) = MISSING_SENTENCE_SPACE.captures_at(&text, from) {
         let (before, after) = (
             found.get(1).expect("always captured"),
             found.get(2).expect("always captured"),
         );
-        let start = text[..before.start()]
+        let start = text[from..before.start()]
             .char_indices()
             .rfind(|(_, c)| c.is_whitespace())
-            .map_or(0, |(at, c)| at + c.len_utf8());
+            .map_or(from, |(at, c)| from + at + c.len_utf8());
         let end = text[after.end()..]
             .find(char::is_whitespace)
             .map_or(text.len(), |length| after.end() + length);
+        from = end;
 
         let core = text[start..end].trim_end_matches(|c: char| {
             c.is_ascii_punctuation() || "\u{201d}\u{2019}\u{bb}".contains(c)
