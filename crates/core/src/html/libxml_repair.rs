@@ -40,7 +40,7 @@ use std::sync::LazyLock;
 
 use encoding_rs::{Encoding, ISO_2022_JP, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use libxml::parser::{Parser, ParserOptions};
-use libxml::tree::{Document, NodeType, SaveOptions};
+use libxml::tree::{Document, Node, NodeType, SaveOptions};
 use regex::bytes::Regex;
 
 use super::{ContentDocument, HtmlRepair, Repaired};
@@ -59,10 +59,12 @@ static XML_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The encoding a `<meta>` names, as `charset="…"` or inside `content="…;
 /// charset=…"`. Comments and CDATA sections match too, without a name, so
-/// that a `<meta>` written inside one is passed over with it.
+/// that a `<meta>` written inside one is passed over with it. One that never
+/// closes runs to the end, as a parser reads it; matching it only where it
+/// closed had the search look for its end again from every `<meta>` after it.
 static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?s-u)<!--.*?-->|<!\[CDATA\[.*?\]\]>|(?i:<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+))"#,
+        r#"(?s-u)<!--.*?(?:-->|\z)|<!\[CDATA\[.*?(?:\]\]>|\z)|(?i:<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+))"#,
     )
     .unwrap()
 });
@@ -305,67 +307,82 @@ fn restore_case(doc: &Document) -> Result<()> {
 /// characters XML forbids written as references. And it keeps a stylesheet's
 /// or script's text as it stands, the author's own `<![CDATA[` markers
 /// included, which the XML writer would wrap in a CDATA section of its own.
-fn make_legal_xml(doc: &Document) -> Result<()> {
-    for mut comment in xml::find_nodes(doc, "//comment()")? {
-        let mut text = comment.get_content();
-        if text.contains("--") || text.ends_with('-') {
-            while text.contains("--") {
-                text = text.replace("--", "- -");
-            }
-            if text.ends_with('-') {
-                text.push(' ');
-            }
-            comment.set_content(&text).ok();
-        }
-    }
-
-    for mut instruction in xml::find_nodes(doc, "//processing-instruction()")? {
-        let name = instruction.get_name();
-        if name.eq_ignore_ascii_case("xml") || !is_xml_name(&name) {
-            instruction.unlink();
-        }
-    }
-
-    for mut element in xml::find_nodes(doc, "//*")? {
-        if !is_xml_name(&element.get_name()) {
-            element.set_name("span").ok();
-        }
-        for (name, value) in element.get_attributes() {
-            if !is_xml_name(&name) {
-                element.remove_attribute(&name).ok();
-            } else if value.contains(is_forbidden_in_xml) {
-                element
-                    .set_attribute(&name, &value.replace(is_forbidden_in_xml, " "))
-                    .ok();
-            }
-        }
-
-        if matches!(
-            element.get_name().to_ascii_lowercase().as_str(),
-            "style" | "script"
-        ) {
-            for mut text in element.get_child_nodes() {
-                let content = text.get_content();
-                let inner = content.trim();
-                if let Some(inner) = inner
-                    .strip_prefix("<![CDATA[")
-                    .and_then(|inner| inner.strip_suffix("]]>"))
-                {
-                    text.set_content(inner).ok();
+///
+/// It is done in one walk over the tree, rather than a query for each kind of
+/// node: libxml2 sorts what a query finds into document order, and a long run
+/// of comments with no element between them took time growing with the
+/// square of its length to sort.
+fn make_legal_xml(doc: &Document) {
+    let mut parents = vec![doc.as_node()];
+    while let Some(parent) = parents.pop() {
+        for mut node in parent.get_child_nodes() {
+            match node.get_type() {
+                Some(NodeType::CommentNode) => {
+                    let mut text = node.get_content();
+                    if text.contains("--") || text.ends_with('-') {
+                        while text.contains("--") {
+                            text = text.replace("--", "- -");
+                        }
+                        if text.ends_with('-') {
+                            text.push(' ');
+                        }
+                        node.set_content(&text).ok();
+                    }
                 }
+                Some(NodeType::PiNode) => {
+                    let name = node.get_name();
+                    if name.eq_ignore_ascii_case("xml") || !is_xml_name(&name) {
+                        node.unlink();
+                    }
+                }
+                Some(NodeType::ElementNode) => {
+                    make_legal_element(&mut node);
+                    parents.push(node);
+                }
+                Some(NodeType::TextNode) => {
+                    let content = node.get_content();
+                    if content.contains(is_forbidden_in_xml) {
+                        node.set_content(&content.replace(is_forbidden_in_xml, " "))
+                            .ok();
+                    }
+                }
+                _ => {}
             }
         }
     }
+}
 
-    for mut text in xml::find_nodes(doc, "//text()")? {
-        let content = text.get_content();
-        if content.contains(is_forbidden_in_xml) {
-            text.set_content(&content.replace(is_forbidden_in_xml, " "))
+/// [`make_legal_xml`] for one element, its name and attributes, and the text
+/// of a stylesheet or script. Its text is then made legal with the rest.
+fn make_legal_element(element: &mut Node) {
+    if !is_xml_name(&element.get_name()) {
+        element.set_name("span").ok();
+    }
+    for (name, value) in element.get_attributes() {
+        if !is_xml_name(&name) {
+            element.remove_attribute(&name).ok();
+        } else if value.contains(is_forbidden_in_xml) {
+            element
+                .set_attribute(&name, &value.replace(is_forbidden_in_xml, " "))
                 .ok();
         }
     }
 
-    Ok(())
+    if matches!(
+        element.get_name().to_ascii_lowercase().as_str(),
+        "style" | "script"
+    ) {
+        for mut text in element.get_child_nodes() {
+            let content = text.get_content();
+            let inner = content.trim();
+            if let Some(inner) = inner
+                .strip_prefix("<![CDATA[")
+                .and_then(|inner| inner.strip_suffix("]]>"))
+            {
+                text.set_content(inner).ok();
+            }
+        }
+    }
 }
 
 /// Whether `name` can name an element, attribute or processing instruction
@@ -516,12 +533,12 @@ fn root_start(text: &str) -> usize {
 /// How long the DOCTYPE `text` starts with is, internal subset and all.
 fn doctype_length(text: &str) -> Option<usize> {
     let close = text.find('>')?;
-    match text.find('[') {
-        Some(open) if open < close => {
+    match text[..close].find('[') {
+        Some(open) => {
             let subset_end = open + text[open..].find(']')?;
             Some(subset_end + text[subset_end..].find('>')? + 1)
         }
-        _ => Some(close + 1),
+        None => Some(close + 1),
     }
 }
 
@@ -847,7 +864,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     strip_html_parser_artifacts(&mut doc);
     restore_namespace(&doc);
     restore_case(&doc)?;
-    make_legal_xml(&doc)?;
+    make_legal_xml(&doc);
     declare_utf8_in_meta(&doc, &text)?;
 
     let content = ContentDocument {
@@ -899,5 +916,27 @@ impl HtmlRepair for LibxmlRepair {
             bytes: serialize_content(&content),
             recovered: content.recovered,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A comment or CDATA section that never closes runs to the end, so a
+    /// `<meta>` after it is inside it. Matched only where one closed, each
+    /// `<meta>` after one sent the search on to the end of the chapter again.
+    #[test]
+    fn what_never_closes_runs_to_the_end() {
+        for unclosed in ["<!--", "<![CDATA["] {
+            let text = format!(
+                r#"<html><head>{unclosed}<meta charset="latin1"><meta charset="utf-8"></head></html>"#
+            );
+            let named = META_DECLARED
+                .captures_iter(text.as_bytes())
+                .filter_map(|declared| declared.get(1))
+                .count();
+            assert_eq!(named, 0, "{unclosed}");
+        }
     }
 }

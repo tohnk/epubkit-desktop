@@ -254,12 +254,12 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
         return 0;
     }
 
-    // Which part a byte of `css` is in. The end of it is in the last.
+    // Which part a byte of `css` is in: the first to end after it. The end of
+    // `css` is in the last. The parts are in order, so this is a search.
     let part_at = |at: usize| {
         parts
-            .iter()
-            .position(|(_, range)| range.contains(&at))
-            .unwrap_or(parts.len() - 1)
+            .partition_point(|(_, range)| range.end <= at)
+            .min(parts.len() - 1)
     };
     let mut contents = vec![String::new(); parts.len()];
     let keep = |contents: &mut [String], mut from: usize, to: usize| {

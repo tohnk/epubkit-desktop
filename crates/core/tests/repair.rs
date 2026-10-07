@@ -1,3 +1,7 @@
+mod common;
+
+use std::time::Duration;
+
 use epubkit_core::html::{default_backend, HtmlRepair, LibxmlRepair};
 
 fn repair(input: &[u8]) -> (String, bool) {
@@ -457,4 +461,36 @@ fn restoring_case_keeps_the_order_of_attributes() {
             "{out}"
         );
     }
+}
+
+/// Finding where the root element starts passes each declaration before it
+/// once. Each was searched for an internal subset to the end of the chapter,
+/// so 160,000 of them took seconds.
+#[test]
+fn declarations_before_the_root_are_passed_once() {
+    let chapter = format!(
+        "{}<html><head><title>T</title></head><body><p>Text</p></body></html>",
+        "<!x>".repeat(400_000)
+    );
+
+    let (out, _) =
+        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
+    assert!(out.contains("<p>Text</p>"), "{}", &out[..200]);
+}
+
+/// A recovered chapter is made legal XML in time that grows with it. Its
+/// comments were found by a query that libxml2 sorts, which took time growing
+/// with the square of a long run of them with no element between.
+#[test]
+fn a_long_run_of_comments_is_made_legal_in_one_pass() {
+    let comments = 80_000;
+    let chapter = format!(
+        "<html><head><title>T</title></head><body><p>Text<br></p>{}</body></html>",
+        "<!--x-->".repeat(comments)
+    );
+
+    let (out, recovered) =
+        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
+    assert!(recovered);
+    assert_eq!(out.matches("<!--x-->").count(), comments);
 }

@@ -393,6 +393,23 @@ fn a_stale_iso_2022_jp_declaration_does_not_mangle_utf8() {
     assert!(output.contains(JAPANESE), "{output}");
 }
 
+/// A `<meta>` after a CDATA section that never closes is passed over in time
+/// that grows with the chapter. Looking for the end of each such section
+/// again from every `<meta>` after it took time growing with the square of
+/// it: 280 KB took twenty seconds.
+#[test]
+fn unclosed_cdata_sections_are_passed_over_once() {
+    let chapter = format!(
+        "<html><head><title>T</title></head><body><p>{GERMAN}</p>{}</body></html>",
+        "<![CDATA[<meta charset=\"utf-8\">".repeat(12_000)
+    );
+
+    let output = common::finishes_within(std::time::Duration::from_secs(20), move || {
+        read(chapter.as_bytes())
+    });
+    assert!(output.contains(GERMAN), "{}", &output[..200]);
+}
+
 // Every pass that reads a chapter shares the repair step's parse, so each must
 // keep UTF-8 intact on its own, not only after repair has run.
 

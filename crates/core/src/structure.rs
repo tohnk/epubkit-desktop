@@ -635,6 +635,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         }
     }
 
+    let mut pictures = HashSet::new();
     for mut image in images {
         let src = image.get_attribute("src").unwrap_or_default();
         let Some(reference) = Reference::parse(&src) else {
@@ -652,10 +653,11 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 
         // Each page is shown by its `src`. A `srcset` or `sizes`, or the
         // sources of a `<picture>`, would show the one image they name on
-        // every page.
+        // every page. A picture's are gone after its first image, and it is
+        // not looked through again for the rest.
         image.remove_attribute("srcset").ok();
         image.remove_attribute("sizes").ok();
-        if local_name(&parent) == "picture" {
+        if local_name(&parent) == "picture" && pictures.insert(parent.node_ptr()) {
             for mut source in parent.get_child_elements() {
                 if local_name(&source) == "source" {
                     source.unlink();

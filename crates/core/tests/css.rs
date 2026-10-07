@@ -1,3 +1,7 @@
+mod common;
+
+use std::time::Duration;
+
 use epubkit_core::css::{
     collect_used_selectors, decode_stylesheet, remove_embedded_fonts,
     remove_embedded_fonts_from_styles, remove_unused_css, UsedSelectors,
@@ -330,6 +334,29 @@ fn a_style_with_an_entity_in_it_is_left_as_it_is() {
 
     assert_eq!(removed, 0);
     assert_eq!(String::from_utf8(out).unwrap(), chapter);
+}
+
+/// A `<style>` in many pieces, each with an edit in it, is edited in time
+/// that grows with its length. Finding the piece each edit fell in from the
+/// first piece on took time growing with the square of it.
+#[test]
+fn a_style_in_many_pieces_is_edited_in_one_pass() {
+    let pieces = 40_000;
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{}</style></head><body><p>x</p></body></html>
+"#,
+        "@font-face{src:url(a.ttf)}<![CDATA[p{margin:0}]]>".repeat(pieces)
+    );
+
+    let (out, removed) = common::finishes_within(Duration::from_secs(20), move || {
+        remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap()
+    });
+
+    assert_eq!(removed, pieces);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("font-face"));
+    assert_eq!(out.matches("<![CDATA[p{margin:0}]]>").count(), pieces);
 }
 
 // ------------------------------------------------------------- encodings

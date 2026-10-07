@@ -1,6 +1,9 @@
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
@@ -1237,6 +1240,32 @@ fn a_split_images_pages_are_shown_by_src_alone() {
         "an unrelated image keeps its srcset: {out}"
     );
     xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// A `<picture>` is cleared of its sources once, not once for each image in
+/// it: looked through again for every one, a picture of 4,000 split images
+/// took thirteen seconds, four times as long for twice as many.
+#[test]
+fn a_picture_of_many_split_images_is_cleared_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = 8_000;
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><picture><source srcset="../images/spread.webp"/>{}</picture></body></html>
+"#,
+            r#"<img src="../images/spread_part1.jpg" alt=""/>"#.repeat(images)
+        ),
+    );
+    let root = dir.path().to_path_buf();
+
+    let changed = common::finishes_within(Duration::from_secs(20), move || {
+        show_reshaped_pages(&chapter, &ReshapedPages::new(&root, &root, &split_spread())).unwrap()
+    });
+
+    assert_eq!(changed, images);
 }
 
 /// An SVG wrapper's viewBox is sized to the old shape, so it would squash the
