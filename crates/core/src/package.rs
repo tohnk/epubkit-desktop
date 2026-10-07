@@ -26,13 +26,13 @@ pub const OS_ARTIFACT_DIRS: &[&str] = &["__MACOSX", ".git", ".svn"];
 const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2"];
 
 const NS_CONTAINER: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
-const NS_XMLENC: &str = "http://www.w3.org/2001/04/xmlenc#";
 
-// Substring markers, matched against raw `encryption.xml` text. See `has_drm`.
-const MARKER_XMLENC: &str = "http://www.w3.org/2001/04/xmlenc";
-const MARKER_IDPF_EMBEDDING: &str = "http://www.idpf.org/2008/embedding";
-const MARKER_ADOBE_PDF_ENC: &str = "http://ns.adobe.com/pdf/enc";
-const MARKER_ADOBE_ADEPT: &str = "http://ns.adobe.com/adept";
+/// The font obfuscation algorithms `encryption.xml` names alongside real
+/// encryption: the IDPF's, and Adobe's older one.
+const OBFUSCATION_ALGORITHMS: &[&str] = &[
+    "http://www.idpf.org/2008/embedding",
+    "http://ns.adobe.com/pdf/enc#RC",
+];
 
 /// Extract an EPUB into `dest_dir`.
 ///
@@ -239,39 +239,32 @@ pub fn validate_epub(epub_path: &Path) -> Result<Validation> {
 
 /// Detect DRM.
 ///
-/// `META-INF/encryption.xml` alone does not mean DRM: the IDPF font
-/// obfuscation scheme (and Adobe's variant) live in the same file. The
-/// distinction is *what* is encrypted — if only fonts are, it is obfuscation
-/// and the book is processable; anything else is real DRM.
+/// `META-INF/encryption.xml` alone does not mean DRM: font obfuscation, the
+/// IDPF's scheme and Adobe's, is declared in the same file. What counts is
+/// what each entry does, and to what — a font obfuscated leaves the book
+/// processable; anything else is real DRM.
+///
+/// The file is parsed rather than searched, so it reads the same in any
+/// encoding XML allows, UTF-16 as much as UTF-8. Metadata that cannot be read
+/// could be hiding anything, so it is taken for DRM rather than handing the
+/// pipeline a book it cannot read.
 pub fn has_drm(epub_path: &Path) -> Result<bool> {
     let Some(bytes) = read_optional_entry(epub_path, ENCRYPTION_ENTRY)? else {
         return Ok(false);
     };
-    let text = String::from_utf8_lossy(&bytes);
 
-    // No XML Encryption at all.
-    if !text.contains(MARKER_XMLENC) {
+    // An empty file declares nothing encrypted.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(false);
     }
 
-    // Without an obfuscation marker, encrypted content is just encrypted.
-    let obfuscation_marker =
-        text.contains(MARKER_IDPF_EMBEDDING) || text.contains(MARKER_ADOBE_PDF_ENC);
-    if !obfuscation_marker {
+    let Ok(encrypted) = encrypted_resources(&bytes) else {
         return Ok(true);
-    }
+    };
 
-    if !(text.contains(MARKER_ADOBE_ADEPT) || text.contains("EncryptedData")) {
-        return Ok(false);
-    }
-
-    // Inspect what is actually encrypted.
-    match encrypted_uris(&bytes) {
-        Ok(uris) => Ok(uris.iter().any(|uri| !is_font_uri(uri))),
-        // Unparseable encryption metadata: assume the worst rather than
-        // handing the pipeline a book it cannot read.
-        Err(_) => Ok(true),
-    }
+    Ok(encrypted.iter().any(|(algorithm, uri)| {
+        !(OBFUSCATION_ALGORITHMS.contains(&algorithm.as_str()) && is_font_uri(uri))
+    }))
 }
 
 /// Locate the OPF package document within an extracted EPUB, relative to the
@@ -379,12 +372,33 @@ fn read_optional_entry(epub_path: &Path, name: &str) -> Result<Option<Vec<u8>>> 
     result
 }
 
-fn encrypted_uris(encryption_xml: &[u8]) -> Result<Vec<String>> {
+/// The algorithm of each `EncryptedData` in `encryption.xml`, and the file it
+/// applies to, either empty if it names none.
+///
+/// Elements are matched by local name, so that one in a namespace other than
+/// XML Encryption's still counts.
+fn encrypted_resources(encryption_xml: &[u8]) -> Result<Vec<(String, String)>> {
     let doc = xml::parse_strict(encryption_xml)?;
-    xml::attribute_values(
-        &doc,
-        "//enc:EncryptedData//enc:CipherReference",
-        "URI",
-        &[("enc", NS_XMLENC)],
-    )
+    let method = format!("./{}", xml::local("EncryptionMethod"));
+    let reference = format!(
+        "./{}/{}",
+        xml::local("CipherData"),
+        xml::local("CipherReference")
+    );
+
+    let mut encrypted = Vec::new();
+    for data in xml::find_nodes(&doc, &format!("//{}", xml::local("EncryptedData")))? {
+        let attribute = |xpath: &str, name: &str| -> Result<String> {
+            Ok(xml::find_nodes_under(&doc, &data, xpath)?
+                .first()
+                .and_then(|node| node.get_attribute(name))
+                .unwrap_or_default())
+        };
+        encrypted.push((
+            attribute(&method, "Algorithm")?,
+            attribute(&reference, "URI")?,
+        ));
+    }
+
+    Ok(encrypted)
 }

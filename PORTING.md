@@ -419,6 +419,16 @@ root as URLs inside an EPUB container resolve, and ignores one that leads out.
 A `container.xml` naming a package that is not in the book falls back to the
 search for one that is.
 
+### Encryption metadata is parsed, not searched
+
+The reference decided whether a book had DRM by looking for namespace URIs in
+`META-INF/encryption.xml` read as UTF-8 text. The same file written in UTF-16,
+as XML allows, had none of them to find, and a book with encrypted chapters
+went through the pipeline as if it had none. The port parses the file and
+judges each entry by its algorithm and the file it names: only a font under the
+IDPF's or Adobe's obfuscation is let through. A file that cannot be parsed is
+taken for DRM.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But
