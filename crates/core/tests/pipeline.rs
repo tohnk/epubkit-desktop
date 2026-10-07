@@ -762,6 +762,56 @@ fn an_svg_document_follows_the_images_it_draws() {
     assert!(work.path().join("OEBPS/images/plate.jpg").is_file());
 }
 
+/// An SVG document can use a stylesheet's rules as much as a chapter can, so
+/// what it uses counts when deciding which rules nothing uses.
+#[test]
+fn rules_only_an_svg_document_uses_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svgcss</dc:identifier><dc:title>SVG CSS</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="page" href="page2.svg" media-type="image/svg+xml"/>
+    <item id="css" href="style.css" media-type="text/css"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="page"/></spine>
+</package>
+"#;
+    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/css" href="style.css"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text class="balloon" x="10" y="50">Hello</text></svg>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/page2.svg", svg),
+            (
+                "OEBPS/style.css",
+                b".balloon { font-size: 40px; fill: #333 }\n.unused { color: red }\n",
+            ),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let css = fs::read_to_string(work.path().join("OEBPS/style.css")).unwrap();
+    assert!(
+        css.contains(".balloon { font-size: 40px; fill: #333 }"),
+        "{css}"
+    );
+    assert!(!css.contains(".unused"), "{css}");
+    assert_eq!(report.css_rules_removed, 1);
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.

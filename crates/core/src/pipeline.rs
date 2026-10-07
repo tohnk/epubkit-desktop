@@ -367,6 +367,13 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             used.merge(&css::collect_used_selectors(&bytes)?);
         }
+        // An SVG document can use a stylesheet's rules as much as a chapter.
+        for path in svg_documents(&content.images) {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            if let Ok(used_here) = css::collect_used_selectors(&bytes) {
+                used.merge(&used_here);
+            }
+        }
 
         for path in &content.css {
             if !path.is_file() {
