@@ -440,10 +440,13 @@ fn only_a_real_meta_charset_decides_the_encoding() {
 /// internal subset holds, is no markup of the chapter's: a `</script>` and a
 /// `<meta>` written there are text. Looked for in the text, the `<meta>` after
 /// a CDATA section's `"</script><meta charset='iso-8859-1'>"` was found first,
-/// and a `<script>` in a DOCTYPE's comment swallowed the real one. Each is
-/// tried well-formed, which the XML parser reads, and with a markup error in
-/// it, which the HTML parser recovers; the DOCTYPEs hold a `]` or a `>` that
-/// does not end them.
+/// and a `<script>` in a DOCTYPE's comment swallowed the real one. The
+/// DOCTYPEs, which hold a `]` or a `>` that does not end them, are tried
+/// well-formed, which the XML parser reads, and with a markup error, which the
+/// HTML parser recovers. The CDATA sections are tried well-formed only: the
+/// HTML parser that recovers a malformed chapter ends a script at its first
+/// `</script>`, in a CDATA section or not, and the `<meta>` is found as it
+/// reads the chapter.
 #[test]
 fn markup_written_in_cdata_or_a_doctype_does_not_decide_the_encoding() {
     let head = [
@@ -473,22 +476,84 @@ fn markup_written_in_cdata_or_a_doctype_does_not_decide_the_encoding() {
     }
 }
 
+/// A `<![CDATA[` in a script, a stylesheet or a quoted attribute value is text
+/// there, to the HTML parser that recovers the chapter as to a browser, and
+/// starts no section for a later `]]>` to end. Taken for one, the section ran
+/// from there to the end of a real one further on, the `<meta>` between them
+/// was not read, and a windows-1251 chapter came out in Latin letters. A real
+/// section in the chapter's text is still text, `<meta>` and all.
+#[test]
+fn a_cdata_marker_in_a_script_or_an_attribute_starts_no_section() {
+    let markers = [
+        r#"<script>var marker = "<![CDATA[";</script>"#,
+        r#"<style>p::before { content: "<![CDATA[" }</style>"#,
+        r#"<link rel="next" title="<![CDATA[" href="next.html"/>"#,
+    ];
+    // A real section after the `<meta>`, as an SVG caption might be, and one
+    // before it with a `<meta>` of its own.
+    let sections = [
+        ("", r#"<svg><desc><![CDATA[Caption]]></desc></svg>"#),
+        (r#"<![CDATA[<meta charset="iso-8859-1">]]>"#, ""),
+    ];
+    for marker in markers {
+        for (before, after) in sections {
+            let chapter = format!(
+                r#"<html><head>{marker}{before}<meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p>{after}</body></html>"#
+            );
+            let output = read(&encoded(WINDOWS_1251, &chapter));
+            assert!(
+                output.contains(RUSSIAN),
+                "{marker}{before}…{after}: {output}"
+            );
+        }
+    }
+}
+
+/// Only a `<meta>`'s own `charset`, `http-equiv` and `content` say anything,
+/// not attributes of another vocabulary with the same local names. Read by
+/// local name alone, an `x:charset` stood in for the real `charset`, and a
+/// windows-1251 chapter came out in Latin letters.
+#[test]
+fn a_meta_attribute_in_another_namespace_says_nothing() {
+    let metas = [
+        r#"<meta charset="windows-1251" x:charset="iso-8859-1"/>"#,
+        r#"<meta x:charset="iso-8859-1"/><meta charset="windows-1251"/>"#,
+        r#"<meta http-equiv="Content-Type" content="text/html; charset=windows-1251" x:content="text/html; charset=iso-8859-1"/>"#,
+        r#"<meta x:http-equiv="Content-Type" content="text/html; charset=iso-8859-1"/><meta charset="windows-1251"/>"#,
+    ];
+    for meta in metas {
+        for markup_error in ["", "<br>"] {
+            let chapter = format!(
+                r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:x="urn:example"><head>{meta}<title>Title</title></head><body><p>{RUSSIAN}</p>{markup_error}</body></html>"#
+            );
+            let output = read(&encoded(WINDOWS_1251, &chapter));
+            assert!(output.contains(RUSSIAN), "{meta}{markup_error}: {output}");
+        }
+    }
+}
+
 /// Finding the `<meta>` reads each byte before it once, however many tags,
-/// comments and scripts stand there.
+/// comments and scripts stand there, and a CDATA section that never ends is
+/// looked for to its end once.
 #[test]
 fn finding_a_meta_charset_reads_the_chapter_once() {
-    let chapter = format!(
-        r#"<html><head>{}<meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p></body></html>"#,
-        r#"<!--x--><i title="a" lang=b></i><script>"</a>"</script>"#.repeat(20_000)
-    );
-    let bytes = encoded(WINDOWS_1251, &chapter);
+    let chapters = [
+        format!(
+            r#"<html><head>{}<meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p></body></html>"#,
+            r#"<!--x--><i title="a" lang=b></i><script>"</a>"</script>"#.repeat(20_000)
+        ),
+        format!(
+            r#"<html><head><meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p><p>{}</p></body></html>"#,
+            "<![CDATA[x ".repeat(100_000)
+        ),
+    ];
+    for chapter in chapters {
+        let bytes = encoded(WINDOWS_1251, &chapter);
 
-    let output = common::finishes_within(std::time::Duration::from_secs(20), move || read(&bytes));
-    assert!(
-        output.contains(RUSSIAN),
-        "{}",
-        &output[output.len() - 200..]
-    );
+        let output =
+            common::finishes_within(std::time::Duration::from_secs(20), move || read(&bytes));
+        assert!(output.contains(RUSSIAN), "{}", &output[..400]);
+    }
 }
 
 // Every pass that reads a chapter shares the repair step's parse, so each must

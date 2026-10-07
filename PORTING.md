@@ -280,12 +280,16 @@ by parsing the chapter as it will be parsed once it is decoded: strictly if
 it is well-formed, by the HTML parser if not. Its markup is ASCII in any
 encoding it can name, so its bytes read as windows-1252 give the parser the
 same markup, and only what the parser takes for a `<meta>` counts, whatever
-a script, a CDATA section, a comment or a DOCTYPE holds. A `content` names a
-charset only for an `http-equiv="Content-Type"`. A pattern over the text
-found `<meta>`s in comments and in other `<meta>`s' descriptions, and
-scanners after it took a script's `<!--` for a comment, a `</script>` in a
-CDATA section for the script's end, and a `>` in a DOCTYPE's comment or
-entity value for the DOCTYPE's.
+a script, a CDATA section, a comment or a DOCTYPE holds. Only a CDATA section
+in the chapter's text is kept from the HTML parser, which does not read it as
+the text XHTML takes it for; a `<![CDATA[` in a script or an attribute value
+is text to both. Only the `<meta>`'s own attributes count, not another
+vocabulary's with the same names, and a `content` names a charset only for an
+`http-equiv="Content-Type"`. A pattern over the text found `<meta>`s in
+comments and in other `<meta>`s' descriptions, and scanners after it took a
+script's `<!--` for a comment, a `</script>` in a CDATA section for the
+script's end, and a `>` in a DOCTYPE's comment or entity value for the
+DOCTYPE's.
 
 Only real declarations are renamed UTF-8, too: the XML declaration where it
 opens the chapter, and a `<meta>` element's `charset`, or the charset in an

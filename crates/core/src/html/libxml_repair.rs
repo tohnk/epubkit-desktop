@@ -72,10 +72,6 @@ static ENTITY_DECLARED: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>"#).unwrap()
 });
 
-/// A CDATA section that ends.
-static CDATA_SECTIONS: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?s)<!\[CDATA\[.*?\]\]>").unwrap());
-
 /// What a chapter's source has besides its text, for [`kept_the_text`].
 static COMMENTS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
@@ -758,6 +754,39 @@ fn fill_entities(
     true
 }
 
+/// Whether `text` starts with a start or end tag: a `<` or `</`, then a letter.
+fn opens_tag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let name = if bytes.get(1) == Some(&b'/') { 2 } else { 1 };
+    bytes.first() == Some(&b'<') && bytes.get(name).is_some_and(u8::is_ascii_alphabetic)
+}
+
+/// How long the tag `text` starts with is: to its `>`, one in a quoted
+/// attribute value aside, or to the end if it never ends. A quote starts a
+/// value only after an `=`, as HTML reads a tag.
+fn tag_length(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut after_equals = false;
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'>' => return at + 1,
+            b'=' => after_equals = true,
+            quote @ (b'"' | b'\'') if after_equals => {
+                match bytes[at + 1..].iter().position(|&byte| byte == quote) {
+                    Some(length) => at += length + 1,
+                    None => return bytes.len(),
+                }
+                after_equals = false;
+            }
+            byte if byte.is_ascii_whitespace() => {}
+            _ => after_equals = false,
+        }
+        at += 1;
+    }
+    bytes.len()
+}
+
 /// `text` with every control character XML forbids, NUL among them, made a
 /// space, and the two noncharacters it forbids made U+FFFD. libxml2 2.9 lost
 /// everything after a NUL, and dropped other controls from between words or
@@ -963,6 +992,92 @@ fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> +
         .chain(std::iter::once_with(|| meta_charset(input)).flatten())
 }
 
+/// `text` with each CDATA section in the chapter's text made a space: as XHTML
+/// reads one, text, whatever `<meta>` it holds. libxml2's HTML parser reads
+/// one otherwise, and each release its own way, 2.9 taking the markup in it
+/// for markup, and 2.14 the markup after its first `>`. A `<![CDATA[` in a
+/// script, a stylesheet or a quoted attribute value is left as it is: both
+/// read it as text there, as browsers do, so it starts no section for a
+/// later `]]>` to end. Nor does one that never ends.
+fn without_cdata_in_text(text: &str) -> Cow<'_, str> {
+    let mut sections = Vec::new();
+    // No `]]>` after one place means none after any later one either.
+    let mut endless = false;
+    let mut at = 0;
+    while let Some(offset) = text[at..].find('<') {
+        let from = at + offset;
+        let rest = &text[from..];
+        at = from + 1;
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            at = comment
+                .find("-->")
+                .map_or(text.len(), |end| from + 4 + end + 3);
+        } else if let Some(section) = rest.strip_prefix("<![CDATA[") {
+            if !endless {
+                match section.find("]]>") {
+                    Some(end) => {
+                        at = from + 9 + end + 3;
+                        sections.push(from..at);
+                    }
+                    None => endless = true,
+                }
+            }
+        } else if rest.starts_with("<!") || rest.starts_with("<?") {
+            at = rest.find('>').map_or(text.len(), |end| from + end + 1);
+        } else if opens_tag(rest) {
+            let tag = &rest[..tag_length(rest)];
+            at = from + tag.len();
+            // A script's or a stylesheet's text runs to its end tag, unless
+            // the tag closes where it opens.
+            let name = &tag[1..];
+            let name = &name[..name
+                .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+                .unwrap_or(name.len())];
+            if ["script", "style"]
+                .iter()
+                .any(|raw| name.eq_ignore_ascii_case(raw))
+                && !tag.ends_with("/>")
+            {
+                at = raw_text_end(text, at, name);
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut masked = String::with_capacity(text.len());
+    let mut kept = 0;
+    for section in sections {
+        masked.push_str(&text[kept..section.start]);
+        masked.push(' ');
+        kept = section.end;
+    }
+    masked.push_str(&text[kept..]);
+    Cow::Owned(masked)
+}
+
+/// Where the text of the raw text element `name` that starts at `from` ends:
+/// at its end tag, as HTML reads it, or at the end of `text`.
+fn raw_text_end(text: &str, mut from: usize, name: &str) -> usize {
+    while let Some(offset) = text[from..].find("</") {
+        let at = from + offset;
+        let after = &text[at + 2..];
+        if after
+            .get(..name.len())
+            .is_some_and(|written| written.eq_ignore_ascii_case(name))
+            && after[name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_ascii_whitespace() || c == '/' || c == '>')
+        {
+            return at;
+        }
+        from = at + 2;
+    }
+    text.len()
+}
+
 /// The encoding the first `<meta>` of a chapter that names one names: its
 /// `charset`, or the charset in an `http-equiv="Content-Type"`'s `content`.
 ///
@@ -974,16 +1089,18 @@ fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> +
 /// or a DOCTYPE holds. Looked for in the text, a `<meta>` was found in each of
 /// those in turn, or hidden by them.
 ///
-/// A CDATA section is the chapter's text, as XHTML writes it, however the
-/// HTML parser reads one: libxml2 2.9's reads markup in it. So the HTML parser
-/// is not given those.
+/// A CDATA section in the chapter's text is text, as XHTML writes it, however
+/// the HTML parser reads one, so the HTML parser is not given those
+/// ([`without_cdata_in_text`]). And only a `<meta>`'s own attributes say
+/// anything, not another vocabulary's with the same local name.
 fn meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
     let text = WINDOWS_1252.decode_without_bom_handling(bytes).0;
     let text = declare_utf8(without_junk_before_root(text));
     let doc = Parser::default()
         .parse_string_with_options(text.as_bytes(), hardened_options(false))
         .or_else(|_| {
-            let text = CDATA_SECTIONS.replace_all(&text, "");
+            let filled = without_internal_subset(&text);
+            let text = without_cdata_in_text(&filled);
             let (bytes, options) = prepare_for_recovery(text.as_bytes());
             Parser::default_html().parse_string_with_options(&bytes, options)
         })
@@ -996,7 +1113,11 @@ fn meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
     )
     .ok()?;
     metas.iter().find_map(|meta| {
-        let attributes = meta.get_attributes();
+        let attributes: HashMap<String, String> = meta
+            .get_attributes_ns()
+            .into_iter()
+            .filter_map(|((name, namespace), value)| namespace.is_none().then_some((name, value)))
+            .collect();
         let attribute = |name: &str| {
             attributes.get(name).or_else(|| {
                 attributes
