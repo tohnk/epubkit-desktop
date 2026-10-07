@@ -439,3 +439,22 @@ fn svg_and_mathml_names_keep_their_case_through_recovery() {
     }
     assert_well_formed(&out);
 }
+
+/// Names put back in their case stay where they were, so a recovered chapter
+/// comes out the same every time. They were taken out and added again, in
+/// whatever order a hash map gave them.
+#[test]
+fn restoring_case_keeps_the_order_of_attributes() {
+    let chapter = br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>x<br></p>
+<svg xmlns="http://www.w3.org/2000/svg" viewbox="0 0 100 50" width="100%" preserveaspectratio="xMidYMid meet" textlength="1"><rect width="1" height="1"/></svg>
+</body></html>"#;
+
+    for _ in 0..20 {
+        let (out, recovered) = repair(chapter);
+        assert!(recovered);
+        assert!(
+            out.contains(r#"viewBox="0 0 100 50" width="100%" preserveAspectRatio="xMidYMid meet" textLength="1""#),
+            "{out}"
+        );
+    }
+}

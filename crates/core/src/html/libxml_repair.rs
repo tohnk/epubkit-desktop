@@ -280,15 +280,16 @@ fn restore_case(doc: &Document) -> Result<()> {
             {
                 element.set_name(proper).ok();
             }
-            for (name, value) in element.get_attributes() {
-                let Some(proper) = attributes
+            // Renamed where they stand, so they keep their order, and the
+            // chapter comes out the same every time.
+            for mut attribute in xml::find_nodes_under(doc, &element, "@*")? {
+                let name = attribute.get_name();
+                if let Some(proper) = attributes
                     .iter()
                     .find(|proper| proper.to_ascii_lowercase() == name)
-                else {
-                    continue;
-                };
-                element.remove_attribute(&name).ok();
-                element.set_attribute(proper, &value).ok();
+                {
+                    attribute.set_name(proper).ok();
+                }
             }
         }
     }
