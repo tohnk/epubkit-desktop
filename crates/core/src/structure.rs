@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::ops::Range;
 
 use cssparser::{ParseError, Parser as CssParser, ParserInput, Token};
-use libxml::tree::{Document, Node, NodeType};
+use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::html;
@@ -19,6 +19,7 @@ use crate::{Error, Result};
 pub const NS_OPF: &str = "http://www.idpf.org/2007/opf";
 pub const NS_NCX: &str = "http://www.daisy.org/z3986/2005/ncx/";
 pub const NS_XLINK: &str = "http://www.w3.org/1999/xlink";
+const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
 
 const NCX_MEDIA_TYPE: &str = "application/x-dtbncx+xml";
 
@@ -196,6 +197,9 @@ pub fn resolve_href(root: &Path, base: &Path, href: &str) -> Option<PathBuf> {
 /// left out.
 pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result<ContentFiles> {
     let mut files = ContentFiles::default();
+    // One file listed under two spellings is still one file, to be processed
+    // once.
+    let mut seen = HashSet::new();
 
     for item in manifest_items(doc)? {
         let href = item.decoded_href();
@@ -205,6 +209,9 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
         let Some(path) = resolve_href(root, opf_dir, &href) else {
             continue;
         };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
         let media_type = item.media_type.to_ascii_lowercase();
 
         match media_type.as_str() {
@@ -248,7 +255,9 @@ pub fn build_rename_map(processed: &BTreeMap<String, String>) -> BTreeMap<String
 /// entries changed.
 ///
 /// An entry is matched by the file its href leads to, however it is spelled,
-/// and gets the new file's path as the rename map writes it.
+/// and gets the new file's path as the rename map writes it. One whose file
+/// is missing is left as it is: it named something other than the renamed
+/// file, and re-pointing it by filename made two entries share one file.
 pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
     if renames.is_empty() {
         return Ok(0);
@@ -262,7 +271,7 @@ pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
     let mut updated = 0;
     for mut node in nodes {
         let href = node.get_attribute("href").unwrap_or_default();
-        let Some(new_path) = renames.new_path(renames.opf_dir, &decode(&href)) else {
+        let Some(new_path) = renames.renamed(renames.opf_dir, &decode(&href)) else {
             continue;
         };
 
@@ -608,20 +617,35 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         image.remove_attribute("width").ok();
         image.remove_attribute("height").ok();
 
-        // Each further page is shown the way the first is: same class, style
-        // and alt text, but no id, which must stay unique.
-        let attributes = image.get_attributes_ns();
+        // Each further page is shown the way the first is: its attributes,
+        // in the order they come, but no id, plain or `xml:id`, which must
+        // stay unique. A prefix the image declares for itself is out of the
+        // copy's scope, and is declared again on it.
+        let attributes = xml::find_nodes_under(&content.doc, &image, "@*")?;
         let mut previous = image.clone();
         for page in &pages[1..] {
             let Ok(mut copy) = parent.new_child(image.get_namespace(), "img") else {
                 continue;
             };
-            for ((name, namespace), value) in &attributes {
-                match namespace {
-                    Some(namespace) => copy.set_attribute_ns(name, value, namespace).ok(),
-                    None if name != "id" => copy.set_attribute(name, value).ok(),
-                    None => None,
-                };
+            for attribute in &attributes {
+                let name = attribute.get_name();
+                let value = attribute.get_content();
+                match attribute.get_namespace() {
+                    None if name == "id" => {}
+                    None => {
+                        copy.set_attribute(&name, &value).ok();
+                    }
+                    Some(namespace) if namespace.get_href() == NS_XML => {
+                        if name != "id" {
+                            copy.set_attribute_ns(&name, &value, &namespace).ok();
+                        }
+                    }
+                    Some(namespace) => {
+                        if let Some(namespace) = namespace_on(&content.doc, &mut copy, &namespace) {
+                            copy.set_attribute_ns(&name, &value, &namespace).ok();
+                        }
+                    }
+                }
             }
             copy.set_attribute("src", &reference.with_name(page)).ok();
             previous.add_next_sibling(&mut copy).ok();
@@ -797,6 +821,16 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
     drawn_as_is.then_some(image)
 }
 
+/// `namespace` as `node` can use it for an attribute: a prefixed declaration of
+/// it in scope there, or else a new one on `node`, with the same prefix.
+fn namespace_on(doc: &Document, node: &mut Node, namespace: &Namespace) -> Option<Namespace> {
+    let href = namespace.get_href();
+    node.get_namespaces(doc)
+        .into_iter()
+        .find(|in_scope| in_scope.get_href() == href && !in_scope.get_prefix().is_empty())
+        .or_else(|| Namespace::new(&namespace.get_prefix(), &href, node).ok())
+}
+
 /// The xlink namespace as declared in scope at `node`, if it is.
 fn xlink_namespace(doc: &Document, node: &Node) -> Option<libxml::tree::Namespace> {
     node.get_namespaces(doc)
@@ -922,7 +956,16 @@ impl<'a> Renames<'a> {
     }
 
     /// The new path, relative to the OPF, of the file `path` leads to from
-    /// `base`, if that file was renamed.
+    /// `base`, if that file was renamed. Only a path that leads to it counts.
+    fn renamed(&self, base: &Path, path: &str) -> Option<&'a String> {
+        self.by_source
+            .get(&resolve_href(self.root, base, path)?)
+            .copied()
+    }
+
+    /// The new path, relative to the OPF, of the file `path` leads to from
+    /// `base`, if that file was renamed, or failing that, of the one renamed
+    /// file with its filename.
     fn new_path(&self, base: &Path, path: &str) -> Option<&'a String> {
         if let Some(target) = resolve_href(self.root, base, path) {
             if let Some(new) = self.by_source.get(&target) {

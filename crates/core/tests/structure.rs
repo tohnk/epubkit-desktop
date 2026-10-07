@@ -1126,6 +1126,106 @@ fn an_illustration_around_a_split_image_is_kept_and_followed_by_its_pages() {
     xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
 }
 
+/// Each further page is a copy of the first page's image. A prefix the image
+/// declared for itself has to be declared on each copy too, or the chapter
+/// stops being namespace-well-formed. An `xml:id` is an id like any other and
+/// stays with the first. And the copy is the same every run: its attributes
+/// come in the order the original has them.
+#[test]
+fn copied_page_images_declare_what_they_use_and_come_out_the_same_every_time() {
+    let chapter_text = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p><img xmlns:epub="http://www.idpf.org/2007/ops" xml:id="x1" id="spread" class="plate" epub:type="illustration" src="../images/spread_part1.jpg" alt="Both pages" title="A spread"/></p>
+</body></html>
+"#;
+
+    let mut outputs = Vec::new();
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let chapter = put(dir.path(), "text/chapter.xhtml", chapter_text);
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread()),
+        )
+        .unwrap();
+        outputs.push(fs::read_to_string(&chapter).unwrap());
+    }
+    let out = &outputs[0];
+    assert!(outputs.iter().all(|other| other == out), "{outputs:#?}");
+
+    assert_eq!(out.matches("xml:id=").count(), 1, "{out}");
+    let doc = xml::parse_strict(out.as_bytes()).unwrap();
+    let images = xml::find_nodes(&doc, "//*[local-name()='img']").unwrap();
+    assert_eq!(images.len(), 2, "{out}");
+    assert_eq!(
+        images[1].get_attribute_ns("type", "http://www.idpf.org/2007/ops"),
+        Some("illustration".to_string()),
+        "the copy's epub:type is not in the epub namespace:\n{out}"
+    );
+    let copy = &out[out.rfind("<img").unwrap()..];
+    let copy = &copy[..copy.find("/>").unwrap()];
+    let order: Vec<usize> = ["class=", "epub:type=", "src=", "alt=", "title="]
+        .iter()
+        .map(|name| {
+            copy.find(name)
+                .unwrap_or_else(|| panic!("{name} missing: {copy}"))
+        })
+        .collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{copy}");
+}
+
+/// A chapter the manifest lists twice, under two spellings, is one file, and
+/// is processed once.
+#[test]
+fn a_file_listed_twice_is_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="a" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="b" href="Text/./ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c" href="Images/a.png" media-type="image/png"/>
+    <item id="d" href="Text/../Images/a.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="a"/></spine>
+</package>
+"#);
+
+    let content = find_content_files(dir.path(), dir.path(), &doc).unwrap();
+    assert_eq!(content.xhtml.len(), 1, "{:?}", content.xhtml);
+    assert_eq!(content.images.len(), 1, "{:?}", content.images);
+}
+
+/// The manifest follows an image by the file its href names. One whose file
+/// is missing named something else, and re-pointing it at another folder's
+/// image of the same name made two items share one file.
+#[test]
+fn a_manifest_item_for_a_missing_file_is_not_repointed() {
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="Images/cover.png" media-type="image/png"/>
+    <item id="thumb" href="Thumbs/cover.png" media-type="image/png"/>
+  </manifest>
+  <spine/>
+</package>
+"#);
+    let map = rename_map(&[("Images/cover.png", "Images/cover.jpg")]);
+
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
+    let hrefs: Vec<String> = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.href)
+        .collect();
+    assert_eq!(hrefs, ["Images/cover.jpg", "Thumbs/cover.png"]);
+}
+
 /// A rotated image is one page, but no longer the shape its size describes.
 #[test]
 fn a_rotated_image_loses_the_size_it_no_longer_has() {
