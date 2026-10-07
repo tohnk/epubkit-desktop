@@ -349,9 +349,13 @@ order, as a reading engine reads them. Removing a font or rewriting a url
 edits them as one, then puts each piece back in the section it came from,
 so CDATA stays CDATA. Edited one section at a time, a rule split between two
 was cut in half, and the common `/*<![CDATA[*/ … /*]]>*/` wrapping hid every
-rule inside it. A `<style>` with an entity reference in it is left as it is:
-what the entity stands for is part of its CSS, but cannot be edited where it
-is written, and `url(&cdn;cover.png)` read without it is a different url.
+rule inside it. What an entity reference stands for is part of the CSS too,
+so `url(&cdn;cover.png)` is read as the url it is, not as `url(cover.png)`.
+An entity cannot be edited where it is written, so one an edit runs into is
+written out as what it stands for, and edited with the text around it; one
+beside an edit stays as written. An entity that stands for nothing that can
+be read, under a doctype that is never loaded, stops the edits that run into
+it.
 
 ### Empty paragraphs are collapsed among siblings
 

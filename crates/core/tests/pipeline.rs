@@ -720,6 +720,74 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// Every image a chapter's `<style>` names is still there after the images are
+/// converted, whatever entities the style holds: one beside a url, one in it,
+/// or one standing for another site, whose url is that site's.
+#[test]
+fn a_style_with_entities_in_it_names_only_images_that_are_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:entities</dc:identifier><dc:title>Entities</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover" href="cover.png" media-type="image/png"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/"><!ENTITY cdn "https://cdn.example/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.b { background: url(&dir;plate.png) }</style><style type="text/css">.c { background: url(&cdn;cover.png) }</style></head>
+<body><p class="a b c">Body</p><p><img src="cover.png" alt=""/></p></body></html>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter.as_bytes()),
+            ("OEBPS/cover.png", &solid(image::ImageFormat::Png, 0)),
+            (
+                "OEBPS/images/plate.png",
+                &solid(image::ImageFormat::Png, 90),
+            ),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let options = ProcessingOptions {
+        text_cleanup: false,
+        ..ProcessingOptions::default()
+    };
+    process_epub(&input, &output, &options, |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    assert!(
+        chapter.contains(".a { font-family: &family;; background: url(cover.jpg) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".b { background: url(images/plate.jpg) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".c { background: url(&cdn;cover.png) }"),
+        "{chapter}"
+    );
+    for image in ["OEBPS/cover.jpg", "OEBPS/images/plate.jpg"] {
+        assert!(work.path().join(image).is_file(), "{image} is missing");
+    }
+    for gone in ["OEBPS/cover.png", "OEBPS/images/plate.png"] {
+        assert!(!work.path().join(gone).exists(), "{gone} is still there");
+    }
+}
+
 /// An SVG document in the book names its images as a chapter does, and has to
 /// follow them when they are converted. It is an SVG document by its media
 /// type, whatever its name.

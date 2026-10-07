@@ -230,27 +230,90 @@ pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>,
 /// so. What an edit replaces is taken out of whichever of them it spans, and
 /// what replaces it goes into the one it starts in, so that CDATA stays CDATA.
 ///
-/// A `<style>` with an entity reference in it is left as it is. What the
-/// entity stands for is part of the CSS, but cannot be edited where it is
-/// written, and read as if it were not there, the CSS around it is misread:
-/// `url(&cdn;cover.png)` is not `url(cover.png)`.
+/// What an entity reference stands for is part of the CSS too, but cannot be
+/// edited where it is written: `url(&cdn;cover.png)` is not `url(cover.png)`.
+/// An edit beside one leaves it as it is. When an edit runs into one, the
+/// style's entities are written out as what they stand for, into the text
+/// before them, and edited with it. One that stands for nothing that can be
+/// read, under a doctype that is never loaded, say, stays where it is, and
+/// nothing is written out past it; it stops the edits that run into it, since
+/// what it hides could change where they end.
 pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Edit>) -> usize {
-    let mut parts: Vec<(Node, Range<usize>)> = Vec::new();
+    let mut parts: Vec<StylePart> = Vec::new();
     let mut css = String::new();
-    for child in style.get_child_nodes() {
-        match child.get_type() {
-            Some(NodeType::TextNode | NodeType::CDataSectionNode) => {
-                let start = css.len();
-                css.push_str(&child.get_content());
-                parts.push((child, start..css.len()));
+    for node in style.get_child_nodes() {
+        let entity = match node.get_type() {
+            Some(NodeType::TextNode | NodeType::CDataSectionNode) => false,
+            Some(NodeType::EntityRefNode) => true,
+            _ => continue,
+        };
+        let start = css.len();
+        css.push_str(&node.get_content());
+        parts.push(StylePart {
+            node,
+            range: start..css.len(),
+            entity,
+        });
+    }
+
+    if parts.iter().all(|part| part.entity) {
+        return 0;
+    }
+    let mut edits = edit(&css);
+
+    // Entities are written out only when an edit runs into one that can be.
+    let readable: Vec<&Range<usize>> = parts
+        .iter()
+        .filter(|part| part.entity && !part.range.is_empty())
+        .map(|part| &part.range)
+        .collect();
+    let write_out = run_into(&readable, &edits).contains(&true);
+
+    // Where each part's text goes as it is edited: a text or CDATA part's into
+    // itself. A readable entity's, when entities are written out, goes into
+    // the text before it, or after it if it comes first, but never past an
+    // entity that cannot be read, which keeps its place; one with no text to
+    // go into on its side of those stays as it is too.
+    let mut slots: Vec<Option<usize>> = parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| (!part.entity).then_some(index))
+        .collect();
+    if write_out {
+        let mut start = 0;
+        while start < parts.len() {
+            let end = parts[start..]
+                .iter()
+                .position(|part| part.entity && part.range.is_empty())
+                .map_or(parts.len(), |length| start + length);
+            if let Some(first) = (start..end).find(|&index| !parts[index].entity) {
+                let mut owner = first;
+                for index in start..end {
+                    if parts[index].entity {
+                        slots[index] = Some(owner);
+                    } else {
+                        owner = index;
+                    }
+                }
             }
-            Some(NodeType::EntityRefNode) => return 0,
-            _ => {}
+            start = end + 1;
         }
     }
 
-    let edits = edit(&css);
-    if edits.is_empty() || parts.is_empty() {
+    // An edit that runs into an entity that stays is not made.
+    let staying: Vec<&Range<usize>> = parts
+        .iter()
+        .zip(&slots)
+        .filter(|(part, slot)| part.entity && slot.is_none())
+        .map(|(part, _)| &part.range)
+        .collect();
+    let blocked = run_into(&staying, &edits);
+    edits = edits
+        .into_iter()
+        .zip(blocked)
+        .filter_map(|(edit, blocked)| (!blocked).then_some(edit))
+        .collect();
+    if edits.is_empty() {
         return 0;
     }
 
@@ -258,40 +321,89 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
     // `css` is in the last. The parts are in order, so this is a search.
     let part_at = |at: usize| {
         parts
-            .partition_point(|(_, range)| range.end <= at)
+            .partition_point(|part| part.range.end <= at)
             .min(parts.len() - 1)
     };
     let mut contents = vec![String::new(); parts.len()];
     let keep = |contents: &mut [String], mut from: usize, to: usize| {
         while from < to {
             let part = part_at(from);
-            let until = to.min(parts[part].1.end);
-            contents[part].push_str(&css[from..until]);
+            let until = to.min(parts[part].range.end);
+            if let Some(slot) = slots[part] {
+                contents[slot].push_str(&css[from..until]);
+            }
             from = until;
         }
     };
 
+    let mut made = 0;
     let mut kept_from = 0;
     for (range, replacement) in &edits {
+        // Never an entity that stays: an edit that ran into one is gone.
+        let Some(slot) = slots[part_at(range.start)] else {
+            continue;
+        };
         keep(&mut contents, kept_from, range.start);
-        contents[part_at(range.start)].push_str(replacement);
+        contents[slot].push_str(replacement);
         kept_from = range.end;
+        made += 1;
     }
     keep(&mut contents, kept_from, css.len());
 
-    for ((mut part, range), content) in parts.iter().cloned().zip(contents) {
-        if content == css[range] {
-            continue;
-        }
-        // Text and CDATA take what they are given as it reads.
-        if content.is_empty() {
-            part.unlink();
-        } else {
-            part.set_content(&content).ok();
+    for ((part, slot), content) in parts.iter().zip(&slots).zip(contents) {
+        let mut node = part.node.clone();
+        if part.entity {
+            // Written out into the text it went to.
+            if slot.is_some() {
+                node.unlink();
+            }
+        } else if content != css[part.range.clone()] {
+            // Text and CDATA take what they are given as it reads.
+            if content.is_empty() {
+                node.unlink();
+            } else {
+                node.set_content(&content).ok();
+            }
         }
     }
 
-    edits.len()
+    made
+}
+
+/// One piece of a `<style>`'s CSS: a text or CDATA child, or an entity
+/// reference, and where what it holds or stands for is in the CSS.
+struct StylePart {
+    node: Node,
+    range: Range<usize>,
+    entity: bool,
+}
+
+/// Whether each of `edits` runs into one of `entities`: takes in some of what
+/// one stands for, or, for one that stands for nothing that can be read, has
+/// it inside. Both are in order, so each entity is passed once.
+fn run_into(entities: &[&Range<usize>], edits: &[Edit]) -> Vec<bool> {
+    let wholly_before = |entity: &Range<usize>, edit: &Range<usize>| {
+        if entity.is_empty() {
+            entity.start <= edit.start
+        } else {
+            entity.end <= edit.start
+        }
+    };
+
+    let mut next = 0;
+    edits
+        .iter()
+        .map(|(edit, _)| {
+            while next < entities.len() && wholly_before(entities[next], edit) {
+                next += 1;
+            }
+            // The first entity that is not wholly before the edit is in it,
+            // if it starts before the edit ends.
+            entities
+                .get(next)
+                .is_some_and(|entity| entity.start < edit.end)
+        })
+        .collect()
 }
 
 /// `text` with `edits`, which are in order and do not overlap, made.

@@ -526,6 +526,67 @@ fn a_url_with_an_entity_in_it_is_left_as_it_is() {
     assert!(out.contains(r#"<img src="cover.jpg""#), "{out}");
 }
 
+/// A url beside an entity follows its image, and the entity stays as written.
+/// One with an entity in it follows its image too, the entity written out as
+/// what it stands for. Leaving a `<style>` with an entity in it alone left its
+/// urls naming images that were gone.
+#[test]
+fn urls_beside_and_through_entities_follow_their_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.c { background: url(&dir;plate.png) }</style></head>
+<body><p class="a c"><img src="cover.png" alt=""/></p></body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("cover.png", "cover.jpg"),
+        ("images/plate.png", "images/plate.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".a { font-family: &family;; background: url(cover.jpg) }"),
+        "{out}"
+    );
+    assert!(
+        out.contains(".c { background: url(images/plate.jpg) }"),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// An entity that stands for nothing this can read, under a doctype that is
+/// never loaded, stays where it is. A url with a readable entity in it still
+/// follows its image, the entity written out beside the one that stays.
+#[test]
+fn a_readable_entity_is_written_out_beside_one_that_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd" [<!ENTITY dir "images/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">p:before { content: "&mdash;" } .c { background: url(&dir;plate.png) }</style></head>
+<body><p class="c">x</p></body></html>
+"#,
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(r#"p:before { content: "&mdash;" } .c { background: url(images/plate.jpg) }"#),
+        "{out}"
+    );
+}
+
 /// A srcset is split as the HTML standard splits it: a URL runs to the first
 /// blank, commas and all, and only a comma after it, outside parentheses,
 /// ends a candidate. Split at every comma, a remote image whose URL held one
