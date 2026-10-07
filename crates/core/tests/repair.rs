@@ -368,3 +368,46 @@ fn recovery_never_hands_back_part_of_a_chapter() {
         assert!(out.contains("THE END"), "truncated");
     }
 }
+
+/// What the HTML parser recovers is not always legal XML: a comment may hold
+/// `--`, and under libxml2 2.14 a bare `<` in prose opens an element whose
+/// "attributes" are the words after it. Written out as it stood, the chapter
+/// was malformed again, so every later pass recovered it anew and each run
+/// counted it as repaired once more.
+#[test]
+fn recovered_output_is_legal_xml_whatever_was_recovered() {
+    let (out, _) = repair(
+        br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<!-- ======== Chapter 1 -- start ======== -->
+<p>if i<n && ok, go on.</p><p>Next.<br></p><!-- trailing dash- -->
+</body></html>"#,
+    );
+
+    assert!(out.contains("Chapter 1"), "{out}");
+    assert!(out.contains("Next."), "{out}");
+    assert_well_formed(&out);
+}
+
+/// The HTML parser keeps a stylesheet's text as it stands, the author's own
+/// `<![CDATA[` included, and the XML writer then wrapped all of it in a
+/// CDATA section of its own. The CSS began with `<![CDATA[`, and its first
+/// rule was lost to it.
+#[test]
+fn a_stylesheet_in_cdata_survives_recovery() {
+    let (out, recovered) = repair(
+        br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css"><![CDATA[
+p.first { text-indent: 0 }
+h1 { margin: 0 }
+]]></style></head><body><p class="first">One & two.</p></body></html>"#,
+    );
+    assert!(recovered);
+
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes()).unwrap();
+    let style = epubkit_core::xml::find_first(&doc, "//*[local-name()='style']")
+        .unwrap()
+        .unwrap()
+        .get_content();
+    assert!(!style.contains("CDATA"), "{style:?}\n{out}");
+    assert!(style.trim_start().starts_with("p.first"), "{style:?}");
+    assert!(style.contains("h1 { margin: 0 }"), "{style:?}");
+}

@@ -209,6 +209,21 @@ whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
 
+### Recovered chapters come out as legal XML
+
+HTML allows what XML does not, and libxml2's HTML parser keeps it: `--`
+inside a comment, the words after a bare `<` as attribute names (as 2.14
+reads one), characters XML forbids written as references. Serialized as XML
+anyway, such a chapter was malformed again, so each later pass recovered it
+afresh and every run counted it as repaired. The parser also keeps a
+stylesheet's text as it stands, the author's `<![CDATA[` included, which the
+XML writer then wrapped in a CDATA section of its own; the CSS began with
+`<![CDATA[`, and its first rule was lost to it.
+
+The port mends each of these in the recovered tree and then reads the result
+back strictly. A chapter that still does not read back is refused, which
+leaves it as it was.
+
 ### Malformed chapters are read as UTF-8
 
 The reference's recovery parser left the encoding to libxml2, which obeys a

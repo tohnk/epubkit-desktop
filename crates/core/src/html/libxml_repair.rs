@@ -44,7 +44,7 @@ use libxml::tree::{Document, NodeType, SaveOptions};
 use regex::bytes::Regex;
 
 use super::{ContentDocument, HtmlRepair, Repaired};
-use crate::xml::hardened_options;
+use crate::xml::{self, hardened_options};
 use crate::{Error, Result};
 
 const XML_DECLARATION: &str = r#"<?xml version="1.0" encoding="utf-8"?>"#;
@@ -144,6 +144,92 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
             child.unlink();
         }
     }
+}
+
+/// Make what the HTML parser recovered legal XML.
+///
+/// HTML allows what XML does not, and the parser keeps it: `--` inside a
+/// comment, attribute names like `&&` made of the words after a bare `<` (as
+/// libxml2 2.14 reads one), an XML declaration in the middle of the body,
+/// characters XML forbids written as references. And it keeps a stylesheet's
+/// or script's text as it stands, the author's own `<![CDATA[` markers
+/// included, which the XML writer would wrap in a CDATA section of its own.
+fn make_legal_xml(doc: &Document) -> Result<()> {
+    for mut comment in xml::find_nodes(doc, "//comment()")? {
+        let mut text = comment.get_content();
+        if text.contains("--") || text.ends_with('-') {
+            while text.contains("--") {
+                text = text.replace("--", "- -");
+            }
+            if text.ends_with('-') {
+                text.push(' ');
+            }
+            comment.set_content(&text).ok();
+        }
+    }
+
+    for mut instruction in xml::find_nodes(doc, "//processing-instruction()")? {
+        let name = instruction.get_name();
+        if name.eq_ignore_ascii_case("xml") || !is_xml_name(&name) {
+            instruction.unlink();
+        }
+    }
+
+    for mut element in xml::find_nodes(doc, "//*")? {
+        if !is_xml_name(&element.get_name()) {
+            element.set_name("span").ok();
+        }
+        for (name, value) in element.get_attributes() {
+            if !is_xml_name(&name) {
+                element.remove_attribute(&name).ok();
+            } else if value.contains(is_forbidden_in_xml) {
+                element
+                    .set_attribute(&name, &value.replace(is_forbidden_in_xml, " "))
+                    .ok();
+            }
+        }
+
+        if matches!(
+            element.get_name().to_ascii_lowercase().as_str(),
+            "style" | "script"
+        ) {
+            for mut text in element.get_child_nodes() {
+                let content = text.get_content();
+                let inner = content.trim();
+                if let Some(inner) = inner
+                    .strip_prefix("<![CDATA[")
+                    .and_then(|inner| inner.strip_suffix("]]>"))
+                {
+                    text.set_content(inner).ok();
+                }
+            }
+        }
+    }
+
+    for mut text in xml::find_nodes(doc, "//text()")? {
+        let content = text.get_content();
+        if content.contains(is_forbidden_in_xml) {
+            text.set_content(&content.replace(is_forbidden_in_xml, " "))
+                .ok();
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether `name` can name an element, attribute or processing instruction
+/// in XML. Simplified: anything non-ASCII is taken to be a name character.
+fn is_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | ':'))
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-' | '.'))
+}
+
+/// Characters XML forbids outright, even as references.
+fn is_forbidden_in_xml(c: char) -> bool {
+    (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{fffe}' | '\u{ffff}')
 }
 
 /// Whether `doc`, recovered from `source`, kept at least half of its text.
@@ -493,11 +579,25 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
 
     strip_html_parser_artifacts(&mut doc);
     restore_namespace(&doc);
+    make_legal_xml(&doc)?;
 
-    Ok(ContentDocument {
+    let content = ContentDocument {
         doc,
         recovered: true,
-    })
+    };
+
+    // Whatever was recovered has to read back strictly, or every later pass
+    // would recover it again. Past the strict parse's own 256 levels too:
+    // with the internal subset gone there are no entities to expand.
+    let deep = ParserOptions {
+        huge: true,
+        ..hardened_options(false)
+    };
+    Parser::default()
+        .parse_string_with_options(serialize_content(&content), deep)
+        .map_err(|e| Error::Xml(format!("recovered XHTML is not well-formed: {e}")))?;
+
+    Ok(content)
 }
 
 /// Serialize a content document back to XHTML bytes.
