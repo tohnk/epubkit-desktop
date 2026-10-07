@@ -2,7 +2,7 @@
 //! detection. Port of `epub_packager.py`.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -82,7 +82,7 @@ pub fn extract_epub(epub_path: &Path, dest_dir: &Path) -> Result<()> {
 /// 3. Everything else, deflated, in sorted order for reproducible output.
 pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
     let out = File::create(output_path).map_err(|e| Error::io(output_path, e))?;
-    let mut zip = ZipWriter::new(out);
+    let mut zip = ZipWriter::new(BufWriter::new(out));
 
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -100,9 +100,7 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
     let container_path = source_dir.join("META-INF").join("container.xml");
     if container_path.is_file() {
         zip.start_file(CONTAINER_ENTRY, deflated)?;
-        let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
-        zip.write_all(&bytes)
-            .map_err(|e| Error::io(output_path, e))?;
+        copy_into(&mut zip, &container_path, output_path)?;
     }
 
     // 3. Everything else. Collected and sorted so the same input directory
@@ -132,12 +130,18 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
 
     for (name, path) in entries {
         zip.start_file(name, deflated)?;
-        let bytes = fs::read(&path).map_err(|e| Error::io(&path, e))?;
-        zip.write_all(&bytes)
-            .map_err(|e| Error::io(output_path, e))?;
+        copy_into(&mut zip, &path, output_path)?;
     }
 
-    zip.finish()?;
+    // The buffer would flush itself when dropped, but lose any error doing so.
+    zip.finish()?.flush().map_err(|e| Error::io(output_path, e))
+}
+
+/// Copy the file at `path` into the entry `zip` has started, a piece at a
+/// time: a book's largest file need not fit in memory to be packed.
+fn copy_into(zip: &mut ZipWriter<BufWriter<File>>, path: &Path, output_path: &Path) -> Result<()> {
+    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+    io::copy(&mut file, zip).map_err(|e| Error::io(output_path, e))?;
     Ok(())
 }
 
