@@ -287,6 +287,20 @@ so an empty paragraph could pair with an unrelated one elsewhere in the tree
 and be dropped. The port groups runs among siblings, which is what
 "consecutive empty paragraphs" means.
 
+What counts as empty is narrower too. An element with an id, an `epub:type`
+or any attribute but `class` and `style` is a link target or a marker, a
+page break the page list points at say, and stays. And a paragraph holding
+an entity other than a space, `&bull;` or `&mdash;` under an XHTML 1.1
+doctype that is never loaded, has content even though it has no text as such;
+the port's libxml2 parse had been dropping scene-break ornaments.
+
+### Direction and visibility are kept
+
+The reference stripped `dir`, `hidden`, `inert` and `popover` along with the
+interaction attributes. They change what is shown and how: without `dir` an
+Arabic or Hebrew book runs left to right, and without `hidden` a navigation
+document in the spine shows its landmarks and page list. The port keeps them.
+
 ### Optimized Huffman tables are applied by rewriting, not by the encoder
 
 The reference encodes with `optimize=True`, and so does this port — but not via
