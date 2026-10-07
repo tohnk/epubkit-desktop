@@ -35,6 +35,7 @@
 //! declaration at all.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
@@ -61,6 +62,23 @@ static XML_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
 static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
 });
+
+/// A general entity a DOCTYPE's internal subset declares with a plain value:
+/// not a parameter entity, and not one fetched from elsewhere.
+static ENTITY_DECLARED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>"#).unwrap()
+});
+
+/// A reference to a named entity.
+static ENTITY_REFERENCE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"&([A-Za-z_:][\w.:-]*);").unwrap());
+
+/// How much filling in a subset's entities may grow a chapter, past which
+/// they are left as references: a few may be long, and used often, but not
+/// so much as to make a small chapter enormous.
+const MAX_ENTITY_GROWTH: usize = 1 << 20;
+
+const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
 /// How UTF-16 XML without a byte order mark begins: `<?` in two-byte units.
 const UTF16LE_START: &[u8] = b"<\0?\0";
@@ -121,6 +139,17 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
     }
 }
 
+/// Put the XHTML namespace back on a recovered `<html>` that has lost it: one
+/// the HTML parser had to imply, say, because something stood before the real
+/// one. Without it a reader that minds namespaces does not see XHTML at all.
+fn restore_namespace(doc: &Document) {
+    if let Some(mut root) = doc.get_root_element() {
+        if root.get_name().eq_ignore_ascii_case("html") && root.get_attribute("xmlns").is_none() {
+            root.set_attribute("xmlns", XHTML_NAMESPACE).ok();
+        }
+    }
+}
+
 /// Whether a comment is what libxml2 2.14 makes of an XML declaration.
 fn is_demoted_declaration(comment: &str) -> bool {
     comment
@@ -167,10 +196,135 @@ fn as_utf8(input: &[u8]) -> Cow<'_, [u8]> {
         Cow::Owned(utf8_with_stray_bytes(input))
     };
 
-    match declare_utf8(text) {
+    match without_junk_before_root(declare_utf8(text)) {
         Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
         Cow::Owned(text) => Cow::Owned(text.into_bytes()),
     }
+}
+
+/// `text` without what has no business before its root element: byte order
+/// marks, stray or garbled by a trip through windows-1252 into "ï»¿", and
+/// blanks ahead of the XML declaration. The HTML parser took any of them for
+/// body text, and opened an implied `<html><body>`, dropping the real `<html>`
+/// and `<head>` with their namespace and language.
+fn without_junk_before_root(text: Cow<'_, str>) -> Cow<'_, str> {
+    let root = root_start(&text);
+    let prolog = &text[..root];
+    let tidy = prolog
+        .replace('\u{feff}', "")
+        .replace("\u{ef}\u{bb}\u{bf}", "");
+    let tidy = tidy.trim_start();
+    if tidy.len() == prolog.len() {
+        return text;
+    }
+    Cow::Owned(format!("{tidy}{}", &text[root..]))
+}
+
+/// Where the root element starts: the first `<` that does not open a
+/// declaration, processing instruction, comment or DOCTYPE.
+fn root_start(text: &str) -> usize {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('<') {
+        let at = from + offset;
+        let rest = &text[at..];
+        let length = if rest.starts_with("<?") {
+            rest.find("?>").map(|end| end + 2)
+        } else if rest.starts_with("<!--") {
+            rest.find("-->").map(|end| end + 3)
+        } else if rest.starts_with("<!") {
+            doctype_length(rest)
+        } else {
+            return at;
+        };
+        match length {
+            Some(length) => from = at + length,
+            None => return text.len(),
+        }
+    }
+    text.len()
+}
+
+/// How long the DOCTYPE `text` starts with is, internal subset and all.
+fn doctype_length(text: &str) -> Option<usize> {
+    let close = text.find('>')?;
+    match text.find('[') {
+        Some(open) if open < close => {
+            let subset_end = open + text[open..].find(']')?;
+            Some(subset_end + text[subset_end..].find('>')? + 1)
+        }
+        _ => Some(close + 1),
+    }
+}
+
+/// `text` without its DOCTYPE, if that has an internal subset, and with the
+/// entities the subset declares filled in where they are used.
+///
+/// libxml2's HTML parser cannot read an internal subset. It stops the DOCTYPE
+/// at the subset's first `>`, and the rest of the declarations become text.
+/// Only plain values are filled in, and only so far, so a subset cannot blow a
+/// chapter up. The strict XML parse needs none of this: it reads subsets.
+fn without_internal_subset(text: &str) -> Cow<'_, str> {
+    let root = root_start(text);
+    let Some(start) = text[..root].find("<!DOCTYPE") else {
+        return Cow::Borrowed(text);
+    };
+    let Some(length) = doctype_length(&text[start..]) else {
+        return Cow::Borrowed(text);
+    };
+    let doctype = &text[start..start + length];
+    if !doctype.contains('[') {
+        return Cow::Borrowed(text);
+    }
+
+    let entities: HashMap<&str, &str> = ENTITY_DECLARED
+        .captures_iter(doctype)
+        .filter_map(|declared| {
+            let value = declared.get(2).or_else(|| declared.get(3))?;
+            Some((declared.get(1)?.as_str(), value.as_str()))
+        })
+        .collect();
+
+    let rest = &text[start + length..];
+    let mut growth = 0usize;
+    let filled = ENTITY_REFERENCE.replace_all(rest, |reference: &regex::Captures| {
+        match entities.get(&reference[1]) {
+            Some(value) if growth + value.len() <= MAX_ENTITY_GROWTH => {
+                growth += value.len();
+                (*value).to_string()
+            }
+            _ => reference[0].to_string(),
+        }
+    });
+
+    Cow::Owned(format!("{}{filled}", &text[..start]))
+}
+
+/// `text` with every control character XML forbids, NUL among them, made a
+/// space, and the two noncharacters it forbids made U+FFFD. libxml2 2.9 lost
+/// everything after a NUL, and dropped other controls from between words or
+/// wrote them raw into attributes; 2.14 shows a U+FFFD for each.
+fn without_forbidden_characters(text: &[u8]) -> Cow<'_, [u8]> {
+    let forbidden = |byte: u8| byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r');
+    let noncharacter =
+        |rest: &[u8]| rest.starts_with(b"\xEF\xBF\xBE") || rest.starts_with(b"\xEF\xBF\xBF");
+
+    if !text
+        .iter()
+        .enumerate()
+        .any(|(at, &byte)| forbidden(byte) || (byte == 0xEF && noncharacter(&text[at..])))
+    {
+        return Cow::Borrowed(text);
+    }
+
+    let mut clean = text.to_vec();
+    for at in 0..clean.len() {
+        if forbidden(clean[at]) {
+            clean[at] = b' ';
+        } else if clean[at] == 0xEF && noncharacter(&clean[at..]) {
+            clean[at + 2] = 0xBD;
+        }
+    }
+    Cow::Owned(clean)
 }
 
 /// `bytes` as UTF-8 wherever they are valid UTF-8, and as windows-1252 where
@@ -231,10 +385,16 @@ fn declare_utf8(text: Cow<'_, str>) -> Cow<'_, str> {
 /// four bytes are there to look at, so on a chapter holding nothing else it
 /// would come out as text.
 fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
+    let text = std::str::from_utf8(text).expect("decoded to UTF-8 already");
+    let text = match without_internal_subset(text) {
+        Cow::Borrowed(text) => without_forbidden_characters(text.as_bytes()),
+        Cow::Owned(text) => Cow::Owned(without_forbidden_characters(text.as_bytes()).into_owned()),
+    };
+
     let bytes = if text.is_ascii() {
-        Cow::Borrowed(text)
+        text
     } else {
-        Cow::Owned([UTF8_BOM, text].concat())
+        Cow::Owned([UTF8_BOM, &text].concat())
     };
     let options = ParserOptions {
         ignore_enc: true,
@@ -295,6 +455,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     }
 
     strip_html_parser_artifacts(&mut doc);
+    restore_namespace(&doc);
 
     Ok(ContentDocument {
         doc,

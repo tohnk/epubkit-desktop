@@ -249,3 +249,73 @@ fn an_xhtml_1_0_chapter_is_not_rewritten_as_xhtml_1_0_would_be_served() {
     assert!(!out.contains("xml:lang"), "{out}");
     assert!(out.contains("<br/>"), "{out}");
 }
+
+/// A strict re-read of what repair produced: every chapter it hands on has to
+/// be well-formed XHTML, or each later pass recovers it all over again.
+fn assert_well_formed(out: &str) {
+    epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+}
+
+/// A NUL cost libxml2 2.9 everything after it, and other control characters
+/// went missing between words or into attributes raw. They are spaces now,
+/// under every release.
+#[test]
+fn control_characters_cost_nothing_around_them() {
+    let (out, _) = repair(
+        b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>One.</p>\0<p>Two.</p>\
+          <p class=\"a\x0bb\">Line\x0bone\x0cline\x07two\x1bdone.</p><p>Last.<br></p></body></html>",
+    );
+
+    for text in ["One.", "Two.", "Line one line two done.", "Last."] {
+        assert!(out.contains(text), "{text:?} is missing:\n{out}");
+    }
+    assert_well_formed(&out);
+}
+
+/// A byte order mark that went through windows-1252 and back, "ï»¿", or a
+/// stray U+FEFF after the declaration, sits before the root element. The
+/// HTML parser took it for body text, opened an implied `<html><body>` and
+/// dropped the real `<html>` and `<head>` with their namespace and language.
+#[test]
+fn a_stray_byte_order_mark_does_not_cost_the_chapter_its_head() {
+    for start in ["\u{ef}\u{bb}\u{bf}", "\u{feff}\u{feff}", ""] {
+        for between in ["", "\u{feff}", "\n\u{feff}\n"] {
+            let chapter = format!(
+                "{start}<?xml version=\"1.0\" encoding=\"utf-8\"?>{between}<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"de\"><head><title>Titel</title><link rel=\"stylesheet\" type=\"text/css\" href=\"s.css\"/></head><body><p>Text.<br></p></body></html>"
+            );
+            let (out, _) = repair(chapter.as_bytes());
+
+            assert!(
+                out.contains(r#"<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="de"><head>"#),
+                "{start:?} {between:?}:\n{out}"
+            );
+            assert!(
+                !out.contains('\u{feff}') && !out.contains('\u{ef}'),
+                "{out}"
+            );
+            assert_well_formed(&out);
+        }
+    }
+}
+
+/// libxml2's HTML parser cannot read a DOCTYPE's internal subset, and stops it
+/// at the first `>`; the rest of the declarations became text. The entities
+/// such a subset declares are filled in.
+#[test]
+fn an_internal_subset_is_read_before_recovery() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> <!ENTITY copy '&#169;'> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>By &author;, &copy; 2001 &amp; ever since.<br></p></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(
+        out.contains("By Jane Doe, \u{a9} 2001 &amp; ever since."),
+        "{out}"
+    );
+    assert!(!out.contains("ENTITY"), "{out}");
+    assert_well_formed(&out);
+}
