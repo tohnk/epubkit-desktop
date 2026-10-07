@@ -308,6 +308,91 @@ fn a_utf16_chapter_without_a_byte_order_mark_is_read_as_utf16() {
     assert!(output.contains(GERMAN), "{output}");
 }
 
+/// An XML declaration's encoding can be anything at all, a `<meta>` included.
+/// Renaming the declaration's and then the `<meta>`'s, one inside the other,
+/// panicked.
+#[test]
+fn a_meta_inside_the_xml_declaration_is_no_meta() {
+    let chapter = br#"<?xml version="1.0" encoding="<meta charset=latin1"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>Text</p></body></html>"#;
+
+    let output = read(chapter);
+    assert!(output.contains("<p>Text</p>"), "{output}");
+    assert!(!output.contains("latin1"), "{output}");
+}
+
+/// Only the declarations a chapter makes are renamed. A `<meta>` written out
+/// in a CDATA section, a comment or an attribute is the chapter's text, and so
+/// is "charset=" in a `<meta>` that says something else.
+#[test]
+fn what_only_looks_like_a_declaration_is_left_alone() {
+    let kept = [
+        r#"<pre><![CDATA[<meta charset="iso-8859-1">]]></pre>"#,
+        r#"<!-- <meta charset="iso-8859-1"> -->"#,
+        r#"<p title="&lt;meta charset=iso-8859-1&gt;">T</p>"#,
+    ];
+    let head_kept = r#"<meta name="description" content="Notes on charset=latin1 in old HTML"/>"#;
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>{head_kept}<meta charset="iso-8859-1"/></head><body>{}</body></html>"#,
+        kept.concat()
+    );
+
+    let output = read(chapter.as_bytes());
+    for text in kept.iter().chain([&head_kept]) {
+        assert!(output.contains(text), "{text}: {output}");
+    }
+    assert!(output.contains(r#"<meta charset="utf-8"/>"#), "{output}");
+
+    // The same in a chapter that needs recovering, which the HTML parser reads.
+    let malformed = format!(
+        r#"<html><head><title>T</title><meta charset="iso-8859-1"></head><body><!-- <meta charset="iso-8859-1"> --><p>{GERMAN}<br></p></body></html>"#
+    );
+    let output = repaired(malformed.as_bytes());
+    assert!(
+        output.contains(r#"<!-- <meta charset="iso-8859-1"> -->"#),
+        "{output}"
+    );
+    assert!(output.contains(r#"<meta charset="utf-8"/>"#), "{output}");
+    assert!(output.contains(GERMAN), "{output}");
+}
+
+/// ISO-2022-JP is written in seven bits, so its bytes are valid UTF-8 too.
+/// What gives it away is the escapes it switches character sets with: read as
+/// UTF-8, Japanese came out as ASCII gibberish.
+#[test]
+fn a_chapter_in_iso_2022_jp_is_read_as_declared() {
+    let declarations = [
+        (r#"<?xml version="1.0" encoding="ISO-2022-JP"?>"#, ""),
+        ("", r#"<meta charset="iso-2022-jp"/>"#),
+        (
+            "",
+            r#"<meta http-equiv="Content-Type" content="text/html; charset=ISO-2022-JP"/>"#,
+        ),
+    ];
+    for (declaration, meta) in declarations {
+        let chapter = format!(
+            r#"{declaration}<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>{meta}</head><body><p>{JAPANESE}</p></body></html>"#
+        );
+        let bytes = encoded(encoding_rs::ISO_2022_JP, &chapter);
+        assert!(bytes.is_ascii(), "the fixture should be seven-bit");
+
+        let output = read(&bytes);
+        assert!(output.contains(JAPANESE), "{declaration}{meta}: {output}");
+        assert!(!output.contains("2022"), "{declaration}{meta}: {output}");
+    }
+}
+
+/// A chapter re-encoded as UTF-8 that still declares ISO-2022-JP has no escapes
+/// in it, and is the UTF-8 it now is.
+#[test]
+fn a_stale_iso_2022_jp_declaration_does_not_mangle_utf8() {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="ISO-2022-JP"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>{JAPANESE}</p></body></html>"#
+    );
+
+    let output = read(chapter.as_bytes());
+    assert!(output.contains(JAPANESE), "{output}");
+}
+
 // Every pass that reads a chapter shares the repair step's parse, so each must
 // keep UTF-8 intact on its own, not only after repair has run.
 

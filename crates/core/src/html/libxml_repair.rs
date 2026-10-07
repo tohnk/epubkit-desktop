@@ -38,7 +38,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use encoding_rs::{Encoding, ISO_2022_JP, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use libxml::parser::{Parser, ParserOptions};
 use libxml::tree::{Document, NodeType, SaveOptions};
 use regex::bytes::Regex;
@@ -58,9 +58,13 @@ static XML_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The encoding a `<meta>` names, as `charset="…"` or inside `content="…;
-/// charset=…"`.
+/// charset=…"`. Comments and CDATA sections match too, without a name, so
+/// that a `<meta>` written inside one is passed over with it.
 static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
+    Regex::new(
+        r#"(?s-u)<!--.*?-->|<!\[CDATA\[.*?\]\]>|(?i:<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+))"#,
+    )
+    .unwrap()
 });
 
 /// A general entity a DOCTYPE's internal subset declares with a plain value:
@@ -197,6 +201,9 @@ const MATHML_ATTRIBUTES: &[&str] = &["definitionURL"];
 /// How UTF-16 XML without a byte order mark begins: `<?` in two-byte units.
 const UTF16LE_START: &[u8] = b"<\0?\0";
 const UTF16BE_START: &[u8] = b"\0<\0?";
+
+/// What every ISO-2022 escape starts with.
+const ESCAPE: u8 = 0x1B;
 
 /// Repairs XHTML with libxml2, trying a strict parse before falling back to
 /// error recovery.
@@ -412,8 +419,9 @@ fn is_demoted_declaration(comment: &str) -> bool {
         && comment[4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '?')
 }
 
-/// A chapter as UTF-8, however it was saved, saying so in its XML declaration
-/// and any `<meta>` charset.
+/// A chapter as UTF-8, however it was saved, saying so in its XML
+/// declaration. A `<meta>` that says otherwise is put right once the chapter
+/// is parsed ([`declare_utf8_in_meta`]).
 ///
 /// Both parsers read what comes back, so a chapter is decoded the same way
 /// whether or not it has a markup error in it. EPUB content documents are
@@ -421,6 +429,8 @@ fn is_demoted_declaration(comment: &str) -> bool {
 ///
 /// - A byte order mark decides first, and UTF-16 can also be told by how its
 ///   declaration starts.
+/// - A chapter that names ISO-2022-JP and has its escapes in it is in it
+///   ([`is_iso_2022_jp`]).
 /// - Bytes that are valid UTF-8 are UTF-8, whatever they declare: books
 ///   converted from old HTML often still declare ISO-8859-1 long after their
 ///   text was re-encoded.
@@ -442,6 +452,8 @@ fn as_utf8(input: &[u8]) -> Cow<'_, [u8]> {
         UTF_16LE.decode_without_bom_handling(input).0
     } else if input.starts_with(UTF16BE_START) {
         UTF_16BE.decode_without_bom_handling(input).0
+    } else if is_iso_2022_jp(input) {
+        ISO_2022_JP.decode_without_bom_handling(input).0
     } else if let Ok(text) = std::str::from_utf8(input) {
         Cow::Borrowed(text)
     } else if let Some(encoding) = declared_legacy_encoding(input) {
@@ -450,7 +462,9 @@ fn as_utf8(input: &[u8]) -> Cow<'_, [u8]> {
         Cow::Owned(utf8_with_stray_bytes(input))
     };
 
-    match without_junk_before_root(declare_utf8(text)) {
+    // The declaration is found where it opens the chapter, so whatever stood
+    // before it goes first.
+    match declare_utf8(without_junk_before_root(text)) {
         Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
         Cow::Owned(text) => Cow::Owned(text.into_bytes()),
     }
@@ -592,33 +606,113 @@ fn utf8_with_stray_bytes(bytes: &[u8]) -> String {
     text
 }
 
-/// `text` with any encoding its XML declaration or a `<meta>` names, other
-/// than UTF-8, renamed UTF-8.
+/// `text` with any encoding its XML declaration names, other than UTF-8,
+/// renamed UTF-8.
 fn declare_utf8(text: Cow<'_, str>) -> Cow<'_, str> {
-    let names_other = |label: &[u8]| Encoding::for_label(label) != Some(UTF_8);
-
-    let mut stale: Vec<std::ops::Range<usize>> = XML_DECLARED
+    let Some(label) = XML_DECLARED
         .captures(text.as_bytes())
-        .into_iter()
-        .chain(META_DECLARED.captures_iter(text.as_bytes()))
-        .filter_map(|declared| declared.get(1))
-        .filter(|label| names_other(label.as_bytes()))
-        .map(|label| label.range())
-        .collect();
-    if stale.is_empty() {
+        .and_then(|declared| declared.get(1))
+        .filter(|label| names_other_than_utf8(label.as_bytes()))
+    else {
         return text;
-    }
-    stale.sort_by_key(|range| range.start);
+    };
 
-    let mut renamed = String::with_capacity(text.len());
-    let mut kept_from = 0;
-    for range in stale {
-        renamed.push_str(&text[kept_from..range.start]);
-        renamed.push_str("utf-8");
-        kept_from = range.end;
+    let range = label.range();
+    Cow::Owned(format!(
+        "{}utf-8{}",
+        &text[..range.start],
+        &text[range.end..]
+    ))
+}
+
+/// Make every `<meta>` of `doc` that names an encoding other than UTF-8 name
+/// UTF-8, which the chapter has been read as and is saved as: a `charset`, or
+/// the charset in an `http-equiv="Content-Type"`'s `content`, as browsers read
+/// them.
+///
+/// This is done on the parsed chapter, not its text, so that only real
+/// `<meta>` elements change. The same words in a CDATA section, a comment or
+/// another `<meta>`'s `content` are the chapter's text, and stay as written.
+/// `source` is the text `doc` was parsed from: one that names nothing else
+/// has nothing to change, and is not searched.
+fn declare_utf8_in_meta(doc: &Document, source: &[u8]) -> Result<()> {
+    let names_other = META_DECLARED
+        .captures_iter(source)
+        .filter_map(|declared| declared.get(1))
+        .any(|label| names_other_than_utf8(label.as_bytes()));
+    if !names_other {
+        return Ok(());
     }
-    renamed.push_str(&text[kept_from..]);
-    Cow::Owned(renamed)
+
+    for mut meta in xml::find_nodes(doc, &format!("//{}", xml::local("meta")))? {
+        if let Some(charset) = meta.get_attribute_no_ns("charset") {
+            if names_other_than_utf8(charset.as_bytes()) {
+                meta.set_attribute("charset", "utf-8").ok();
+            }
+        }
+
+        let pragma = meta
+            .get_attribute_no_ns("http-equiv")
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case("content-type"));
+        let Some(content) = meta.get_attribute_no_ns("content").filter(|_| pragma) else {
+            continue;
+        };
+        if let Some(label) = content_charset(&content) {
+            if names_other_than_utf8(content[label.clone()].as_bytes()) {
+                let renamed = format!("{}utf-8{}", &content[..label.start], &content[label.end..]);
+                meta.set_attribute("content", &renamed).ok();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Where the encoding a `<meta>`'s `content` names is, found as the HTML
+/// standard's algorithm for extracting a character encoding from a meta
+/// element finds it.
+fn content_charset(content: &str) -> Option<std::ops::Range<usize>> {
+    let bytes = content.as_bytes();
+    let blank = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_whitespace);
+    let mut from = 0;
+
+    loop {
+        let found = bytes[from..]
+            .windows(7)
+            .position(|word| word.eq_ignore_ascii_case(b"charset"))?;
+        let mut at = from + found + 7;
+        while blank(at) {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            from = at;
+            continue;
+        }
+        at += 1;
+        while blank(at) {
+            at += 1;
+        }
+
+        return match bytes.get(at)? {
+            quote @ (b'"' | b'\'') => {
+                let end = at + 1 + bytes[at + 1..].iter().position(|byte| byte == quote)?;
+                Some(at + 1..end)
+            }
+            _ => {
+                let end = bytes[at..]
+                    .iter()
+                    .position(|byte| byte.is_ascii_whitespace() || *byte == b';')
+                    .map_or(bytes.len(), |length| at + length);
+                Some(at..end)
+            }
+        };
+    }
+}
+
+/// Whether an encoding's name, as a chapter wrote it, is anything but UTF-8's.
+/// A name nobody knows is not UTF-8's either.
+fn names_other_than_utf8(label: &[u8]) -> bool {
+    Encoding::for_label(label) != Some(UTF_8)
 }
 
 /// Prepare malformed input, already UTF-8, for the HTML parser that recovers
@@ -664,6 +758,22 @@ fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) 
     (bytes, options)
 }
 
+/// The encodings a chapter names, as far as they are known: in its XML
+/// declaration, and then in its first `<meta>` that names one.
+fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> + '_ {
+    let in_declaration = XML_DECLARED
+        .captures(input)
+        .and_then(|declared| declared.get(1));
+    let in_meta = META_DECLARED
+        .captures_iter(input)
+        .find_map(|declared| declared.get(1));
+
+    in_declaration
+        .into_iter()
+        .chain(in_meta)
+        .filter_map(|label| Encoding::for_label(label.as_bytes()))
+}
+
 /// The legacy encoding a chapter that is not UTF-8 names, in its XML
 /// declaration or else a `<meta>`.
 ///
@@ -674,13 +784,25 @@ fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) 
 ///
 /// A name that cannot be right counts for nothing: a UTF-8 the bytes belie,
 /// one nobody knows, or one of an encoding that is not ASCII-compatible, which
-/// could not have been read as ASCII to find it.
+/// could not have been read as ASCII to find it. ISO-2022-JP, which can, is
+/// [`is_iso_2022_jp`]'s to find.
 fn declared_legacy_encoding(input: &[u8]) -> Option<&'static Encoding> {
-    [XML_DECLARED.captures(input), META_DECLARED.captures(input)]
-        .into_iter()
-        .flatten()
-        .filter_map(|declared| Encoding::for_label(&declared[1]))
-        .find(|encoding| encoding.is_ascii_compatible() && *encoding != UTF_8)
+    declared_encodings(input).find(|encoding| encoding.is_ascii_compatible() && *encoding != UTF_8)
+}
+
+/// Whether a chapter is in ISO-2022-JP: it says so, and has the escapes that
+/// switch the encoding into and out of its Japanese character sets.
+///
+/// ISO-2022-JP is written in seven bits, so it is valid UTF-8 as well, and
+/// read as UTF-8 its Japanese came out as ASCII gibberish. A chapter that
+/// says it is ISO-2022-JP but has no escapes is ASCII, the same either way,
+/// or has been re-encoded since and is UTF-8 now.
+fn is_iso_2022_jp(input: &[u8]) -> bool {
+    input.contains(&ESCAPE)
+        && input
+            .windows(2)
+            .any(|pair| pair[0] == ESCAPE && matches!(pair[1], b'$' | b'('))
+        && declared_encodings(input).any(|encoding| encoding == ISO_2022_JP)
 }
 
 /// Parse an EPUB content document, recovering if it is malformed.
@@ -694,6 +816,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
 
     // Strict first. Success means the document was already well-formed.
     if let Ok(doc) = Parser::default().parse_string_with_options(&text, hardened_options(false)) {
+        declare_utf8_in_meta(&doc, &text)?;
         return Ok(ContentDocument {
             doc,
             recovered: false,
@@ -724,6 +847,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     restore_namespace(&doc);
     restore_case(&doc)?;
     make_legal_xml(&doc)?;
+    declare_utf8_in_meta(&doc, &text)?;
 
     let content = ContentDocument {
         doc,

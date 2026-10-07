@@ -261,6 +261,18 @@ So a chapter reads the same with or without a markup error in it. And one
 stray byte no longer sends a whole UTF-8 chapter through windows-1252, which
 had turned every Cyrillic letter into two Latin ones.
 
+ISO-2022-JP is the exception to valid UTF-8 being UTF-8: it is written in
+seven bits, so its bytes are valid UTF-8 as well. A chapter that names it and
+has the escapes it switches character sets with is read as ISO-2022-JP; read
+as UTF-8, its Japanese came out as ASCII gibberish.
+
+Only real declarations are renamed UTF-8: the XML declaration where it opens
+the chapter, and a `<meta>` element's `charset`, or the charset in an
+`http-equiv="Content-Type"`'s `content`, found on the parsed chapter. The same
+words in a CDATA section, a comment or another `<meta>`'s `content` are text,
+and stay as written. Renaming by pattern over the text changed them too, and
+a `<meta>` written inside the XML declaration's encoding made it panic.
+
 ### Prose after `<code>` and `<pre>` is cleaned
 
 lxml stores the text *following* an element as that element's `tail`, so
