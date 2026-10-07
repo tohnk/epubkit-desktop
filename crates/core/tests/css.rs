@@ -366,6 +366,38 @@ fn fonts_are_removed_beside_and_through_entities() {
     );
 }
 
+/// A `<style>` that is nothing but an entity has no text to edit, and its
+/// entity is written out as what it stands for to remove the font in it. An
+/// entity declared to stand for nothing is read as that, not as one that
+/// cannot be read. Either way the font rule stayed, naming a deleted font.
+#[test]
+fn fonts_are_removed_from_entities_alone_and_empty_ones() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY empty ""><!ENTITY fonts "@font-face {{ src: url(x.ttf) }} p {{ color: red }}">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    for (style, after) in [
+        ("&fonts;", "p { color: red }"),
+        (
+            "@font-face { src: url(&empty;x.ttf) } p { color: red }",
+            "p { color: red }",
+        ),
+    ] {
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter(style).as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(removed, 1, "{style}: {out}");
+        assert!(
+            out.contains(&format!(r#"<style type="text/css">{after}</style>"#)),
+            "{style}: {out}"
+        );
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    }
+}
+
 /// An entity a doctype that is never loaded declares stands for nothing this
 /// can read. A font rule with one in it stays, since where the rule ends is
 /// unknown; one beside it goes.

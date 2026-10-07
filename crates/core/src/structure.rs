@@ -439,7 +439,7 @@ fn rewrite_references(doc: &Document, base: &Path, renames: &Renames) -> Result<
         }
 
         if local_name(&node) == "style" {
-            updated += css::edit_style_element(&node, |css| css_url_edits(css, base, renames));
+            updated += css::edit_style_element(doc, &node, |css| css_url_edits(css, base, renames));
         }
     }
 

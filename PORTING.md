@@ -364,10 +364,11 @@ was cut in half, and the common `/*<![CDATA[*/ … /*]]>*/` wrapping hid every
 rule inside it. What an entity reference stands for is part of the CSS too,
 so `url(&cdn;cover.png)` is read as the url it is, not as `url(cover.png)`.
 An entity cannot be edited where it is written, so one an edit runs into is
-written out as what it stands for, and edited with the text around it; one
-beside an edit stays as written. An entity that stands for nothing that can
-be read, under a doctype that is never loaded, stops the edits that run into
-it.
+written out as what it stands for, and edited with the text around it, or
+in new text of its own in a `<style>` that is nothing but entities; one
+beside an edit stays as written. One declared to stand for nothing is read
+as that. One that stands for nothing that can be read, under a doctype that
+is never loaded, stops the edits that run into it.
 
 ### Empty paragraphs are collapsed among siblings
 

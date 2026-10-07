@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 
 use cssparser::{ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
-use libxml::tree::{Node, NodeType};
+use libxml::tree::{Document, Node, NodeType};
 
 use crate::html;
 use crate::{xml, Error, Result};
@@ -211,7 +211,7 @@ pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>,
     let content = html::parse_content(xhtml_bytes)?;
     let mut removed = 0;
     for style in xml::find_nodes(&content.doc, &format!("//{}", xml::local("style")))? {
-        removed += edit_style_element(&style, embedded_font_cuts);
+        removed += edit_style_element(&content.doc, &style, embedded_font_cuts);
     }
 
     if removed == 0 {
@@ -234,17 +234,25 @@ pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>,
 /// edited where it is written: `url(&cdn;cover.png)` is not `url(cover.png)`.
 /// An edit beside one leaves it as it is. When an edit runs into one, the
 /// style's entities are written out as what they stand for, into the text
-/// before them, and edited with it. One that stands for nothing that can be
-/// read, under a doctype that is never loaded, say, stays where it is, and
-/// nothing is written out past it; it stops the edits that run into it, since
-/// what it hides could change where they end.
-pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Edit>) -> usize {
+/// before them, and edited with it; where there is no text, into new text put
+/// in their place. One the document does not declare, under a doctype that
+/// is never loaded, say, stands for nothing that can be read: it stays where
+/// it is, nothing is written out past it, and it stops the edits that run
+/// into it, since what it hides could change where they end. One declared to
+/// stand for nothing is read as that.
+pub(crate) fn edit_style_element(
+    doc: &Document,
+    style: &Node,
+    edit: impl FnOnce(&str) -> Vec<Edit>,
+) -> usize {
     let mut parts: Vec<StylePart> = Vec::new();
     let mut css = String::new();
     for node in style.get_child_nodes() {
-        let entity = match node.get_type() {
-            Some(NodeType::TextNode | NodeType::CDataSectionNode) => false,
-            Some(NodeType::EntityRefNode) => true,
+        let (entity, readable) = match node.get_type() {
+            Some(NodeType::TextNode | NodeType::CDataSectionNode) => (false, true),
+            // libxml2 gives a reference to a declared entity the declaration
+            // as its child, and one to an undeclared entity nothing.
+            Some(NodeType::EntityRefNode) => (true, node.get_first_child().is_some()),
             _ => continue,
         };
         let start = css.len();
@@ -253,10 +261,11 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
             node,
             range: start..css.len(),
             entity,
+            readable,
         });
     }
 
-    if parts.iter().all(|part| part.entity) {
+    if parts.is_empty() {
         return 0;
     }
     let mut edits = edit(&css);
@@ -264,7 +273,7 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
     // Entities are written out only when an edit runs into one that can be.
     let readable: Vec<&Range<usize>> = parts
         .iter()
-        .filter(|part| part.entity && !part.range.is_empty())
+        .filter(|part| part.entity && part.readable)
         .map(|part| &part.range)
         .collect();
     let write_out = run_into(&readable, &edits).contains(&true);
@@ -272,22 +281,30 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
     // Where each part's text goes as it is edited: a text or CDATA part's into
     // itself. A readable entity's, when entities are written out, goes into
     // the text before it, or after it if it comes first, but never past an
-    // entity that cannot be read, which keeps its place; one with no text to
-    // go into on its side of those stays as it is too.
+    // entity that cannot be read, which keeps its place. Readable entities
+    // with no text on their side of those go into new text, put before the
+    // first of them; the slots past the parts' are those.
     let mut slots: Vec<Option<usize>> = parts
         .iter()
         .enumerate()
         .map(|(index, part)| (!part.entity).then_some(index))
         .collect();
+    let mut new_texts: Vec<usize> = Vec::new();
     if write_out {
         let mut start = 0;
         while start < parts.len() {
             let end = parts[start..]
                 .iter()
-                .position(|part| part.entity && part.range.is_empty())
+                .position(|part| part.entity && !part.readable)
                 .map_or(parts.len(), |length| start + length);
-            if let Some(first) = (start..end).find(|&index| !parts[index].entity) {
-                let mut owner = first;
+            if start < end {
+                let mut owner = match (start..end).find(|&index| !parts[index].entity) {
+                    Some(first) => first,
+                    None => {
+                        new_texts.push(start);
+                        parts.len() + new_texts.len() - 1
+                    }
+                };
                 for index in start..end {
                     if parts[index].entity {
                         slots[index] = Some(owner);
@@ -324,7 +341,7 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
             .partition_point(|part| part.range.end <= at)
             .min(parts.len() - 1)
     };
-    let mut contents = vec![String::new(); parts.len()];
+    let mut contents = vec![String::new(); parts.len() + new_texts.len()];
     let keep = |contents: &mut [String], mut from: usize, to: usize| {
         while from < to {
             let part = part_at(from);
@@ -349,6 +366,24 @@ pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Ed
         made += 1;
     }
     keep(&mut contents, kept_from, css.len());
+
+    // New text first, while the entities it stands in for are still there to
+    // put it before. Nothing in the tree has changed if one cannot be made.
+    // None goes beside other text, so libxml2 has none to merge it into.
+    let mut made_texts = Vec::new();
+    for (index, &before) in new_texts.iter().enumerate() {
+        let content = &contents[parts.len() + index];
+        if content.is_empty() {
+            continue;
+        }
+        let Ok(text) = Node::new_text(content, doc) else {
+            return 0;
+        };
+        made_texts.push((before, text));
+    }
+    for (before, mut text) in made_texts {
+        parts[before].node.clone().add_prev_sibling(&mut text).ok();
+    }
 
     for ((part, slot), content) in parts.iter().zip(&slots).zip(contents) {
         let mut node = part.node.clone();
@@ -376,6 +411,8 @@ struct StylePart {
     node: Node,
     range: Range<usize>,
     entity: bool,
+    /// Whether what it stands for can be read: an entity's declaration was.
+    readable: bool,
 }
 
 /// Whether each of `edits` runs into one of `entities`: takes in some of what

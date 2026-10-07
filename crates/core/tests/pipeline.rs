@@ -722,7 +722,8 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
 
 /// Every image a chapter's `<style>` names is still there after the images are
 /// converted, whatever entities the style holds: one beside a url, one in it,
-/// or one standing for another site, whose url is that site's.
+/// one standing for another site, whose url is that site's, one that is the
+/// whole style, or one that stands for nothing.
 #[test]
 fn a_style_with_entities_in_it_names_only_images_that_are_there() {
     let dir = tempfile::tempdir().unwrap();
@@ -739,9 +740,9 @@ fn a_style_with_entities_in_it_names_only_images_that_are_there() {
 </package>
 "#;
     let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/"><!ENTITY cdn "https://cdn.example/">]>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.b { background: url(&dir;plate.png) }</style><style type="text/css">.c { background: url(&cdn;cover.png) }</style></head>
-<body><p class="a b c">Body</p><p><img src="cover.png" alt=""/></p></body></html>
+<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/"><!ENTITY cdn "https://cdn.example/"><!ENTITY image "cover.png"><!ENTITY rule ".d { background: url(&image;) }"><!ENTITY empty "">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.b { background: url(&dir;plate.png) }</style><style type="text/css">.c { background: url(&cdn;cover.png) }</style><style type="text/css">&rule;</style><style type="text/css">.e { background: url(&empty;cover.png) }</style></head>
+<body><p class="a b c d e">Body</p><p><img src="cover.png" alt=""/></p></body></html>
 "#;
     common::write_epub(
         &input,
@@ -778,6 +779,14 @@ fn a_style_with_entities_in_it_names_only_images_that_are_there() {
     );
     assert!(
         chapter.contains(".c { background: url(&cdn;cover.png) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(r#"<style type="text/css">.d { background: url(cover.jpg) }</style>"#),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".e { background: url(cover.jpg) }"),
         "{chapter}"
     );
     for image in ["OEBPS/cover.jpg", "OEBPS/images/plate.jpg"] {
