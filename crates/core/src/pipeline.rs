@@ -339,7 +339,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
         // An SVG document names images as a chapter does. One that is not
         // well-formed is left as it is.
-        for path in svg_documents(&content.images) {
+        for path in svg_documents(&content) {
             structure::update_svg_references(path, &renames).ok();
         }
         for path in &content.css {
@@ -368,7 +368,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             used.merge(&css::collect_used_selectors(&bytes)?);
         }
         // An SVG document can use a stylesheet's rules as much as a chapter.
-        for path in svg_documents(&content.images) {
+        for path in svg_documents(&content) {
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             if let Ok(used_here) = css::collect_used_selectors(&bytes) {
                 used.merge(&used_here);
@@ -486,13 +486,13 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
 // ---------------------------------------------------------------- internals
 
-/// The SVG documents among a book's images.
-fn svg_documents(images: &[PathBuf]) -> impl Iterator<Item = &Path> {
-    images.iter().map(PathBuf::as_path).filter(|path| {
-        path.extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-            && path.is_file()
-    })
+/// The SVG documents in a book that are there to read.
+fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Path> {
+    content
+        .svg
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
 }
 
 /// What the image step leaves for the steps after it. Paths are relative to

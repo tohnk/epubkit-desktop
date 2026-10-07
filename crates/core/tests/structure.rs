@@ -97,6 +97,32 @@ fn classifies_fonts_by_extension_when_the_media_type_lies() {
     );
 }
 
+/// An SVG document is known by its media type, whatever its name; and by its
+/// name where the book gives it some other media type, since a wrong guess
+/// only costs a parse that fails.
+#[test]
+fn svg_documents_are_known_by_media_type_or_name() {
+    let manifest = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="diagram" href="images/diagram" media-type="image/svg+xml"/>
+    <item id="map" href="images/Map.SVG" media-type="application/octet-stream"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+</package>
+"#;
+    let files = find_content_files(book(), book(), &opf(manifest)).unwrap();
+
+    assert_eq!(
+        files.svg,
+        vec![
+            Path::new("/book/images/diagram"),
+            Path::new("/book/images/Map.SVG")
+        ]
+    );
+}
+
 #[test]
 fn rename_map_keeps_the_directory() {
     let processed = rename_map(&[
@@ -497,7 +523,9 @@ fn a_srcset_is_split_as_the_html_standard_splits_it() {
     ];
     let images: String = srcsets
         .iter()
-        .map(|(srcset, _)| format!(r#"<p><img src="../images/cover.png" srcset="{srcset}" alt=""/></p>"#))
+        .map(|(srcset, _)| {
+            format!(r#"<p><img src="../images/cover.png" srcset="{srcset}" alt=""/></p>"#)
+        })
         .collect();
     let chapter = put(
         dir.path(),

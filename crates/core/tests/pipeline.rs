@@ -721,95 +721,111 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
 }
 
 /// An SVG document in the book names its images as a chapter does, and has to
-/// follow them when they are converted.
+/// follow them when they are converted. It is an SVG document by its media
+/// type, whatever its name.
 #[test]
 fn an_svg_document_follows_the_images_it_draws() {
-    let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("in.epub");
-    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+    for name in ["map.svg", "map"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svg</dc:identifier><dc:title>SVG</dc:title></metadata>
   <manifest>
     <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
-    <item id="map" href="map.svg" media-type="image/svg+xml"/>
+    <item id="map" href="{name}" media-type="image/svg+xml"/>
     <item id="plate" href="images/plate.png" media-type="image/png"/>
   </manifest>
   <spine><itemref idref="ch1"/><itemref idref="map"/></spine>
 </package>
-"#;
-    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+"#
+        );
+        let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 64 64"><image width="64" height="64" xlink:href="images/plate.png"/><text x="5" y="60">Map</text></svg>
 "#;
-    common::write_epub(
-        &input,
-        &[
-            ("mimetype", b"application/epub+zip"),
-            ("META-INF/container.xml", common::CONTAINER_XML),
-            ("OEBPS/content.opf", opf.as_bytes()),
-            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
-            ("OEBPS/map.svg", svg),
-            ("OEBPS/images/plate.png", &solid(image::ImageFormat::Png, 0)),
-        ],
-    );
+        let svg_path = format!("OEBPS/{name}");
+        common::write_epub(
+            &input,
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("META-INF/container.xml", common::CONTAINER_XML),
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+                (&svg_path, svg),
+                ("OEBPS/images/plate.png", &solid(image::ImageFormat::Png, 0)),
+            ],
+        );
 
-    let output = dir.path().join("out.epub");
-    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
-    let work = tempfile::tempdir().unwrap();
-    package::extract_epub(&output, work.path()).unwrap();
+        let output = dir.path().join("out.epub");
+        process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
 
-    let svg = fs::read_to_string(work.path().join("OEBPS/map.svg")).unwrap();
-    assert!(svg.contains(r#"xlink:href="images/plate.jpg""#), "{svg}");
-    assert!(work.path().join("OEBPS/images/plate.jpg").is_file());
+        let svg = fs::read_to_string(work.path().join(&svg_path)).unwrap();
+        assert!(
+            svg.contains(r#"xlink:href="images/plate.jpg""#),
+            "{name}: {svg}"
+        );
+        assert!(work.path().join("OEBPS/images/plate.jpg").is_file());
+    }
 }
 
 /// An SVG document can use a stylesheet's rules as much as a chapter can, so
-/// what it uses counts when deciding which rules nothing uses.
+/// what it uses counts when deciding which rules nothing uses, whatever the
+/// document is called.
 #[test]
 fn rules_only_an_svg_document_uses_are_kept() {
-    let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("in.epub");
-    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+    for name in ["page2.svg", "page2"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svgcss</dc:identifier><dc:title>SVG CSS</dc:title></metadata>
   <manifest>
     <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
-    <item id="page" href="page2.svg" media-type="image/svg+xml"/>
+    <item id="page" href="{name}" media-type="image/svg+xml"/>
     <item id="css" href="style.css" media-type="text/css"/>
   </manifest>
   <spine><itemref idref="ch1"/><itemref idref="page"/></spine>
 </package>
-"#;
-    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+"#
+        );
+        let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/css" href="style.css"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text class="balloon" x="10" y="50">Hello</text></svg>
 "#;
-    common::write_epub(
-        &input,
-        &[
-            ("mimetype", b"application/epub+zip"),
-            ("META-INF/container.xml", common::CONTAINER_XML),
-            ("OEBPS/content.opf", opf.as_bytes()),
-            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
-            ("OEBPS/page2.svg", svg),
-            (
-                "OEBPS/style.css",
-                b".balloon { font-size: 40px; fill: #333 }\n.unused { color: red }\n",
-            ),
-        ],
-    );
+        let svg_path = format!("OEBPS/{name}");
+        common::write_epub(
+            &input,
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("META-INF/container.xml", common::CONTAINER_XML),
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+                (&svg_path, svg),
+                (
+                    "OEBPS/style.css",
+                    b".balloon { font-size: 40px; fill: #333 }\n.unused { color: red }\n",
+                ),
+            ],
+        );
 
-    let output = dir.path().join("out.epub");
-    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
-    let work = tempfile::tempdir().unwrap();
-    package::extract_epub(&output, work.path()).unwrap();
+        let output = dir.path().join("out.epub");
+        let report =
+            process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
 
-    let css = fs::read_to_string(work.path().join("OEBPS/style.css")).unwrap();
-    assert!(
-        css.contains(".balloon { font-size: 40px; fill: #333 }"),
-        "{css}"
-    );
-    assert!(!css.contains(".unused"), "{css}");
-    assert_eq!(report.css_rules_removed, 1);
+        let css = fs::read_to_string(work.path().join("OEBPS/style.css")).unwrap();
+        assert!(
+            css.contains(".balloon { font-size: 40px; fill: #333 }"),
+            "{name}: {css}"
+        );
+        assert!(!css.contains(".unused"), "{name}: {css}");
+        assert_eq!(report.css_rules_removed, 1, "{name}");
+    }
 }
 
 // ---------------------------------------------------------- Light Novel mode

@@ -22,6 +22,7 @@ pub const NS_NCX: &str = "http://www.daisy.org/z3986/2005/ncx/";
 pub const NS_XLINK: &str = "http://www.w3.org/1999/xlink";
 
 const NCX_MEDIA_TYPE: &str = "application/x-dtbncx+xml";
+const SVG_MEDIA_TYPE: &str = "image/svg+xml";
 
 /// Attributes whose value is one URL a reader may fetch an image from: an
 /// image's own, a link to the full size, SVG 2's `href`, a video's poster, an
@@ -87,6 +88,10 @@ pub struct ContentFiles {
     pub xhtml: Vec<PathBuf>,
     pub css: Vec<PathBuf>,
     pub images: Vec<PathBuf>,
+    /// The SVG documents, known by their media type, whatever their name, or
+    /// by their name, whatever media type the book gives them: a wrong guess
+    /// costs only a parse that fails. Each is in another list too.
+    pub svg: Vec<PathBuf>,
     pub fonts: Vec<PathBuf>,
     pub ncx: Vec<PathBuf>,
     pub other: Vec<PathBuf>,
@@ -213,6 +218,14 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             continue;
         }
         let media_type = item.media_type.to_ascii_lowercase();
+
+        if media_type == SVG_MEDIA_TYPE
+            || Path::new(&href)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+        {
+            files.svg.push(path.clone());
+        }
 
         match media_type.as_str() {
             "application/xhtml+xml" | "text/html" => files.xhtml.push(path),

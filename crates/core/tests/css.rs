@@ -308,7 +308,9 @@ fn a_style_elements_text_and_cdata_are_one_stylesheet() {
     );
     assert_eq!(removed, 1, "{out}");
     assert!(
-        out.contains("<style type=\"text/css\">\n/*<![CDATA[*/\np { margin: 0 }\n/*]]>*/\n</style>"),
+        out.contains(
+            "<style type=\"text/css\">\n/*<![CDATA[*/\np { margin: 0 }\n/*]]>*/\n</style>"
+        ),
         "{out}"
     );
 }
