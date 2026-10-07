@@ -234,8 +234,11 @@ pub fn build_rename_map(processed: &BTreeMap<String, String>) -> BTreeMap<String
 
 /// Point renamed images' manifest entries at their new files. Returns how many
 /// entries changed.
-pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Result<usize> {
-    if rename_map.is_empty() {
+///
+/// An entry is matched by the file its href leads to, however it is spelled,
+/// and gets the new file's path as the rename map writes it.
+pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
         return Ok(0);
     }
 
@@ -243,18 +246,11 @@ pub fn update_opf(doc: &Document, rename_map: &BTreeMap<String, String>) -> Resu
         doc,
         &format!("//{}/{}", xml::local("manifest"), xml::local("item")),
     )?;
-    let by_name = renames_by_filename(rename_map);
 
     let mut updated = 0;
     for mut node in nodes {
         let href = node.get_attribute("href").unwrap_or_default();
-        let decoded = decode(&href);
-
-        let Some(new_path) = rename_map
-            .get(&decoded)
-            .or_else(|| rename_map.get(&href))
-            .or_else(|| by_name.get(&file_name_of(&decoded)).copied().flatten())
-        else {
+        let Some(new_path) = renames.new_path(renames.opf_dir, &decode(&href)) else {
             continue;
         };
 
@@ -452,7 +448,6 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         return Ok(0);
     }
 
-    let pages_by_target = &reshaped.by_target;
     let base = path.parent().unwrap_or(reshaped.opf_dir);
 
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
@@ -467,7 +462,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
             .or_else(|| image.get_attribute("href"))
             .unwrap_or_default();
         let reference = Reference::parse(&href)?;
-        let pages = pages_by_target.get(&reference.target(base))?;
+        let pages = reshaped.pages(base, &reference.path())?;
         Some(pages.iter().map(|page| reference.with_name(page)).collect())
     };
 
@@ -528,7 +523,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         let Some(reference) = Reference::parse(&src) else {
             continue;
         };
-        let Some(pages) = pages_by_target.get(&reference.target(base)) else {
+        let Some(pages) = reshaped.pages(base, &reference.path()) else {
             continue;
         };
         let Some(mut parent) = image.get_parent() else {
@@ -813,7 +808,12 @@ fn renames_by_filename(rename_map: &BTreeMap<String, String>) -> HashMap<String,
 
 /// The images the image step renamed, from [`build_rename_map`], indexed once
 /// for every document whose references to them are rewritten.
+///
+/// Files are told apart by where their paths lead, resolved as
+/// [`resolve_href`] resolves them, so two spellings of one path name one file.
 pub struct Renames<'a> {
+    /// The unpacked book.
+    root: &'a Path,
     /// What the rename map's paths are relative to.
     opf_dir: &'a Path,
     /// Each renamed file's new path, by the file it was.
@@ -822,14 +822,20 @@ pub struct Renames<'a> {
 }
 
 impl<'a> Renames<'a> {
-    /// `rename_map`'s paths are relative to `opf_dir`.
-    pub fn new(opf_dir: &'a Path, rename_map: &'a BTreeMap<String, String>) -> Self {
+    /// `rename_map`'s paths are relative to `opf_dir`, in the book unpacked at
+    /// `root`.
+    pub fn new(
+        root: &'a Path,
+        opf_dir: &'a Path,
+        rename_map: &'a BTreeMap<String, String>,
+    ) -> Self {
         let by_source = rename_map
             .iter()
-            .map(|(old, new)| (normalize_path(&opf_dir.join(old)), new))
+            .filter_map(|(old, new)| Some((resolve_href(root, opf_dir, old)?, new)))
             .collect();
 
         Self {
+            root,
             opf_dir,
             by_source,
             by_name: renames_by_filename(rename_map),
@@ -840,31 +846,37 @@ impl<'a> Renames<'a> {
         self.by_source.is_empty()
     }
 
+    /// The new path, relative to the OPF, of the file `path` leads to from
+    /// `base`, if that file was renamed.
+    fn new_path(&self, base: &Path, path: &str) -> Option<&'a String> {
+        if let Some(target) = resolve_href(self.root, base, path) {
+            if let Some(new) = self.by_source.get(&target) {
+                return Some(new);
+            }
+
+            // A path to a file that is still there names something that was
+            // not renamed, whatever its filename shares with something that
+            // was.
+            if target.is_file() {
+                return None;
+            }
+        }
+
+        self.by_name.get(&file_name_of(path)).copied().flatten()
+    }
+
     /// The new filename of the file `path` leads to from `base`, if that file
     /// was renamed.
     fn new_name(&self, base: &Path, path: &str) -> Option<String> {
-        let target = normalize_path(&base.join(path));
-        if let Some(new) = self.by_source.get(&target) {
-            return Some(file_name_of(new));
-        }
-
-        // A path to a file that is still there names something that was not
-        // renamed, whatever its filename shares with something that was.
-        if target.is_file() {
-            return None;
-        }
-
-        self.by_name
-            .get(&file_name_of(path))
-            .copied()
-            .flatten()
-            .map(|new| file_name_of(new))
+        self.new_path(base, path).map(|new| file_name_of(new))
     }
 }
 
 /// The pages of each image Light Novel mode reshaped, indexed once for every
 /// document that shows them.
 pub struct ReshapedPages<'a> {
+    /// The unpacked book.
+    root: &'a Path,
     /// What the pages' paths are relative to.
     opf_dir: &'a Path,
     /// The filename of each page, by the file of the first.
@@ -873,21 +885,35 @@ pub struct ReshapedPages<'a> {
 
 impl<'a> ReshapedPages<'a> {
     /// `reshaped` is as for [`declare_reshaped_pages`], its paths relative to
-    /// `opf_dir`.
-    pub fn new(opf_dir: &'a Path, reshaped: &BTreeMap<String, Vec<String>>) -> Self {
+    /// `opf_dir`, in the book unpacked at `root`.
+    pub fn new(
+        root: &'a Path,
+        opf_dir: &'a Path,
+        reshaped: &BTreeMap<String, Vec<String>>,
+    ) -> Self {
         let by_target = reshaped
             .iter()
-            .map(|(first, pages)| {
+            .filter_map(|(first, pages)| {
                 let names = pages.iter().map(|page| file_name_of(page)).collect();
-                (normalize_path(&opf_dir.join(first)), names)
+                Some((resolve_href(root, opf_dir, first)?, names))
             })
             .collect();
 
-        Self { opf_dir, by_target }
+        Self {
+            root,
+            opf_dir,
+            by_target,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_target.is_empty()
+    }
+
+    /// The filename of each page of the image `path` leads to from `base`, if
+    /// that image was reshaped.
+    fn pages(&self, base: &Path, path: &str) -> Option<&Vec<String>> {
+        self.by_target.get(&resolve_href(self.root, base, path)?)
     }
 }
 
@@ -922,11 +948,6 @@ impl<'a> Reference<'a> {
     /// The path, percent-decoded.
     fn path(&self) -> String {
         decode(&format!("{}{}", self.directory, self.name))
-    }
-
-    /// The file it names, from a document in `base`.
-    fn target(&self, base: &Path) -> PathBuf {
-        normalize_path(&base.join(self.path()))
     }
 
     /// The same reference naming `new_name`, percent-encoded only if the
@@ -1071,9 +1092,23 @@ fn extract_chapters(
         .collect()
 }
 
-/// The href that leads from the directory `from` to `to`, both resolved inside
-/// the book's `root`.
+/// The path that leads from the directory `from` to `to`, both resolved inside
+/// the book's `root`: `/`-separated, with `..` where `to` is not below
+/// `from`, and not percent-encoded.
+pub fn relative_path(root: &Path, from: &Path, to: &Path) -> Option<String> {
+    Some(relative_parts(root, from, to)?.join("/"))
+}
+
+/// [`relative_path`] as an href, each part percent-encoded.
 fn relative_href(root: &Path, from: &Path, to: &Path) -> Option<String> {
+    let parts: Vec<String> = relative_parts(root, from, to)?
+        .iter()
+        .map(|part| encode(part))
+        .collect();
+    Some(parts.join("/"))
+}
+
+fn relative_parts(root: &Path, from: &Path, to: &Path) -> Option<Vec<String>> {
     let from: Vec<Component> = from.strip_prefix(root).ok()?.components().collect();
     let to: Vec<Component> = to.strip_prefix(root).ok()?.components().collect();
     let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
@@ -1081,9 +1116,9 @@ fn relative_href(root: &Path, from: &Path, to: &Path) -> Option<String> {
     let up = std::iter::repeat_n("..".to_string(), from.len() - shared);
     let down = to[shared..]
         .iter()
-        .map(|part| encode(&part.as_os_str().to_string_lossy()));
+        .map(|part| part.as_os_str().to_string_lossy().to_string());
 
-    Some(up.chain(down).collect::<Vec<_>>().join("/"))
+    Some(up.chain(down).collect())
 }
 
 fn chapter_title(path: &Path) -> Option<String> {

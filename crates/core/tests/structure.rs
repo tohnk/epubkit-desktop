@@ -14,6 +14,12 @@ fn opf(body: &str) -> libxml::tree::Document {
     xml::parse_strict(body.as_bytes()).expect("fixture should parse")
 }
 
+/// Where a book with no files on disk is said to be unpacked, for steps that
+/// only resolve its paths.
+fn book() -> &'static Path {
+    Path::new("/book")
+}
+
 fn rename_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
@@ -114,7 +120,10 @@ fn manifest_hrefs_follow_renamed_images() {
     let doc = opf(MIXED_MANIFEST);
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
-    assert_eq!(update_opf(&doc, &map).unwrap(), 1);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
 
     let item = manifest_items(&doc)
         .unwrap()
@@ -138,7 +147,10 @@ fn percent_encoded_hrefs_are_matched_and_re_encoded() {
 "#);
 
     let map = rename_map(&[("images/a plate.png", "images/a plate.jpg")]);
-    assert_eq!(update_opf(&doc, &map).unwrap(), 1);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
 
     let item = &manifest_items(&doc).unwrap()[0];
     assert_eq!(item.href, "images/a%20plate.jpg");
@@ -198,7 +210,7 @@ fn xhtml_image_references_follow_renames() {
 
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
     assert_eq!(
-        update_xhtml_references(&path, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         2
     );
 
@@ -218,7 +230,11 @@ fn xhtml_untouched_by_an_empty_rename_map() {
     fs::write(&path, original).unwrap();
 
     assert_eq!(
-        update_xhtml_references(&path, &Renames::new(dir.path(), &BTreeMap::new())).unwrap(),
+        update_xhtml_references(
+            &path,
+            &Renames::new(dir.path(), dir.path(), &BTreeMap::new())
+        )
+        .unwrap(),
         0
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -239,7 +255,7 @@ fn css_url_references_follow_renames() {
         ("images/other.gif", "images/other.jpg"),
     ]);
     assert_eq!(
-        update_css_references(&path, &Renames::new(dir.path(), &map)).unwrap(),
+        update_css_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         1
     );
 
@@ -281,11 +297,11 @@ fn references_follow_the_file_they_name_not_its_filename() {
     let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(&chapter, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         2
     );
     assert_eq!(
-        update_css_references(&css, &Renames::new(dir.path(), &map)).unwrap(),
+        update_css_references(&css, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         1
     );
 
@@ -310,7 +326,7 @@ fn a_reference_to_a_file_that_kept_its_name_is_left_alone() {
     let map = rename_map(&[("a/pic.png", "a/pic.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(&chapter, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 }
@@ -327,7 +343,7 @@ fn an_ambiguous_filename_is_not_guessed_at() {
     );
     let map = rename_map(&[("a/pic.png", "a/pic.jpg"), ("b/pic.png", "b/pic-2.jpg")]);
     assert_eq!(
-        update_xhtml_references(&chapter, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 
@@ -338,7 +354,10 @@ fn an_ambiguous_filename_is_not_guessed_at() {
   <spine/>
 </package>
 "#);
-    assert_eq!(update_opf(&doc, &map).unwrap(), 0);
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -354,7 +373,7 @@ fn links_to_other_sites_and_data_are_left_alone() {
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
     assert_eq!(
-        update_xhtml_references(&chapter, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         0
     );
 }
@@ -377,7 +396,7 @@ fn a_renamed_filename_is_written_the_way_the_reference_wrote_it() {
     ]);
 
     assert_eq!(
-        update_xhtml_references(&chapter, &Renames::new(dir.path(), &map)).unwrap(),
+        update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         2
     );
 
@@ -400,7 +419,7 @@ fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
     let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
 
     assert_eq!(
-        update_css_references(&css, &Renames::new(dir.path(), &map)).unwrap(),
+        update_css_references(&css, &Renames::new(dir.path(), dir.path(), &map)).unwrap(),
         1
     );
 
@@ -904,7 +923,11 @@ fn a_split_image_is_followed_by_its_other_pages() {
     );
 
     assert_eq!(
-        show_reshaped_pages(&chapter, &ReshapedPages::new(dir.path(), &split_spread())).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
         1
     );
 
@@ -942,7 +965,11 @@ fn an_svg_wrapper_around_a_reshaped_image_gives_way_to_plain_images() {
     );
 
     assert_eq!(
-        show_reshaped_pages(&chapter, &ReshapedPages::new(dir.path(), &split_spread())).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
         1
     );
 
@@ -975,7 +1002,11 @@ fn an_illustration_around_a_split_image_is_kept_and_followed_by_its_pages() {
     );
 
     assert_eq!(
-        show_reshaped_pages(&chapter, &ReshapedPages::new(dir.path(), &split_spread())).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
         1
     );
 
@@ -1008,7 +1039,11 @@ fn a_rotated_image_loses_the_size_it_no_longer_has() {
     )]);
 
     assert_eq!(
-        show_reshaped_pages(&chapter, &ReshapedPages::new(dir.path(), &rotated)).unwrap(),
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &rotated)
+        )
+        .unwrap(),
         1
     );
 

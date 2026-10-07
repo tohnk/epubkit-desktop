@@ -285,6 +285,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(15, "Processing images...");
     let converted = convert_images(
         &content.images,
+        work_dir,
         &opf_dir,
         options,
         &mut report,
@@ -330,9 +331,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(68, "Updating references...");
     let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
-        structure::update_opf(&opf, &rename_map)?;
         // Indexed once, not for each document.
-        let renames = structure::Renames::new(&opf_dir, &rename_map);
+        let renames = structure::Renames::new(work_dir, &opf_dir, &rename_map);
+        structure::update_opf(&opf, &renames)?;
         for &path in &chapters {
             structure::update_xhtml_references(path, &renames)?;
         }
@@ -348,7 +349,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !converted.reshaped.is_empty() {
         progress(72, "Showing reshaped pages...");
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
-        let reshaped = structure::ReshapedPages::new(&opf_dir, &converted.reshaped);
+        let reshaped = structure::ReshapedPages::new(work_dir, &opf_dir, &converted.reshaped);
         for &path in &chapters {
             structure::show_reshaped_pages(path, &reshaped)?;
         }
@@ -474,6 +475,7 @@ struct ConvertedImages {
 /// Convert every image in the manifest.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
+    root: &Path,
     opf_dir: &Path,
     options: &ProcessingOptions,
     report: &mut ProcessingReport,
@@ -505,6 +507,12 @@ fn convert_images<P: FnMut(u8, &str)>(
         if !image::should_process(&name) {
             continue;
         }
+        // What the rename map calls the image: its path from the OPF's
+        // directory, which may climb out of it. An image the map could not
+        // name would lose its references, so it is left as it is.
+        let Some(relative) = structure::relative_path(root, opf_dir, path) else {
+            continue;
+        };
 
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
 
@@ -557,22 +565,19 @@ fn convert_images<P: FnMut(u8, &str)>(
             .to_string();
         *report.image_formats.entry(kind).or_insert(0) += 1;
 
-        if let Ok(relative) = path.strip_prefix(opf_dir) {
-            let source = relative.to_string_lossy().replace('\\', "/");
-            if outputs[0].reshaped {
-                let pages: Vec<String> = names
-                    .iter()
-                    .map(|page| {
-                        relative
-                            .with_file_name(page)
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    })
-                    .collect();
-                reshaped.insert(pages[0].clone(), pages);
-            }
-            renames.insert(source, names[0].clone());
+        if outputs[0].reshaped {
+            let pages: Vec<String> = names
+                .iter()
+                .map(|page| {
+                    Path::new(&relative)
+                        .with_file_name(page)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            reshaped.insert(pages[0].clone(), pages);
         }
+        renames.insert(relative, names[0].clone());
 
         // The source only goes once its replacement is safely written, and
         // never when the replacement took its place.
