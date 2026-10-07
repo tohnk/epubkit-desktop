@@ -319,3 +319,52 @@ fn an_internal_subset_is_read_before_recovery() {
     assert!(!out.contains("ENTITY"), "{out}");
     assert_well_formed(&out);
 }
+
+fn nested(depth: usize, closed: bool) -> String {
+    let mut chapter = String::from(
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>"#,
+    );
+    for n in 1..=depth {
+        chapter.push_str(&format!(r#"<div class="para">Paragraph {n}."#));
+    }
+    if closed {
+        chapter.push_str(&"</div>".repeat(depth));
+    }
+    chapter.push_str("<p>THE END</p></body></html>");
+    chapter
+}
+
+/// libxml2 stops at 256 levels of nesting and hands back what it has. 300
+/// `<div>`s nobody closed came back as 255, the rest of the chapter gone, and
+/// a well-formed chapter nested that deep lost all its text; both counted as
+/// repaired.
+#[test]
+fn deep_nesting_is_not_cut_short() {
+    for closed in [false, true] {
+        let (out, _) = repair(nested(300, closed).as_bytes());
+
+        assert!(out.contains("Paragraph 300."), "closed: {closed}\n{out}");
+        assert!(out.contains("THE END"), "closed: {closed}\n{out}");
+        // Read back past the strict parser's own 256 levels.
+        let deep = libxml::parser::ParserOptions {
+            huge: true,
+            ..libxml::parser::ParserOptions::default()
+        };
+        libxml::parser::Parser::default()
+            .parse_string_with_options(&out, deep)
+            .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    }
+}
+
+/// Past even the raised limit, recovery would lose the rest of the chapter.
+/// It refuses instead, which leaves the chapter as it was; it never hands
+/// back part of one. (libxml2 2.9 recovers this depth whole; 2.14 stops at
+/// 2048 levels and has to refuse.)
+#[test]
+fn recovery_never_hands_back_part_of_a_chapter() {
+    if let Ok(out) = LibxmlRepair::new().repair(nested(5000, false).as_bytes()) {
+        let out = String::from_utf8(out.bytes).unwrap();
+        assert!(out.contains("Paragraph 5000."), "truncated");
+        assert!(out.contains("THE END"), "truncated");
+    }
+}

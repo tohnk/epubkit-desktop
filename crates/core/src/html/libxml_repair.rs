@@ -69,6 +69,13 @@ static ENTITY_DECLARED: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>"#).unwrap()
 });
 
+/// What a chapter's source has besides its text, for [`kept_the_text`].
+static COMMENTS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
+static TAGS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
+static CHARACTER_REFERENCES: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"&#?[A-Za-z0-9]+;").unwrap());
+
 /// A reference to a named entity.
 static ENTITY_REFERENCE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"&([A-Za-z_:][\w.:-]*);").unwrap());
@@ -137,6 +144,24 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
             child.unlink();
         }
     }
+}
+
+/// Whether `doc`, recovered from `source`, kept at least half of its text.
+///
+/// libxml2 stops at its nesting limit, even raised, and hands back what it
+/// has without an error. Recovery that loses most of a chapter is not
+/// recovery; refusing it leaves the chapter as it was.
+fn kept_the_text(source: &str, doc: &Document) -> bool {
+    let printable = |text: &str| text.chars().filter(|c| !c.is_whitespace()).count();
+
+    let source = COMMENTS.replace_all(source, "");
+    let source = TAGS.replace_all(&source, "");
+    let source = CHARACTER_REFERENCES.replace_all(&source, "&");
+    let kept = doc
+        .get_root_element()
+        .map_or(0, |root| printable(&root.get_content()));
+
+    kept * 2 >= printable(&source)
 }
 
 /// Put the XHTML namespace back on a recovered `<html>` that has lost it: one
@@ -384,6 +409,11 @@ fn declare_utf8(text: Cow<'_, str>) -> Cow<'_, str> {
 /// in every encoding in question, and 2.9 looks for a mark only when at least
 /// four bytes are there to look at, so on a chapter holding nothing else it
 /// would come out as text.
+///
+/// `huge` lifts libxml2's nesting limit from 256 levels to 2048. At 256, a
+/// chapter of unclosed `<div>`s lost everything after the 255th. The limits
+/// it also lifts guard against entity expansion, which the HTML parser does
+/// not do: it reads no DTD.
 fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) {
     let text = std::str::from_utf8(text).expect("decoded to UTF-8 already");
     let text = match without_internal_subset(text) {
@@ -398,6 +428,7 @@ fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) 
     };
     let options = ParserOptions {
         ignore_enc: true,
+        huge: true,
         ..hardened_options(true)
     };
 
@@ -443,7 +474,7 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     // Malformed. The HTML parser recovers without dropping text.
     let (bytes, options) = prepare_for_recovery(&text);
     let mut doc = Parser::default_html()
-        .parse_string_with_options(bytes, options)
+        .parse_string_with_options(&bytes, options)
         .map_err(|e| Error::Xml(format!("unrecoverable XHTML: {e}")))?;
 
     // Recovering an empty or blank file yields no element at all, depending
@@ -452,6 +483,12 @@ pub fn parse_content(input: &[u8]) -> Result<ContentDocument> {
     // nothing to recover.
     if doc.get_root_element().is_none() {
         return Err(Error::Xml("unrecoverable XHTML: no content".into()));
+    }
+
+    if !kept_the_text(&String::from_utf8_lossy(&bytes), &doc) {
+        return Err(Error::Xml(
+            "unrecoverable XHTML: recovery would lose most of the text".into(),
+        ));
     }
 
     strip_html_parser_artifacts(&mut doc);
