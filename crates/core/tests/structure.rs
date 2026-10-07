@@ -708,6 +708,59 @@ fn a_toc_lists_no_chapter_outside_the_book() {
     assert!(!elsewhere.path().join("toc.ncx").exists());
 }
 
+/// IDs are unique across the whole package document, so a generated NCX
+/// takes one nothing else has, and the spine points at it by that.
+#[test]
+fn a_generated_ncx_takes_an_id_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    write_chapter(&dir.path().join("c1.xhtml"), "First", "One");
+    write_chapter(&dir.path().join("c2.xhtml"), "Second", "Two");
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="ncx-2">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="ncx-2">urn:uuid:demo</dc:identifier>
+    <dc:title>T</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="c1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="c2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ncx"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>
+"#);
+
+    assert_eq!(
+        fix_toc(dir.path(), dir.path(), &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
+
+    let ids: Vec<String> = xml::find_nodes(&doc, "//*[@id]")
+        .unwrap()
+        .iter()
+        .map(|node| node.get_attribute("id").unwrap())
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+
+    let ncx = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.media_type == "application/x-dtbncx+xml")
+        .expect("the NCX is declared");
+    let spine = xml::find_first(&doc, "//*[local-name()='spine']")
+        .unwrap()
+        .unwrap();
+    assert_eq!(spine.get_attribute("toc"), Some(ncx.id));
+    assert_eq!(
+        spine_hrefs(&doc).unwrap()[0],
+        ("ncx".to_string(), "c1.xhtml".to_string())
+    );
+}
+
 #[test]
 fn an_empty_spine_is_reported_not_guessed_at() {
     let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -836,8 +889,11 @@ fn a_rotated_image_loses_the_size_it_no_longer_has() {
 #[test]
 fn split_pages_are_declared_under_ids_of_their_own() {
     let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="plate-2-2">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="plate-2-2">urn:uuid:demo</dc:identifier>
+    <dc:title>T</dc:title>
+  </metadata>
   <manifest>
     <item id="plate" href="images/spread_part1.jpg" media-type="image/jpeg"/>
     <item id="plate-2" href="images/unrelated.jpg" media-type="image/jpeg"/>
@@ -853,7 +909,10 @@ fn split_pages_are_declared_under_ids_of_their_own() {
         .into_iter()
         .find(|item| item.href == "images/spread_part2.jpg")
         .expect("the second page should be declared");
-    assert_eq!(added.id, "plate-2-2", "plate-2 was taken");
+    assert_eq!(
+        added.id, "plate-2-3",
+        "plate-2 was taken in the manifest, plate-2-2 in the metadata"
+    );
     assert_eq!(added.media_type, "image/jpeg");
 }
 

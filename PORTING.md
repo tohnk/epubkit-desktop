@@ -466,7 +466,9 @@ stub's comment intended, and reports `TocOutcome::Generated`.
 When the reference did generate an NCX, it copied each chapter's href into it
 as the OPF wrote it: relative to the OPF. An NCX in a folder of its own,
 `Navigation/toc.ncx` say, then pointed every entry at a file that was not
-there. The port writes each link relative to the NCX.
+there. The port writes each link relative to the NCX. It also declares a new
+NCX under an id nothing else in the package has; the reference always used
+`ncx`, which a chapter may already be called.
 
 ### Validation collects all problems
 

@@ -428,7 +428,7 @@ pub fn declare_reshaped_pages(
     reshaped: &BTreeMap<String, Vec<String>>,
 ) -> Result<usize> {
     let items = manifest_items(doc)?;
-    let mut ids: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+    let mut ids = ids_in(doc)?;
     let mut added = 0;
 
     for (first, pages) in reshaped {
@@ -438,12 +438,7 @@ pub fn declare_reshaped_pages(
             .map_or_else(|| "image".to_string(), |item| item.id.clone());
 
         for (index, page) in pages.iter().enumerate().skip(1) {
-            let wanted = format!("{base}-{}", index + 1);
-            let id = std::iter::once(wanted.clone())
-                .chain((2..).map(|n| format!("{wanted}-{n}")))
-                .find(|candidate| !ids.contains(candidate))
-                .expect("an unused suffix always exists");
-
+            let id = unused_id(&ids, &format!("{base}-{}", index + 1));
             add_image_to_opf(doc, &encode(page), &id)?;
             ids.insert(id);
             added += 1;
@@ -1077,20 +1072,40 @@ fn add_ncx_to_opf(doc: &Document, ncx_href: &str) -> Result<()> {
         return Err(Error::InvalidEpub("OPF has no manifest".into()));
     };
 
+    // A book may already use "ncx" for something else.
+    let id = unused_id(&ids_in(doc)?, "ncx");
+
     let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add NCX to manifest: {e}")))?;
-    item.set_attribute("id", "ncx").ok();
+    item.set_attribute("id", &id).ok();
     item.set_attribute("href", ncx_href).ok();
     item.set_attribute("media-type", NCX_MEDIA_TYPE).ok();
 
     // EPUB 2 readers find the NCX through the spine's toc attribute.
     if let Some(mut spine) = xml::find_first(doc, &format!("//{}", xml::local("spine")))? {
-        spine.set_attribute("toc", "ncx").ok();
+        spine.set_attribute("toc", &id).ok();
     }
 
     Ok(())
+}
+
+/// Every `id` in the package document. One must be unique across all of it,
+/// not only among the manifest's items.
+fn ids_in(doc: &Document) -> Result<HashSet<String>> {
+    Ok(xml::find_nodes(doc, "//*[@id]")?
+        .iter()
+        .filter_map(|node| node.get_attribute("id"))
+        .collect())
+}
+
+/// `wanted`, or the first of `wanted-2`, `wanted-3`, … that is not in `ids`.
+fn unused_id(ids: &HashSet<String>, wanted: &str) -> String {
+    std::iter::once(wanted.to_string())
+        .chain((2..).map(|n| format!("{wanted}-{n}")))
+        .find(|candidate| !ids.contains(candidate))
+        .expect("an unused suffix always exists")
 }
 
 fn escape_xml_text(text: &str) -> String {
