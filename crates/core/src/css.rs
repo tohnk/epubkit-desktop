@@ -13,9 +13,11 @@ use std::fs;
 use std::ops::Range;
 use std::path::Path;
 
+use std::sync::LazyLock;
+
 use cssparser::{ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
-use libxml::tree::NodeType;
+use libxml::tree::{Node, NodeType};
 
 use crate::html;
 use crate::{xml, Error, Result};
@@ -40,6 +42,15 @@ const GROUPING_RULES: &[&str] = &[
 /// two. One nested deeper is left as it is there, rather than followed down a
 /// stack that has to end somewhere.
 const MAX_NESTING: usize = 16;
+
+/// A `<style>` element's start tag, prefixed or not and in any case, as bytes:
+/// what a chapter must have for [`remove_embedded_fonts_from_styles`] to have
+/// anything to do.
+static STYLE_ELEMENT: LazyLock<regex::bytes::Regex> =
+    LazyLock::new(|| regex::bytes::Regex::new(r"(?i-u)<(?:[^\s>/:]+:)?style[\s>/]").unwrap());
+
+/// An edit to some text: the bytes it replaces, and what replaces them.
+pub(crate) type Edit = (Range<usize>, String);
 
 /// What a stylesheet opens with to declare its encoding. CSS allows exactly
 /// this form, and only at the very start.
@@ -177,47 +188,129 @@ pub fn remove_unused_css(css_text: &str, used: &UsedSelectors) -> (String, usize
         .collect();
 
     let removed = unused.len();
-    (cut(css_text, &unused), removed)
+    (apply_edits(css_text, &cuts(css_text, &unused)), removed)
 }
 
 /// Remove `@font-face` rules, those inside `@media` and other grouping rules
 /// included. Returns the cleaned stylesheet and how many went.
 pub fn remove_embedded_fonts(css_text: &str) -> (String, usize) {
-    let mut fonts = Vec::new();
-    font_faces(rules(css_text, MAX_NESTING), &mut fonts);
-    fonts.sort_by_key(|span| span.start);
-
-    let removed = fonts.len();
-    (cut(css_text, &fonts), removed)
+    let edits = embedded_font_cuts(css_text);
+    (apply_edits(css_text, &edits), edits.len())
 }
 
 /// Remove `@font-face` rules from the `<style>` elements of an XHTML document,
 /// as [`remove_embedded_fonts`] does from a stylesheet. Returns the document
 /// and how many rules went; the document is untouched if none did.
 pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+    // A chapter is not parsed to find it has no `<style>`. One in UTF-16, the
+    // only encoding a chapter can be in that does not spell it so, is.
+    if !xhtml_bytes.contains(&0) && !STYLE_ELEMENT.is_match(xhtml_bytes) {
+        return Ok((xhtml_bytes.to_vec(), 0));
+    }
+
     let content = html::parse_content(xhtml_bytes)?;
     let mut removed = 0;
-
     for style in xml::find_nodes(&content.doc, &format!("//{}", xml::local("style")))? {
-        for mut text in style.get_child_nodes() {
-            if !matches!(
-                text.get_type(),
-                Some(NodeType::TextNode | NodeType::CDataSectionNode)
-            ) {
-                continue;
-            }
-            let (cleaned, fonts) = remove_embedded_fonts(&text.get_content());
-            if fonts > 0 {
-                text.set_content(&cleaned).ok();
-                removed += fonts;
-            }
-        }
+        removed += edit_style_element(&style, embedded_font_cuts);
     }
 
     if removed == 0 {
         return Ok((xhtml_bytes.to_vec(), 0));
     }
     Ok((html::serialize_content(&content), removed))
+}
+
+/// Edit the stylesheet a `<style>` element holds. `edit` is given its CSS and
+/// says what to change, in order and without overlaps. Returns how many
+/// edits it made.
+///
+/// The CSS is the element's text and CDATA sections, in order, read as one
+/// stylesheet, as a reading engine reads it: a rule can start in one and end
+/// in the next, and the common `/*<![CDATA[*/ … /*]]>*/` makes every rule do
+/// so. What an edit replaces is taken out of whichever of them it spans, and
+/// what replaces it goes into the one it starts in, so that CDATA stays CDATA.
+pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Edit>) -> usize {
+    let mut parts: Vec<(Node, Range<usize>)> = Vec::new();
+    let mut css = String::new();
+    for child in style.get_child_nodes() {
+        if matches!(
+            child.get_type(),
+            Some(NodeType::TextNode | NodeType::CDataSectionNode)
+        ) {
+            let start = css.len();
+            css.push_str(&child.get_content());
+            parts.push((child, start..css.len()));
+        }
+    }
+
+    let edits = edit(&css);
+    if edits.is_empty() || parts.is_empty() {
+        return 0;
+    }
+
+    // Which part a byte of `css` is in. The end of it is in the last.
+    let part_at = |at: usize| {
+        parts
+            .iter()
+            .position(|(_, range)| range.contains(&at))
+            .unwrap_or(parts.len() - 1)
+    };
+    let mut contents = vec![String::new(); parts.len()];
+    let keep = |contents: &mut [String], mut from: usize, to: usize| {
+        while from < to {
+            let part = part_at(from);
+            let until = to.min(parts[part].1.end);
+            contents[part].push_str(&css[from..until]);
+            from = until;
+        }
+    };
+
+    let mut kept_from = 0;
+    for (range, replacement) in &edits {
+        keep(&mut contents, kept_from, range.start);
+        contents[part_at(range.start)].push_str(replacement);
+        kept_from = range.end;
+    }
+    keep(&mut contents, kept_from, css.len());
+
+    for ((mut part, range), content) in parts.iter().cloned().zip(contents) {
+        if content == css[range] {
+            continue;
+        }
+        // Text and CDATA take what they are given as it reads.
+        if content.is_empty() {
+            part.unlink();
+        } else {
+            part.set_content(&content).ok();
+        }
+    }
+
+    edits.len()
+}
+
+/// `text` with `edits`, which are in order and do not overlap, made.
+pub(crate) fn apply_edits(text: &str, edits: &[Edit]) -> String {
+    if edits.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut kept_from = 0;
+    for (range, replacement) in edits {
+        out.push_str(&text[kept_from..range.start]);
+        out.push_str(replacement);
+        kept_from = range.end;
+    }
+    out.push_str(&text[kept_from..]);
+    out
+}
+
+/// What removing every `@font-face` rule from `css` takes out.
+fn embedded_font_cuts(css: &str) -> Vec<Edit> {
+    let mut fonts = Vec::new();
+    font_faces(rules(css, MAX_NESTING), &mut fonts);
+    fonts.sort_by_key(|span| span.start);
+    cuts(css, &fonts)
 }
 
 /// Where the `@font-face` rules among `rules`, and inside them, are.
@@ -233,30 +326,24 @@ fn font_faces(rules: Vec<Rule>, found: &mut Vec<Range<usize>>) {
     }
 }
 
-/// `css` without the bytes in `spans`, which are in order and do not overlap.
-/// Each goes with the blanks after it, up to and including one line break, so
-/// a rule on a line of its own does not leave an empty line behind.
-fn cut(css: &str, spans: &[Range<usize>]) -> String {
-    if spans.is_empty() {
-        return css.to_string();
-    }
-
-    let mut out = String::with_capacity(css.len());
-    let mut kept_from = 0;
-    for span in spans {
-        out.push_str(&css[kept_from..span.start]);
-
-        let rest = &css[span.end..];
-        let blanks = rest.len() - rest.trim_start_matches([' ', '\t']).len();
-        let line_break = match &rest[blanks..] {
-            line if line.starts_with("\r\n") => 2,
-            line if line.starts_with('\n') => 1,
-            _ => 0,
-        };
-        kept_from = span.end + blanks + line_break;
-    }
-    out.push_str(&css[kept_from..]);
-    out
+/// What taking the bytes in `spans`, which are in order and do not overlap,
+/// out of `css` takes. Each goes with the blanks after it, up to and
+/// including one line break, so a rule on a line of its own does not leave an
+/// empty line behind.
+fn cuts(css: &str, spans: &[Range<usize>]) -> Vec<Edit> {
+    spans
+        .iter()
+        .map(|span| {
+            let rest = &css[span.end..];
+            let blanks = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            let line_break = match &rest[blanks..] {
+                line if line.starts_with("\r\n") => 2,
+                line if line.starts_with('\n') => 1,
+                _ => 0,
+            };
+            (span.start..span.end + blanks + line_break, String::new())
+        })
+        .collect()
 }
 
 /// One rule of a stylesheet, where it stands in the text.

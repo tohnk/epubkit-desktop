@@ -469,6 +469,42 @@ fn css_urls_are_found_however_they_are_written() {
     }
 }
 
+/// A `<style>` element's text and CDATA sections are one stylesheet, and a
+/// url can start in one and end in the next. Read one at a time, neither held
+/// a url.
+#[test]
+fn a_url_split_across_a_style_elements_cdata_follows_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { background: url(<![CDATA[../images/a.png]]>) }</style><style type="text/css">
+/*<![CDATA[*/
+.b { background: url(../images/b.png) }
+/*]]>*/
+</style></head><body><p>x</p></body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("images/a.png", "images/a.jpg"),
+        ("images/b.png", "images/b.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".a { background: url(../images/a.jpg) }"),
+        "{out}"
+    );
+    assert!(
+        out.contains("/*<![CDATA[*/\n.b { background: url(../images/b.jpg) }\n/*]]>*/"),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
 /// An image is named by more than `<img src>`: by `srcset`, a link to the
 /// full size, a video's poster, an object's data, a page's background, SVG 2's
 /// plain `href` beside `xlink:href`, and `url()` in a `<style>` element as

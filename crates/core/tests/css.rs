@@ -1,7 +1,8 @@
 use epubkit_core::css::{
-    collect_used_selectors, decode_stylesheet, remove_embedded_fonts, remove_unused_css,
-    UsedSelectors,
+    collect_used_selectors, decode_stylesheet, remove_embedded_fonts,
+    remove_embedded_fonts_from_styles, remove_unused_css, UsedSelectors,
 };
+use epubkit_core::xml;
 
 fn used_from(body: &str) -> UsedSelectors {
     let xhtml = format!(
@@ -269,6 +270,47 @@ fn deeply_nested_css_does_not_exhaust_the_stack() {
     assert!(unused.contains(".inner"));
     assert_eq!(removed_fonts, 1);
     assert!(!fonts.contains("@font-face"));
+}
+
+/// A `<style>` element's text and CDATA sections are one stylesheet, as a
+/// reading engine reads them. Cleaned one at a time, a rule that started in
+/// one and ended in the next was cut in half, and the common
+/// `/*<![CDATA[*/ … /*]]>*/` wrapping hid every rule inside it.
+#[test]
+fn a_style_elements_text_and_cdata_are_one_stylesheet() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    let cleaned = |style: &str| {
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter(style).as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+        (out, removed)
+    };
+
+    let (out, removed) = cleaned(
+        "@font-face { font-family: Test; <![CDATA[src: url(test.ttf);]]> } p { color: red; }",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(!out.contains("font-face"), "{out}");
+    assert!(!out.contains("test.ttf"), "{out}");
+    assert!(
+        out.contains(r#"<style type="text/css">p { color: red; }</style>"#),
+        "{out}"
+    );
+
+    let (out, removed) = cleaned(
+        "\n/*<![CDATA[*/\n@font-face { font-family: Wrapped; src: url(w.ttf) }\np { margin: 0 }\n/*]]>*/\n",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(
+        out.contains("<style type=\"text/css\">\n/*<![CDATA[*/\np { margin: 0 }\n/*]]>*/\n</style>"),
+        "{out}"
+    );
 }
 
 // ------------------------------------------------------------- encodings

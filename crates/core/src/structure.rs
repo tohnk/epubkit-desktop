@@ -9,9 +9,10 @@ use std::path::{Component, Path, PathBuf};
 use std::ops::Range;
 
 use cssparser::{ParseError, Parser as CssParser, ParserInput, Token};
-use libxml::tree::{Document, Namespace, Node, NodeType};
+use libxml::tree::{Document, Namespace, Node};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
+use crate::css::{self, Edit};
 use crate::html;
 use crate::xml::{self, NS_XML};
 use crate::{Error, Result};
@@ -425,20 +426,7 @@ fn rewrite_references(doc: &Document, base: &Path, renames: &Renames) -> Result<
         }
 
         if local_name(&node) == "style" {
-            for mut text in node.get_child_nodes() {
-                if !matches!(
-                    text.get_type(),
-                    Some(NodeType::TextNode | NodeType::CDataSectionNode)
-                ) {
-                    continue;
-                }
-                let css = text.get_content();
-                let new_css = rewrite_css_urls(&css, base, renames);
-                if new_css != css {
-                    text.set_content(&new_css).ok();
-                    updated += 1;
-                }
-            }
+            updated += css::edit_style_element(&node, |css| css_url_edits(css, base, renames));
         }
     }
 
@@ -1103,10 +1091,15 @@ fn has_scheme(reference: &str) -> bool {
 /// Rewrite the `url()` targets in CSS text that name a renamed file, and the
 /// strings `image-set()` names images with. Every other byte, quotes and
 /// padding included, stays as written.
+fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
+    css::apply_edits(css, &css_url_edits(css, base, renames))
+}
+
+/// What [`rewrite_css_urls`] changes, in order.
 ///
 /// The text is tokenized as a browser does: `URL(` in any case, a `)` inside a
 /// quoted url, escapes and comments are all read for what they are.
-fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
+fn css_url_edits(css: &str, base: &Path, renames: &Renames) -> Vec<Edit> {
     let mut edits = Vec::new();
     let mut input = ParserInput::new(css);
     let mut parser = CssParser::new(&mut input);
@@ -1119,20 +1112,7 @@ fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
         false,
         &mut edits,
     );
-
-    if edits.is_empty() {
-        return css.to_string();
-    }
-
-    let mut out = String::with_capacity(css.len());
-    let mut kept_from = 0;
-    for (range, replacement) in edits {
-        out.push_str(&css[kept_from..range.start]);
-        out.push_str(&replacement);
-        kept_from = range.end;
-    }
-    out.push_str(&css[kept_from..]);
-    out
+    edits
 }
 
 /// Note, in order, what each url in `parser`'s input that names a renamed
@@ -1144,7 +1124,7 @@ fn find_css_urls(
     renames: &Renames,
     depth: usize,
     in_image_set: bool,
-    edits: &mut Vec<(Range<usize>, String)>,
+    edits: &mut Vec<Edit>,
 ) {
     loop {
         let start = parser.position().byte_index();
@@ -1211,7 +1191,7 @@ fn edit_css_string(
     url: &str,
     base: &Path,
     renames: &Renames,
-    edits: &mut Vec<(Range<usize>, String)>,
+    edits: &mut Vec<Edit>,
 ) {
     let Some(new_url) = rewrite_reference(url, base, renames) else {
         return;

@@ -344,6 +344,13 @@ not plain names and combinators. And removing fonts reaches into `@media`
 and other grouping rules, where the reference left `@font-face` rules
 pointing at the files it deleted.
 
+A `<style>` element's text and CDATA sections are one stylesheet, read in
+order, as a reading engine reads them. Removing a font or rewriting a url
+edits them as one, then puts each piece back in the section it came from,
+so CDATA stays CDATA. Edited one section at a time, a rule split between two
+was cut in half, and the common `/*<![CDATA[*/ … /*]]>*/` wrapping hid every
+rule inside it.
+
 ### Empty paragraphs are collapsed among siblings
 
 `normalize_whitespace` tracked runs of empty `<p>`/`<div>` in document order,
