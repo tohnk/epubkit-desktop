@@ -403,3 +403,19 @@ fn typewriter_variable_and_math_text_is_left_alone() {
         assert!(out.contains(literal), "{literal:?}:\n{out}");
     }
 }
+
+/// Old HTML wrote Word's punctuation as `&#146;`, `&#150;` and `&#133;`, the
+/// bytes it has in windows-1252, and HTML parsers read them that way. XML
+/// reads them as the invisible control characters at those code points.
+#[test]
+fn control_characters_where_punctuation_belongs_are_read_as_windows_1252() {
+    let (out, report) = clean_with(
+        "<p>Don&#146;t &#150; wait&#133; &#147;now&#148;</p>",
+        &KEEP_QUOTES,
+    );
+    assert!(
+        out.contains("Don\u{2019}t \u{2013} wait\u{2026} \u{201c}now\u{201d}"),
+        "{out}"
+    );
+    assert_eq!(report.encoding_issues_fixed, 5);
+}

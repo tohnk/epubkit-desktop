@@ -111,12 +111,12 @@ Note: stock Xteink firmware (X3 and X4 alike) does not render images inside EPUB
 
 ## Text cleanup details
 
-Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`):
+Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`, `<kbd>`, `<samp>`, `<tt>`, `<var>` and MathML):
 
 - **Whitespace**: Multiple spaces/tabs between words → single space, removes plain spaces before punctuation that ends a word (French spacing and no-break spaces are left alone)
 - **OCR ligatures**: fi (U+FB01), fl (U+FB02), ffi (U+FB03), ffl (U+FB04), ff (U+FB00) → plain ASCII
 - **Smart quotes**: Typographic quotes/dashes → straight equivalents
-- **Mojibake**: Detects and repairs common UTF-8/Latin-1 double-encoding patterns
+- **Mojibake**: Detects and repairs common UTF-8/Latin-1 double-encoding patterns, and Word's punctuation written as Latin-1 control characters (`&#146;`)
 - **Punctuation**: 4+ dots → ellipsis, missing space after sentence-ending punctuation, duplicate commas
 - **Unicode**: NFC normalization
 

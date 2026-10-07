@@ -6,6 +6,7 @@
 
 use std::sync::LazyLock;
 
+use encoding_rs::WINDOWS_1252;
 use libxml::tree::{Node, NodeType};
 use regex::{Captures, Regex};
 use serde::Serialize;
@@ -282,6 +283,10 @@ pub fn clean_string(
             },
             &mut report.encoding_issues_fixed,
         );
+        // What is left of the C1 controls is windows-1252's punctuation at
+        // the same bytes, as old HTML wrote it: `&#146;` for a curly quote,
+        // which HTML parsers read that way and XML does not.
+        text = c1_as_windows_1252(&text, &mut report.encoding_issues_fixed);
     }
 
     if options.fix_whitespace {
@@ -351,6 +356,35 @@ pub fn clean_string(
     }
 
     text
+}
+
+/// `text` with each C1 control character read as the windows-1252 character
+/// at the same byte. The five bytes windows-1252 leaves undefined stay as
+/// they are.
+fn c1_as_windows_1252(text: &str, count: &mut usize) -> String {
+    let c1 = |c: char| ('\u{80}'..='\u{9f}').contains(&c);
+    if !text.contains(c1) {
+        return text.to_string();
+    }
+
+    text.chars()
+        .map(|c| {
+            if !c1(c) {
+                return c;
+            }
+            let byte = [u8::try_from(u32::from(c)).expect("a C1 control is one byte")];
+            let read = WINDOWS_1252
+                .decode_without_bom_handling(&byte)
+                .0
+                .chars()
+                .next()
+                .unwrap_or(c);
+            if read != c {
+                *count += 1;
+            }
+            read
+        })
+        .collect()
 }
 
 /// Fold typographic quotes, dashes and ellipses to ASCII, leaving the ones
