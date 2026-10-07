@@ -266,8 +266,18 @@ seven bits, so its bytes are valid UTF-8 as well. A chapter that names it and
 has the escapes it switches character sets with is read as ISO-2022-JP; read
 as UTF-8, its Japanese came out as ASCII gibberish.
 
-Only real declarations are renamed UTF-8: the XML declaration where it opens
-the chapter, and a `<meta>` element's `charset`, or the charset in an
+Only real declarations count. A legacy chapter's `<meta>` charset is found
+as the HTML standard's prescan finds it: a tag's attributes are read with
+their quotes, comments and CDATA sections are passed over, and a `content`
+declares a charset only for an `http-equiv="Content-Type"`. Beyond the
+prescan, the text of a script, a stylesheet, a title or a text area is passed
+over too, so a `"<!--"` in a script is not taken for a comment that hides the
+`<meta>` after it. A pattern over the text found `<meta>`s in comments and in
+other `<meta>`s' descriptions, and one version of it took a script's `<!--`
+for a comment.
+
+Only real declarations are renamed UTF-8, too: the XML declaration where it
+opens the chapter, and a `<meta>` element's `charset`, or the charset in an
 `http-equiv="Content-Type"`'s `content`, found on the parsed chapter. The same
 words in a CDATA section, a comment or another `<meta>`'s `content` are text,
 and stay as written. Renaming by pattern over the text changed them too, and

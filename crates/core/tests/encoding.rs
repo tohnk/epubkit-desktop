@@ -410,6 +410,50 @@ fn unclosed_cdata_sections_are_passed_over_once() {
     assert!(output.contains(GERMAN), "{}", &output[..200]);
 }
 
+/// A `<meta>` charset is found as a browser finds it. A `<!--` in a script, a
+/// stylesheet or a quoted attribute is text there, not the start of a
+/// comment; what a real comment or CDATA section holds is passed over; and a
+/// `<meta>` whose `content` mentions a charset without declaring one says
+/// nothing. Taken for a comment that never ended, a script's `"<!--"` hid the
+/// `<meta>` after it, and a windows-1251 chapter came out in Latin letters.
+#[test]
+fn only_a_real_meta_charset_decides_the_encoding() {
+    let before_meta = [
+        r#"<script>var marker = "<!--";</script>"#,
+        r#"<script>var marker = "<![CDATA[";</script>"#,
+        r#"<style>p::before { content: "<!--" }</style>"#,
+        r#"<link rel="next" title="<!--" href="next.html"/>"#,
+        r#"<!-- <meta charset="iso-8859-1"> -->"#,
+        r#"<![CDATA[<meta charset="iso-8859-1">]]>"#,
+        r#"<meta name="description" content="Notes on charset=iso-8859-1"/>"#,
+    ];
+    for markup in before_meta {
+        let chapter = format!(
+            r#"<html><head>{markup}<meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p></body></html>"#
+        );
+        let output = read(&encoded(WINDOWS_1251, &chapter));
+        assert!(output.contains(RUSSIAN), "{markup}: {output}");
+    }
+}
+
+/// Finding the `<meta>` reads each byte before it once, however many tags,
+/// comments and scripts stand there.
+#[test]
+fn finding_a_meta_charset_reads_the_chapter_once() {
+    let chapter = format!(
+        r#"<html><head>{}<meta charset="windows-1251"><title>Title</title></head><body><p>{RUSSIAN}</p></body></html>"#,
+        r#"<!--x--><i title="a" lang=b></i><script>"</a>"</script>"#.repeat(20_000)
+    );
+    let bytes = encoded(WINDOWS_1251, &chapter);
+
+    let output = common::finishes_within(std::time::Duration::from_secs(20), move || read(&bytes));
+    assert!(
+        output.contains(RUSSIAN),
+        "{}",
+        &output[output.len() - 200..]
+    );
+}
+
 // Every pass that reads a chapter shares the repair step's parse, so each must
 // keep UTF-8 intact on its own, not only after repair has run.
 

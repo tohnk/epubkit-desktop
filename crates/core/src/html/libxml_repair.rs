@@ -57,17 +57,18 @@ static XML_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i-u)\A\s*<\?xml\s[^>]*?\bencoding\s*=\s*["']([^"'>]*)["']"#).unwrap()
 });
 
-/// The encoding a `<meta>` names, as `charset="…"` or inside `content="…;
-/// charset=…"`. Comments and CDATA sections match too, without a name, so
-/// that a `<meta>` written inside one is passed over with it. One that never
-/// closes runs to the end, as a parser reads it; matching it only where it
-/// closed had the search look for its end again from every `<meta>` after it.
+/// What may be a `<meta>` naming an encoding, as `charset="…"` or inside
+/// `content="…; charset=…"`, wherever it is written: in a comment, a script
+/// or another tag's attribute too. Only the parsed chapter says which are
+/// `<meta>` elements ([`declare_utf8_in_meta`]); this says which chapters
+/// are worth asking.
 static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s-u)<!--.*?(?:-->|\z)|<!\[CDATA\[.*?(?:\]\]>|\z)|(?i:<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+))"#,
-    )
-    .unwrap()
+    Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
 });
+
+/// Elements whose text HTML reads as text to their end tag, a `<!--` in it
+/// included.
+const RAW_TEXT_ELEMENTS: &[&[u8]] = &[b"script", b"style", b"title", b"textarea"];
 
 /// A general entity a DOCTYPE's internal subset declares with a plain value:
 /// not a parameter entity, and not one fetched from elsewhere.
@@ -675,7 +676,7 @@ fn declare_utf8_in_meta(doc: &Document, source: &[u8]) -> Result<()> {
         let Some(content) = meta.get_attribute_no_ns("content").filter(|_| pragma) else {
             continue;
         };
-        if let Some(label) = content_charset(&content) {
+        if let Some(label) = content_charset(content.as_bytes()) {
             if names_other_than_utf8(content[label.clone()].as_bytes()) {
                 let renamed = format!("{}utf-8{}", &content[..label.start], &content[label.end..]);
                 meta.set_attribute("content", &renamed).ok();
@@ -689,8 +690,7 @@ fn declare_utf8_in_meta(doc: &Document, source: &[u8]) -> Result<()> {
 /// Where the encoding a `<meta>`'s `content` names is, found as the HTML
 /// standard's algorithm for extracting a character encoding from a meta
 /// element finds it.
-fn content_charset(content: &str) -> Option<std::ops::Range<usize>> {
-    let bytes = content.as_bytes();
+fn content_charset(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     let blank = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_whitespace);
     let mut from = 0;
 
@@ -777,19 +777,181 @@ fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) 
 }
 
 /// The encodings a chapter names, as far as they are known: in its XML
-/// declaration, and then in its first `<meta>` that names one.
-fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> + '_ {
+/// declaration, and then in its first `<meta>` that names one
+/// ([`meta_charset`]).
+fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> {
     let in_declaration = XML_DECLARED
         .captures(input)
-        .and_then(|declared| declared.get(1));
-    let in_meta = META_DECLARED
-        .captures_iter(input)
-        .find_map(|declared| declared.get(1));
+        .and_then(|declared| declared.get(1))
+        .and_then(|label| Encoding::for_label(label.as_bytes()));
 
-    in_declaration
-        .into_iter()
-        .chain(in_meta)
-        .filter_map(|label| Encoding::for_label(label.as_bytes()))
+    in_declaration.into_iter().chain(meta_charset(input))
+}
+
+/// The encoding the first `<meta>` in `bytes` that names one names, found as
+/// the HTML standard's prescan finds it: a tag's attributes are read with
+/// their quotes, comments and CDATA sections are passed over, and a `<meta>`
+/// declares what its `charset` says, or what its `content` says if it is an
+/// `http-equiv="Content-Type"`. Beyond the prescan, what a script, a
+/// stylesheet, a title or a text area holds is passed over to its end tag,
+/// as HTML reads it, `<!--` and all.
+///
+/// Something that never ends runs to the end. Each byte is read once.
+fn meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
+    let find = |from: usize, needle: &[u8]| {
+        bytes[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|at| from + at)
+    };
+
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].iter().position(|&byte| byte == b'<') {
+        at += offset;
+        let rest = &bytes[at..];
+        let letter_at = |index: usize| rest.get(index).is_some_and(u8::is_ascii_alphabetic);
+
+        if rest.starts_with(b"<!--") {
+            // `<!-->` ends itself, as in HTML.
+            at = find(at + 2, b"-->")? + 3;
+        } else if rest.starts_with(b"<![CDATA[") {
+            at = find(at + 9, b"]]>")? + 3;
+        } else if letter_at(1) || (rest.get(1) == Some(&b'/') && letter_at(2)) {
+            let end_tag = rest[1] == b'/';
+            let name_start = at + 1 + usize::from(end_tag);
+            at = bytes[name_start..]
+                .iter()
+                .position(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+                .map_or(bytes.len(), |length| name_start + length);
+            let name = &bytes[name_start..at];
+            let meta = !end_tag && name.eq_ignore_ascii_case(b"meta");
+
+            let (mut charset, mut pragma, mut content) = (None, None, None);
+            loop {
+                let (attribute, next) = read_attribute(bytes, at);
+                at = next;
+                let Some((attribute, value)) = attribute else {
+                    break;
+                };
+                if !meta {
+                    continue;
+                }
+                if attribute.eq_ignore_ascii_case(b"charset") {
+                    charset.get_or_insert(value);
+                } else if attribute.eq_ignore_ascii_case(b"http-equiv") {
+                    pragma.get_or_insert(value.trim_ascii().eq_ignore_ascii_case(b"content-type"));
+                } else if attribute.eq_ignore_ascii_case(b"content") {
+                    content.get_or_insert(value);
+                }
+            }
+
+            if meta {
+                let label = charset.or_else(|| {
+                    let content = content.filter(|_| pragma == Some(true))?;
+                    content_charset(content).map(|label| &content[label])
+                });
+                if let Some(encoding) = label.and_then(Encoding::for_label) {
+                    return Some(encoding);
+                }
+            }
+            if at == bytes.len() {
+                return None;
+            }
+
+            // A raw text element closed where it opens holds nothing.
+            let closed = bytes[at - 1] == b'/';
+            at += 1;
+            if !end_tag
+                && !closed
+                && RAW_TEXT_ELEMENTS
+                    .iter()
+                    .any(|raw| name.eq_ignore_ascii_case(raw))
+            {
+                at = end_tag_of(bytes, at, name)?;
+            }
+        } else if rest.starts_with(b"<!") || rest.starts_with(b"</") || rest.starts_with(b"<?") {
+            at += rest.iter().position(|&byte| byte == b'>')? + 1;
+        } else {
+            at += 1;
+        }
+    }
+
+    None
+}
+
+/// An attribute's name and value, as a tag writes them.
+type Attribute<'a> = (&'a [u8], &'a [u8]);
+
+/// The next attribute of a tag, read from `at` as the HTML standard's prescan
+/// reads one, and where reading it stopped: none at the tag's `>`, or at the
+/// end of `bytes`. An attribute with no value has an empty one.
+fn read_attribute(bytes: &[u8], mut at: usize) -> (Option<Attribute<'_>>, usize) {
+    let blank = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_whitespace);
+    while blank(at) || bytes.get(at) == Some(&b'/') {
+        at += 1;
+    }
+    if bytes.get(at).is_none_or(|&byte| byte == b'>') {
+        return (None, at);
+    }
+
+    // A name runs to a blank, `=`, `/` or `>`, though it may start with `=`.
+    let name_start = at;
+    at += 1;
+    while bytes
+        .get(at)
+        .is_some_and(|&byte| !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'>'))
+    {
+        at += 1;
+    }
+    let name = &bytes[name_start..at];
+    while blank(at) {
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b'=') {
+        return (Some((name, &[])), at);
+    }
+    at += 1;
+    while blank(at) {
+        at += 1;
+    }
+
+    match bytes.get(at) {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let start = at + 1;
+            let end = bytes[start..]
+                .iter()
+                .position(|&byte| byte == quote)
+                .map_or(bytes.len(), |length| start + length);
+            (Some((name, &bytes[start..end])), (end + 1).min(bytes.len()))
+        }
+        _ => {
+            let start = at;
+            while bytes
+                .get(at)
+                .is_some_and(|&byte| !byte.is_ascii_whitespace() && byte != b'>')
+            {
+                at += 1;
+            }
+            (Some((name, &bytes[start..at])), at)
+        }
+    }
+}
+
+/// Where the end tag of the `name` element whose text starts at `from` is.
+fn end_tag_of(bytes: &[u8], mut from: usize, name: &[u8]) -> Option<usize> {
+    loop {
+        let at = from + bytes[from..].windows(2).position(|pair| pair == b"</")?;
+        let after = &bytes[at + 2..];
+        if after.len() >= name.len()
+            && after[..name.len()].eq_ignore_ascii_case(name)
+            && after
+                .get(name.len())
+                .is_none_or(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        {
+            return Some(at);
+        }
+        from = at + 2;
+    }
 }
 
 /// The legacy encoding a chapter that is not UTF-8 names, in its XML
@@ -923,20 +1085,61 @@ impl HtmlRepair for LibxmlRepair {
 mod tests {
     use super::*;
 
-    /// A comment or CDATA section that never closes runs to the end, so a
-    /// `<meta>` after it is inside it. Matched only where one closed, each
-    /// `<meta>` after one sent the search on to the end of the chapter again.
+    /// A `<meta>` charset is found as a browser finds it.
     #[test]
-    fn what_never_closes_runs_to_the_end() {
-        for unclosed in ["<!--", "<![CDATA["] {
-            let text = format!(
-                r#"<html><head>{unclosed}<meta charset="latin1"><meta charset="utf-8"></head></html>"#
-            );
-            let named = META_DECLARED
-                .captures_iter(text.as_bytes())
-                .filter_map(|declared| declared.get(1))
-                .count();
-            assert_eq!(named, 0, "{unclosed}");
+    fn a_meta_charset_is_found_as_browsers_find_it() {
+        use encoding_rs::{KOI8_R, SHIFT_JIS, WINDOWS_1251};
+
+        let cases: &[(&str, Option<&'static Encoding>)] = &[
+            (r#"<meta charset="windows-1251">"#, Some(WINDOWS_1251)),
+            ("<META CHARSET=KOI8-R>", Some(KOI8_R)),
+            (
+                r#"<meta http-equiv="Content-Type" content="text/html; charset=shift_jis">"#,
+                Some(SHIFT_JIS),
+            ),
+            // Content names a charset only for an http-equiv.
+            (r#"<meta content="text/html; charset=shift_jis">"#, None),
+            // A name nobody knows is passed over for the next.
+            (
+                r#"<meta charset="no-such-thing"><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<!-- <meta charset="koi8-r"> --><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<![CDATA[<meta charset="koi8-r">]]><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<script>"<!--"</script><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<SCRIPT>"</scripts>"</SCRIPT ><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<script src="a.js"/><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            (
+                r#"<p title='<meta charset="koi8-r"> <!--'>x</p><meta charset="windows-1251">"#,
+                Some(WINDOWS_1251),
+            ),
+            // What never ends runs to the end.
+            (r#"<!-- never closed <meta charset="windows-1251">"#, None),
+            (
+                r#"<script>never closed <meta charset="windows-1251">"#,
+                None,
+            ),
+            ("<p title=\"never closed <meta charset=windows-1251>", None),
+            // A meta at the very end counts, closed or not.
+            (r#"<meta charset="windows-1251""#, Some(WINDOWS_1251)),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(meta_charset(text.as_bytes()), *expected, "{text}");
         }
     }
 }
