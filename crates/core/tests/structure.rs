@@ -495,6 +495,34 @@ fn css_urls_are_found_however_they_are_written() {
     }
 }
 
+/// What an entity stands for is part of a `<style>`'s CSS, though it is not
+/// text there. Read as if it were not there, `url(&cdn;cover.png)` named the
+/// book's own `cover.png`, and was rewritten with the entity left behind
+/// outside the url.
+#[test]
+fn a_url_with_an_entity_in_it_is_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY cdn "https://cdn.example/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.remote { background: url(&cdn;cover.png) }</style></head>
+<body><p><img src="cover.png" alt=""/></p></body></html>
+"#,
+    );
+    let map = rename_map(&[("cover.png", "cover.jpg")]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".remote { background: url(&cdn;cover.png) }"),
+        "{out}"
+    );
+    assert!(out.contains(r#"<img src="cover.jpg""#), "{out}");
+}
+
 /// A srcset is split as the HTML standard splits it: a URL runs to the first
 /// blank, commas and all, and only a comma after it, outside parentheses,
 /// ends a candidate. Split at every comma, a remote image whose URL held one

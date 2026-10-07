@@ -315,6 +315,23 @@ fn a_style_elements_text_and_cdata_are_one_stylesheet() {
     );
 }
 
+/// What an entity stands for is part of a `<style>`'s CSS, though it is not
+/// text there, and cannot be edited where it is written. Read as if it were
+/// not there, an `@font-face` with one in it was cut around it, leaving the
+/// entity's text to run into the next rule's selector.
+#[test]
+fn a_style_with_an_entity_in_it_is_left_as_it_is() {
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY fonts "fonts/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">@font-face { font-family: X; src: url(&fonts;x.ttf) } p { color: red }</style></head><body><p>x</p></body></html>
+"#;
+
+    let (out, removed) = remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap();
+
+    assert_eq!(removed, 0);
+    assert_eq!(String::from_utf8(out).unwrap(), chapter);
+}
+
 // ------------------------------------------------------------- encodings
 
 #[test]

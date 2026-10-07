@@ -229,17 +229,23 @@ pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>,
 /// in the next, and the common `/*<![CDATA[*/ … /*]]>*/` makes every rule do
 /// so. What an edit replaces is taken out of whichever of them it spans, and
 /// what replaces it goes into the one it starts in, so that CDATA stays CDATA.
+///
+/// A `<style>` with an entity reference in it is left as it is. What the
+/// entity stands for is part of the CSS, but cannot be edited where it is
+/// written, and read as if it were not there, the CSS around it is misread:
+/// `url(&cdn;cover.png)` is not `url(cover.png)`.
 pub(crate) fn edit_style_element(style: &Node, edit: impl FnOnce(&str) -> Vec<Edit>) -> usize {
     let mut parts: Vec<(Node, Range<usize>)> = Vec::new();
     let mut css = String::new();
     for child in style.get_child_nodes() {
-        if matches!(
-            child.get_type(),
-            Some(NodeType::TextNode | NodeType::CDataSectionNode)
-        ) {
-            let start = css.len();
-            css.push_str(&child.get_content());
-            parts.push((child, start..css.len()));
+        match child.get_type() {
+            Some(NodeType::TextNode | NodeType::CDataSectionNode) => {
+                let start = css.len();
+                css.push_str(&child.get_content());
+                parts.push((child, start..css.len()));
+            }
+            Some(NodeType::EntityRefNode) => return 0,
+            _ => {}
         }
     }
 
