@@ -299,8 +299,11 @@ Several of the reference's text fixes changed text that was right:
 
 - Removing space before punctuation glued ".45", ".NET" and ".com" to the
   word before, and stripped French spacing before `; : ! ?`. Only plain
-  spaces before a mark that ends a word are removed now, and in a French
-  chapter or book only before `.` and `,`.
+  spaces before a mark that ends a word are removed now, and in French text
+  only before `.` and `,`. Text is in the language of the nearest element
+  that gives one in `xml:lang` or `lang`, as a browser reads it, and in the
+  book's where none does: a French quotation in an English book keeps its
+  spacing.
 - No-break spaces were folded to plain ones, so a scene break written as a
   paragraph holding one collapsed to nothing. They are kept.
 - `‚`, which opens a German quote, was folded to a comma, and `„` not at all.

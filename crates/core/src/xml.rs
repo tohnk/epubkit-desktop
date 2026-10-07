@@ -19,6 +19,9 @@ use libxml::xpath::Context;
 
 use crate::{Error, Result};
 
+/// The namespace of `xml:lang`, `xml:id` and the other `xml:` attributes.
+pub(crate) const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// Parser options hardened for untrusted input.
 ///
 /// EPUBs arrive from the open internet, so the parser must not be a network

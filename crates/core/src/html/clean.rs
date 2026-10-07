@@ -207,29 +207,33 @@ fn should_strip(attribute_name: &str) -> bool {
 /// marker, a page break say; only `class` and `style` leave it plain spacing.
 /// An entity it holds is content unless it is a space: under a doctype that
 /// is never loaded, `&bull;` stays a reference with no text of its own.
+///
+/// What it holds is looked at first, since most blocks hold something.
 fn is_empty_block(node: &Node) -> bool {
     if !matches!(local_name(node).as_str(), "p" | "div") {
         return false;
     }
 
-    let plain = node
-        .get_attributes()
-        .keys()
-        .all(|name| matches!(name.as_str(), "class" | "style"));
-    if !plain {
-        return false;
-    }
-
-    let has_content_child = node
+    let blank = node
         .get_child_nodes()
         .iter()
-        .any(|child| match child.get_type() {
-            Some(NodeType::ElementNode) => true,
-            Some(NodeType::EntityRefNode) => !SPACE_ENTITIES.contains(&child.get_name().as_str()),
-            _ => false,
+        .all(|child| match child.get_type() {
+            Some(NodeType::ElementNode) => false,
+            Some(NodeType::EntityRefNode) => {
+                SPACE_ENTITIES.contains(&child.get_name().as_str())
+                    && child.get_content().trim().is_empty()
+            }
+            Some(NodeType::TextNode | NodeType::CDataSectionNode) => {
+                child.get_content().trim().is_empty()
+            }
+            _ => true,
         });
 
-    !has_content_child && node.get_content().trim().is_empty()
+    blank
+        && node
+            .get_attributes()
+            .keys()
+            .all(|name| matches!(name.as_str(), "class" | "style"))
 }
 
 fn local_name(node: &Node) -> String {

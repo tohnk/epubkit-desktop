@@ -13,13 +13,12 @@ use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::html;
-use crate::xml;
+use crate::xml::{self, NS_XML};
 use crate::{Error, Result};
 
 pub const NS_OPF: &str = "http://www.idpf.org/2007/opf";
 pub const NS_NCX: &str = "http://www.daisy.org/z3986/2005/ncx/";
 pub const NS_XLINK: &str = "http://www.w3.org/1999/xlink";
-const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
 
 const NCX_MEDIA_TYPE: &str = "application/x-dtbncx+xml";
 

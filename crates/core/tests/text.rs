@@ -322,6 +322,71 @@ fn french_spacing_and_no_break_spaces_before_punctuation_stay() {
     assert!(out.contains("Vrai\u{a0}? Yes\u{202f}!"), "{out}");
 }
 
+/// Clean a chapter whose root has `root_attributes`, in a book in
+/// `book_language`.
+fn clean_in(root_attributes: &str, body: &str, book_language: &str) -> String {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" {root_attributes}><head><title>T</title></head>{body}</html>
+"#
+    );
+    let options = TextCleanOptions {
+        language: book_language.to_string(),
+        ..KEEP_QUOTES
+    };
+    let (bytes, _) = clean_text_content(chapter.as_bytes(), &options).unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
+/// Text is in the language of the nearest element that gives one, as a
+/// browser reads it: a French passage in an English book keeps its spacing,
+/// and an English one in a French book does not.
+#[test]
+fn the_nearest_language_decides_french_spacing() {
+    let out = clean_in(
+        r#"xml:lang="en" lang="en""#,
+        r#"<body><p>Hello ! <span xml:lang="fr">Bonjour ! Comment allez-vous ?</span> Bye !</p><p lang="fr">Oui ! <em lang="en">Yes !</em> Non !</p></body>"#,
+        "en",
+    );
+    for kept in ["Bonjour ! Comment allez-vous ?", "Oui ! ", " Non !"] {
+        assert!(out.contains(kept), "{kept}: {out}");
+    }
+    for fixed in ["Hello! ", " Bye!", "Yes!"] {
+        assert!(out.contains(fixed), "{fixed}: {out}");
+    }
+
+    let out = clean_in(
+        "",
+        r#"<body><p>Oui ! <span xml:lang="en-GB">Yes !</span></p></body>"#,
+        "fr",
+    );
+    assert!(out.contains("Oui ! "), "{out}");
+    assert!(out.contains("Yes!"), "{out}");
+}
+
+/// A body that gives a language other than its root's is in that one.
+#[test]
+fn a_french_body_under_an_english_root_is_french() {
+    let out = clean_in(
+        r#"lang="en""#,
+        r#"<body xml:lang="fr"><p>Oui ! Non ?</p></body>"#,
+        "en",
+    );
+    assert!(out.contains("Oui ! Non ?"), "{out}");
+}
+
+/// `xml:lang` is what XHTML reads where an element gives both.
+#[test]
+fn xml_lang_outranks_lang() {
+    let out = clean_in(
+        "",
+        r#"<body><p lang="en" xml:lang="fr">Oui !</p><p xml:lang="en" lang="fr">Yes !</p></body>"#,
+        "",
+    );
+    assert!(out.contains("Oui !"), "{out}");
+    assert!(out.contains("Yes!"), "{out}");
+}
+
 /// A paragraph holding a no-break space is a visible blank line, a scene
 /// break; a plain space in its place collapses to nothing. And a no-break
 /// space keeps "10 km" or verse indentation together.
