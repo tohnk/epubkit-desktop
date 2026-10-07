@@ -463,6 +463,11 @@ it was fixed.
 The port regenerates the NCX from the spine in that case, which is what the
 stub's comment intended, and reports `TocOutcome::Generated`.
 
+When the reference did generate an NCX, it copied each chapter's href into it
+as the OPF wrote it: relative to the OPF. An NCX in a folder of its own,
+`Navigation/toc.ncx` say, then pointed every entry at a file that was not
+there. The port writes each link relative to the NCX.
+
 ### Validation collects all problems
 
 `is_valid_epub` returned on the first problem. `package::validate_epub` returns

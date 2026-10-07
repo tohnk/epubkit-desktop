@@ -669,7 +669,13 @@ pub fn fix_toc(root: &Path, opf_dir: &Path, doc: &Document) -> Result<TocOutcome
         return Ok(TocOutcome::Valid);
     }
 
-    let chapters = extract_chapters(root, opf_dir, &spine);
+    let ncx_dir = ncx_path.parent().unwrap_or(root);
+    let chapters = extract_chapters(root, opf_dir, ncx_dir, &spine);
+    if chapters.is_empty() {
+        return Ok(TocOutcome::Skipped(
+            "TOC left alone: no chapter lies inside the book".into(),
+        ));
+    }
     write_ncx(&ncx_path, &chapters)?;
 
     // A newly created NCX has to be declared, and pointed at from the spine.
@@ -963,17 +969,53 @@ fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
 
 /// Derive chapter titles from the spine, preferring `<title>` and falling back
 /// to the first heading, then to a positional name.
-fn extract_chapters(root: &Path, opf_dir: &Path, spine: &[(String, String)]) -> Vec<Chapter> {
+///
+/// The spine's hrefs are relative to the OPF, in `opf_dir`; each chapter's is
+/// rewritten relative to `ncx_dir`, where the NCX naming it goes. A chapter
+/// outside the book is left out.
+fn extract_chapters(
+    root: &Path,
+    opf_dir: &Path,
+    ncx_dir: &Path,
+    spine: &[(String, String)],
+) -> Vec<Chapter> {
     spine
         .iter()
         .enumerate()
-        .map(|(index, (_, href))| Chapter {
-            title: resolve_href(root, opf_dir, &decode(href))
-                .and_then(|path| chapter_title(&path))
-                .unwrap_or_else(|| format!("Chapter {}", index + 1)),
-            href: href.clone(),
+        .filter_map(|(index, (_, href))| {
+            let (file, fragment) = match href.split_once('#') {
+                Some((file, fragment)) => (file, Some(fragment)),
+                None => (href.as_str(), None),
+            };
+            let path = resolve_href(root, opf_dir, &decode(file))?;
+
+            let mut href = relative_href(root, ncx_dir, &path)?;
+            if let Some(fragment) = fragment {
+                href.push('#');
+                href.push_str(fragment);
+            }
+
+            Some(Chapter {
+                title: chapter_title(&path).unwrap_or_else(|| format!("Chapter {}", index + 1)),
+                href,
+            })
         })
         .collect()
+}
+
+/// The href that leads from the directory `from` to `to`, both resolved inside
+/// the book's `root`.
+fn relative_href(root: &Path, from: &Path, to: &Path) -> Option<String> {
+    let from: Vec<Component> = from.strip_prefix(root).ok()?.components().collect();
+    let to: Vec<Component> = to.strip_prefix(root).ok()?.components().collect();
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+
+    let up = std::iter::repeat_n("..".to_string(), from.len() - shared);
+    let down = to[shared..]
+        .iter()
+        .map(|part| encode(&part.as_os_str().to_string_lossy()));
+
+    Some(up.chain(down).collect::<Vec<_>>().join("/"))
 }
 
 fn chapter_title(path: &Path) -> Option<String> {

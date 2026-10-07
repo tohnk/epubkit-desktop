@@ -640,6 +640,74 @@ fn titles_needing_escapes_produce_valid_ncx() {
     assert!(ncx.contains("Cause &amp; Effect"), "{ncx}");
 }
 
+/// Chapter links in the OPF are relative to the OPF; in a generated NCX they
+/// have to be relative to the NCX, which need not sit beside it.
+#[test]
+fn a_regenerated_ncx_links_its_chapters_from_where_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = dir.path().join("OPS");
+    fs::create_dir_all(ops.join("Navigation")).unwrap();
+    fs::create_dir_all(ops.join("Text")).unwrap();
+    write_chapter(&ops.join("chapter.xhtml"), "First", "One");
+    write_chapter(&ops.join("Text").join("Part Two.xhtml"), "Second", "Two");
+    fs::write(ops.join("Navigation").join("toc.ncx"), "not an NCX").unwrap();
+
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="Text/Part%20Two.xhtml" media-type="application/xhtml+xml"/>
+    <item id="toc" href="Navigation/toc.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="toc">
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>
+"#);
+
+    assert_eq!(
+        fix_toc(dir.path(), &ops, &doc).unwrap(),
+        TocOutcome::Generated(2)
+    );
+
+    let ncx = fs::read_to_string(ops.join("Navigation").join("toc.ncx")).unwrap();
+    assert!(ncx.contains(r#"src="../chapter.xhtml""#), "{ncx}");
+    assert!(ncx.contains(r#"src="../Text/Part%20Two.xhtml""#), "{ncx}");
+    // What was written is a table of contents the same check now accepts.
+    assert_eq!(fix_toc(dir.path(), &ops, &doc).unwrap(), TocOutcome::Valid);
+}
+
+/// A chapter outside the book has no place in its table of contents, and a
+/// spine with nothing else gives it nothing to list.
+#[test]
+fn a_toc_lists_no_chapter_outside_the_book() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book");
+    fs::create_dir(&book).unwrap();
+    write_chapter(&book.join("c1.xhtml"), "Inside", "One");
+    write_chapter(&dir.path().join("c2.xhtml"), "Outside", "Two");
+
+    let doc = opf(&TWO_CHAPTER_OPF.replace("c2.xhtml", "../c2.xhtml"));
+    assert_eq!(
+        fix_toc(&book, &book, &doc).unwrap(),
+        TocOutcome::Generated(1)
+    );
+    let ncx = fs::read_to_string(book.join("toc.ncx")).unwrap();
+    assert!(!ncx.contains("c2.xhtml"), "{ncx}");
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let doc = opf(&TWO_CHAPTER_OPF
+        .replace("c1.xhtml", "../c1.xhtml")
+        .replace("c2.xhtml", "../c2.xhtml"));
+    assert!(matches!(
+        fix_toc(elsewhere.path(), elsewhere.path(), &doc).unwrap(),
+        TocOutcome::Skipped(_)
+    ));
+    assert!(!elsewhere.path().join("toc.ncx").exists());
+}
+
 #[test]
 fn an_empty_spine_is_reported_not_guessed_at() {
     let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
