@@ -324,6 +324,26 @@ fn an_internal_subset_is_read_before_recovery() {
     assert_well_formed(&out);
 }
 
+/// The subset is read as XML reads it: a declaration in a comment declares
+/// nothing, the first of two for one name is the one that counts, and a `]`
+/// or `>` in a quoted value or a comment ends nothing.
+#[test]
+fn an_internal_subset_declares_what_xml_says_it_does() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!-- <!ENTITY name "Commented"> ]> --> <!ENTITY name "First"> <!ENTITY name "Second"> <!ENTITY mark "]>"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>By &name; &mark;<br></p></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(out.contains("By First ]&gt;"), "{out}");
+    for gone in ["Commented", "Second", "ENTITY"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
+    assert_well_formed(&out);
+}
+
 fn nested(depth: usize, closed: bool) -> String {
     let mut chapter = String::from(
         r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>"#,
@@ -465,17 +485,37 @@ fn restoring_case_keeps_the_order_of_attributes() {
 
 /// Finding where the root element starts passes each declaration before it
 /// once. Each was searched for an internal subset to the end of the chapter,
-/// so 160,000 of them took seconds.
+/// so 160,000 of them took seconds; and then each subset for the end of a
+/// comment or processing instruction in it that never ends.
 #[test]
 fn declarations_before_the_root_are_passed_once() {
-    let chapter = format!(
-        "{}<html><head><title>T</title></head><body><p>Text</p></body></html>",
-        "<!x>".repeat(400_000)
-    );
+    for (declaration, count) in [
+        ("<!x>", 400_000),
+        ("<!x [<!-- >] ", 100_000),
+        ("<!x [<? >] ", 100_000),
+    ] {
+        let chapter = format!(
+            "{}<html><head><title>T</title></head><body><p>Text</p></body></html>",
+            declaration.repeat(count)
+        );
 
-    let (out, _) =
-        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
-    assert!(out.contains("<p>Text</p>"), "{}", &out[..200]);
+        let repaired = common::finishes_within(Duration::from_secs(20), move || {
+            LibxmlRepair::new().repair(chapter.as_bytes())
+        });
+        match repaired {
+            Ok(repaired) => {
+                let out = String::from_utf8(repaired.bytes).unwrap();
+                assert!(
+                    out.contains("<p>Text</p>"),
+                    "{declaration}: {}",
+                    &out[..200]
+                );
+            }
+            // libxml2 2.9's HTML parser takes the `<!--` for a comment that
+            // never ends, and a chapter that lost its text to it is refused.
+            Err(error) => assert_eq!(declaration, "<!x [<!-- >] ", "{error}"),
+        }
+    }
 }
 
 /// A recovered chapter is made legal XML in time that grows with it. Its

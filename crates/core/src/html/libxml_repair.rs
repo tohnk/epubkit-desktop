@@ -66,15 +66,15 @@ static META_DECLARED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i-u)<meta\s[^>]*?\bcharset\s*=\s*["']?\s*([^\s"'/>;]+)"#).unwrap()
 });
 
-/// Elements whose text HTML reads as text to their end tag, a `<!--` in it
-/// included.
-const RAW_TEXT_ELEMENTS: &[&[u8]] = &[b"script", b"style", b"title", b"textarea"];
-
 /// A general entity a DOCTYPE's internal subset declares with a plain value:
 /// not a parameter entity, and not one fetched from elsewhere.
 static ENTITY_DECLARED: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>"#).unwrap()
 });
+
+/// A CDATA section that ends.
+static CDATA_SECTIONS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<!\[CDATA\[.*?\]\]>").unwrap());
 
 /// What a chapter's source has besides its text, for [`kept_the_text`].
 static COMMENTS: LazyLock<regex::Regex> =
@@ -511,6 +511,7 @@ fn without_junk_before_root(text: Cow<'_, str>) -> Cow<'_, str> {
 /// declaration, processing instruction, comment or DOCTYPE.
 fn root_start(text: &str) -> usize {
     let mut from = 0;
+    let mut doctype_read = false;
     while let Some(offset) = text[from..].find('<') {
         let at = from + offset;
         let rest = &text[at..];
@@ -519,7 +520,17 @@ fn root_start(text: &str) -> usize {
         } else if rest.starts_with("<!--") {
             rest.find("-->").map(|end| end + 3)
         } else if rest.starts_with("<!") {
-            doctype_length(rest)
+            // A chapter has one DOCTYPE. Its quotes and comments can take
+            // reading to the end of the chapter, so any other declaration is
+            // read as HTML reads one, and nothing is read through twice.
+            let doctype = rest
+                .get(..9)
+                .is_some_and(|start| start.eq_ignore_ascii_case("<!DOCTYPE"));
+            if doctype && !std::mem::replace(&mut doctype_read, true) {
+                doctype_length(rest)
+            } else {
+                declaration_length(rest)
+            }
         } else {
             return at;
         };
@@ -531,8 +542,19 @@ fn root_start(text: &str) -> usize {
     text.len()
 }
 
-/// How long the DOCTYPE `text` starts with is, internal subset and all.
+/// How long the DOCTYPE `text` starts with is, internal subset and all, or
+/// `None` if it never ends. A `]` or `>` in a quoted identifier or value, or in
+/// a comment or processing instruction of the subset, ends nothing; but in one
+/// whose quote or comment never ends, the first `]` and `>` do
+/// ([`declaration_length`]).
 fn doctype_length(text: &str) -> Option<usize> {
+    well_formed_doctype_length(text).or_else(|| declaration_length(text))
+}
+
+/// How long the declaration `text` starts with is, read as an HTML parser
+/// reads a broken DOCTYPE: to its first `>`, or, if a `[` comes before that,
+/// to the first `>` after the first `]` after it.
+fn declaration_length(text: &str) -> Option<usize> {
     let close = text.find('>')?;
     match text[..close].find('[') {
         Some(open) => {
@@ -541,6 +563,74 @@ fn doctype_length(text: &str) -> Option<usize> {
         }
         None => Some(close + 1),
     }
+}
+
+/// [`doctype_length`] for a DOCTYPE whose quotes and comments all end.
+fn well_formed_doctype_length(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let after = |from: usize, needle: &[u8]| {
+        bytes[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|at| from + at + needle.len())
+    };
+
+    let mut at = 2;
+    let mut in_subset = false;
+    loop {
+        match *bytes.get(at)? {
+            quote @ (b'"' | b'\'') => {
+                at += 1 + bytes[at + 1..].iter().position(|&byte| byte == quote)? + 1;
+            }
+            b'<' if in_subset && bytes[at..].starts_with(b"<!--") => at = after(at + 4, b"-->")?,
+            b'<' if in_subset && bytes[at..].starts_with(b"<?") => at = after(at + 2, b"?>")?,
+            b'[' if !in_subset => {
+                in_subset = true;
+                at += 1;
+            }
+            b']' if in_subset => {
+                in_subset = false;
+                at += 1;
+            }
+            b'>' if !in_subset => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+}
+
+/// Where the comments and processing instructions of a DOCTYPE are, which
+/// declare nothing. Those in a quoted value are the value's text.
+fn doctype_asides(doctype: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = doctype.as_bytes();
+    let after = |from: usize, needle: &[u8]| {
+        bytes[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map_or(bytes.len(), |at| from + at + needle.len())
+    };
+
+    let mut asides = Vec::new();
+    let mut at = 2;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if rest.starts_with(b"<!--") {
+            let end = after(at + 4, b"-->");
+            asides.push(at..end);
+            at = end;
+        } else if rest.starts_with(b"<?") {
+            let end = after(at + 2, b"?>");
+            asides.push(at..end);
+            at = end;
+        } else if let quote @ (b'"' | b'\'') = rest[0] {
+            at += 1 + rest[1..]
+                .iter()
+                .position(|&byte| byte == quote)
+                .map_or(rest.len() - 1, |length| length + 1);
+        } else {
+            at += 1;
+        }
+    }
+    asides
 }
 
 /// `text` without its DOCTYPE, if that has an internal subset, and with the
@@ -563,13 +653,22 @@ fn without_internal_subset(text: &str) -> Cow<'_, str> {
         return Cow::Borrowed(text);
     }
 
-    let entities: HashMap<&str, &str> = ENTITY_DECLARED
-        .captures_iter(doctype)
-        .filter_map(|declared| {
-            let value = declared.get(2).or_else(|| declared.get(3))?;
-            Some((declared.get(1)?.as_str(), value.as_str()))
-        })
-        .collect();
+    // As XML reads a subset: a declaration in a comment or processing
+    // instruction declares nothing, and of two for one name the first counts.
+    let asides = doctype_asides(doctype);
+    let mut entities: HashMap<&str, &str> = HashMap::new();
+    for declared in ENTITY_DECLARED.captures_iter(doctype) {
+        // The asides are in order, so the one a declaration could be in is
+        // found by a search.
+        let at = declared.get(0).expect("always matched").start();
+        let aside = asides.partition_point(|aside| aside.end <= at);
+        if asides.get(aside).is_some_and(|aside| aside.contains(&at)) {
+            continue;
+        }
+        if let (Some(name), Some(value)) = (declared.get(1), declared.get(2).or(declared.get(3))) {
+            entities.entry(name.as_str()).or_insert(value.as_str());
+        }
+    }
 
     let rest = &text[start + length..];
     let mut growth = 0usize;
@@ -778,180 +877,76 @@ fn prepare_for_recovery(text: &[u8]) -> (Cow<'_, [u8]>, ParserOptions<'static>) 
 
 /// The encodings a chapter names, as far as they are known: in its XML
 /// declaration, and then in its first `<meta>` that names one
-/// ([`meta_charset`]).
-fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> {
+/// ([`meta_charset`]), which is looked for only if the declaration's will not
+/// do.
+fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> + '_ {
     let in_declaration = XML_DECLARED
         .captures(input)
         .and_then(|declared| declared.get(1))
         .and_then(|label| Encoding::for_label(label.as_bytes()));
 
-    in_declaration.into_iter().chain(meta_charset(input))
+    in_declaration
+        .into_iter()
+        .chain(std::iter::once_with(|| meta_charset(input)).flatten())
 }
 
-/// The encoding the first `<meta>` in `bytes` that names one names, found as
-/// the HTML standard's prescan finds it: a tag's attributes are read with
-/// their quotes, comments and CDATA sections are passed over, and a `<meta>`
-/// declares what its `charset` says, or what its `content` says if it is an
-/// `http-equiv="Content-Type"`. Beyond the prescan, what a script, a
-/// stylesheet, a title or a text area holds is passed over to its end tag,
-/// as HTML reads it, `<!--` and all.
+/// The encoding the first `<meta>` of a chapter that names one names: its
+/// `charset`, or the charset in an `http-equiv="Content-Type"`'s `content`.
 ///
-/// Something that never ends runs to the end. Each byte is read once.
+/// The chapter is parsed to find it, as it will be parsed once it is decoded:
+/// strictly if it is well-formed, by the HTML parser if not. Its markup is
+/// ASCII in any encoding a chapter can name in it, so its bytes read one for
+/// one as windows-1252 give the parser the same markup, and what the parser
+/// takes for a `<meta>` is one, whatever a script, a CDATA section, a comment
+/// or a DOCTYPE holds. Looked for in the text, a `<meta>` was found in each of
+/// those in turn, or hidden by them.
+///
+/// A CDATA section is the chapter's text, as XHTML writes it, however the
+/// HTML parser reads one: libxml2 2.9's reads markup in it. So the HTML parser
+/// is not given those.
 fn meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
-    let find = |from: usize, needle: &[u8]| {
-        bytes[from..]
-            .windows(needle.len())
-            .position(|window| window == needle)
-            .map(|at| from + at)
-    };
+    let text = WINDOWS_1252.decode_without_bom_handling(bytes).0;
+    let text = declare_utf8(without_junk_before_root(text));
+    let doc = Parser::default()
+        .parse_string_with_options(text.as_bytes(), hardened_options(false))
+        .or_else(|_| {
+            let text = CDATA_SECTIONS.replace_all(&text, "");
+            let (bytes, options) = prepare_for_recovery(text.as_bytes());
+            Parser::default_html().parse_string_with_options(&bytes, options)
+        })
+        .ok()?;
 
-    let mut at = 0;
-    while let Some(offset) = bytes[at..].iter().position(|&byte| byte == b'<') {
-        at += offset;
-        let rest = &bytes[at..];
-        let letter_at = |index: usize| rest.get(index).is_some_and(u8::is_ascii_alphabetic);
-
-        if rest.starts_with(b"<!--") {
-            // `<!-->` ends itself, as in HTML.
-            at = find(at + 2, b"-->")? + 3;
-        } else if rest.starts_with(b"<![CDATA[") {
-            at = find(at + 9, b"]]>")? + 3;
-        } else if letter_at(1) || (rest.get(1) == Some(&b'/') && letter_at(2)) {
-            let end_tag = rest[1] == b'/';
-            let name_start = at + 1 + usize::from(end_tag);
-            at = bytes[name_start..]
-                .iter()
-                .position(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-                .map_or(bytes.len(), |length| name_start + length);
-            let name = &bytes[name_start..at];
-            let meta = !end_tag && name.eq_ignore_ascii_case(b"meta");
-
-            let (mut charset, mut pragma, mut content) = (None, None, None);
-            loop {
-                let (attribute, next) = read_attribute(bytes, at);
-                at = next;
-                let Some((attribute, value)) = attribute else {
-                    break;
-                };
-                if !meta {
-                    continue;
-                }
-                if attribute.eq_ignore_ascii_case(b"charset") {
-                    charset.get_or_insert(value);
-                } else if attribute.eq_ignore_ascii_case(b"http-equiv") {
-                    pragma.get_or_insert(value.trim_ascii().eq_ignore_ascii_case(b"content-type"));
-                } else if attribute.eq_ignore_ascii_case(b"content") {
-                    content.get_or_insert(value);
-                }
-            }
-
-            if meta {
-                let label = charset.or_else(|| {
-                    let content = content.filter(|_| pragma == Some(true))?;
-                    content_charset(content).map(|label| &content[label])
-                });
-                if let Some(encoding) = label.and_then(Encoding::for_label) {
-                    return Some(encoding);
-                }
-            }
-            if at == bytes.len() {
-                return None;
-            }
-
-            // A raw text element closed where it opens holds nothing.
-            let closed = bytes[at - 1] == b'/';
-            at += 1;
-            if !end_tag
-                && !closed
-                && RAW_TEXT_ELEMENTS
+    // An XHTML `<META>` is no `<meta>`, but a chapter that wrote one meant it.
+    let metas = xml::find_nodes(
+        &doc,
+        "//*[translate(local-name(), 'ATEM', 'atem') = 'meta']",
+    )
+    .ok()?;
+    metas.iter().find_map(|meta| {
+        let attributes = meta.get_attributes();
+        let attribute = |name: &str| {
+            attributes.get(name).or_else(|| {
+                attributes
                     .iter()
-                    .any(|raw| name.eq_ignore_ascii_case(raw))
-            {
-                at = end_tag_of(bytes, at, name)?;
+                    .filter(|(written, _)| written.eq_ignore_ascii_case(name))
+                    .min_by_key(|(written, _)| written.as_str())
+                    .map(|(_, value)| value)
+            })
+        };
+
+        let label = match attribute("charset") {
+            Some(charset) => charset.as_bytes(),
+            None => {
+                let pragma = attribute("http-equiv")?;
+                if !pragma.trim().eq_ignore_ascii_case("content-type") {
+                    return None;
+                }
+                let content = attribute("content")?.as_bytes();
+                &content[content_charset(content)?]
             }
-        } else if rest.starts_with(b"<!") || rest.starts_with(b"</") || rest.starts_with(b"<?") {
-            at += rest.iter().position(|&byte| byte == b'>')? + 1;
-        } else {
-            at += 1;
-        }
-    }
-
-    None
-}
-
-/// An attribute's name and value, as a tag writes them.
-type Attribute<'a> = (&'a [u8], &'a [u8]);
-
-/// The next attribute of a tag, read from `at` as the HTML standard's prescan
-/// reads one, and where reading it stopped: none at the tag's `>`, or at the
-/// end of `bytes`. An attribute with no value has an empty one.
-fn read_attribute(bytes: &[u8], mut at: usize) -> (Option<Attribute<'_>>, usize) {
-    let blank = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_whitespace);
-    while blank(at) || bytes.get(at) == Some(&b'/') {
-        at += 1;
-    }
-    if bytes.get(at).is_none_or(|&byte| byte == b'>') {
-        return (None, at);
-    }
-
-    // A name runs to a blank, `=`, `/` or `>`, though it may start with `=`.
-    let name_start = at;
-    at += 1;
-    while bytes
-        .get(at)
-        .is_some_and(|&byte| !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'>'))
-    {
-        at += 1;
-    }
-    let name = &bytes[name_start..at];
-    while blank(at) {
-        at += 1;
-    }
-    if bytes.get(at) != Some(&b'=') {
-        return (Some((name, &[])), at);
-    }
-    at += 1;
-    while blank(at) {
-        at += 1;
-    }
-
-    match bytes.get(at) {
-        Some(&quote @ (b'"' | b'\'')) => {
-            let start = at + 1;
-            let end = bytes[start..]
-                .iter()
-                .position(|&byte| byte == quote)
-                .map_or(bytes.len(), |length| start + length);
-            (Some((name, &bytes[start..end])), (end + 1).min(bytes.len()))
-        }
-        _ => {
-            let start = at;
-            while bytes
-                .get(at)
-                .is_some_and(|&byte| !byte.is_ascii_whitespace() && byte != b'>')
-            {
-                at += 1;
-            }
-            (Some((name, &bytes[start..at])), at)
-        }
-    }
-}
-
-/// Where the end tag of the `name` element whose text starts at `from` is.
-fn end_tag_of(bytes: &[u8], mut from: usize, name: &[u8]) -> Option<usize> {
-    loop {
-        let at = from + bytes[from..].windows(2).position(|pair| pair == b"</")?;
-        let after = &bytes[at + 2..];
-        if after.len() >= name.len()
-            && after[..name.len()].eq_ignore_ascii_case(name)
-            && after
-                .get(name.len())
-                .is_none_or(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-        {
-            return Some(at);
-        }
-        from = at + 2;
-    }
+        };
+        Encoding::for_label(label)
+    })
 }
 
 /// The legacy encoding a chapter that is not UTF-8 names, in its XML
@@ -1085,61 +1080,85 @@ impl HtmlRepair for LibxmlRepair {
 mod tests {
     use super::*;
 
-    /// A `<meta>` charset is found as a browser finds it.
+    /// A `<meta>` charset is found as the parser that reads the chapter finds
+    /// one: in a well-formed chapter as XML, in a malformed one as HTML.
     #[test]
-    fn a_meta_charset_is_found_as_browsers_find_it() {
+    fn a_meta_charset_is_found_where_the_parser_finds_one() {
         use encoding_rs::{KOI8_R, SHIFT_JIS, WINDOWS_1251};
 
-        let cases: &[(&str, Option<&'static Encoding>)] = &[
-            (r#"<meta charset="windows-1251">"#, Some(WINDOWS_1251)),
-            ("<META CHARSET=KOI8-R>", Some(KOI8_R)),
+        let page = |head: &str| {
+            format!("<html><head>{head}<title>T</title></head><body><p>x</p></body></html>")
+        };
+        let cases: &[(String, Option<&'static Encoding>)] = &[
             (
-                r#"<meta http-equiv="Content-Type" content="text/html; charset=shift_jis">"#,
+                page(r#"<meta charset="windows-1251"/>"#),
+                Some(WINDOWS_1251),
+            ),
+            (page("<META CHARSET=KOI8-R>"), Some(KOI8_R)),
+            (page(r#"<META CHARSET="koi8-r"/>"#), Some(KOI8_R)),
+            (
+                page(r#"<meta http-equiv="Content-Type" content="text/html; charset=shift_jis"/>"#),
                 Some(SHIFT_JIS),
             ),
             // Content names a charset only for an http-equiv.
-            (r#"<meta content="text/html; charset=shift_jis">"#, None),
-            // A name nobody knows is passed over for the next.
             (
-                r#"<meta charset="no-such-thing"><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<!-- <meta charset="koi8-r"> --><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<![CDATA[<meta charset="koi8-r">]]><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<script>"<!--"</script><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<SCRIPT>"</scripts>"</SCRIPT ><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<script src="a.js"/><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            (
-                r#"<p title='<meta charset="koi8-r"> <!--'>x</p><meta charset="windows-1251">"#,
-                Some(WINDOWS_1251),
-            ),
-            // What never ends runs to the end.
-            (r#"<!-- never closed <meta charset="windows-1251">"#, None),
-            (
-                r#"<script>never closed <meta charset="windows-1251">"#,
+                page(r#"<meta content="text/html; charset=shift_jis"/>"#),
                 None,
             ),
-            ("<p title=\"never closed <meta charset=windows-1251>", None),
-            // A meta at the very end counts, closed or not.
-            (r#"<meta charset="windows-1251""#, Some(WINDOWS_1251)),
+            // A name nobody knows is passed over for the next.
+            (
+                page(r#"<meta charset="no-such-thing"/><meta charset="windows-1251"/>"#),
+                Some(WINDOWS_1251),
+            ),
+            (
+                page(r#"<!-- <meta charset="koi8-r"/> --><meta charset="windows-1251"/>"#),
+                Some(WINDOWS_1251),
+            ),
+            // As XML, a CDATA section's `</script>` ends nothing.
+            (
+                page(
+                    r#"<script><![CDATA["</script><meta charset='koi8-r'>"]]></script><meta charset="windows-1251"/>"#,
+                ),
+                Some(WINDOWS_1251),
+            ),
+            // As HTML, a script's `<!--` starts nothing.
+            (
+                page(r#"<script>"<!--"</script><meta charset="windows-1251">"#),
+                Some(WINDOWS_1251),
+            ),
+            (
+                format!(
+                    "<!DOCTYPE html [<!-- ]> <script> -->]>{}",
+                    page(r#"<meta charset="windows-1251"/>"#)
+                ),
+                Some(WINDOWS_1251),
+            ),
         ];
         for (text, expected) in cases {
             assert_eq!(meta_charset(text.as_bytes()), *expected, "{text}");
         }
+    }
+
+    /// A DOCTYPE ends at its own `>`, not one in a quoted value, a comment or
+    /// a processing instruction of its internal subset.
+    #[test]
+    fn a_doctype_ends_where_it_ends() {
+        let after = "<html/>";
+        for doctype in [
+            "<!DOCTYPE html>",
+            r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">"#,
+            r#"<!DOCTYPE html SYSTEM "a>b">"#,
+            r#"<!DOCTYPE html [<!ENTITY a "]>">]>"#,
+            "<!DOCTYPE html [<!-- ]> --><?pi ]> ?>] >",
+        ] {
+            let text = format!("{doctype}{after}");
+            assert_eq!(doctype_length(&text), Some(doctype.len()), "{doctype}");
+        }
+        // A quote that never ends ends at the first `]` and `>` after all.
+        assert_eq!(
+            doctype_length(r#"<!DOCTYPE html PUBLIC "never closed><html/>"#),
+            Some(r#"<!DOCTYPE html PUBLIC "never closed>"#.len())
+        );
+        assert_eq!(doctype_length("<!DOCTYPE html"), None);
     }
 }

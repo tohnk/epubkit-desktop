@@ -267,14 +267,16 @@ has the escapes it switches character sets with is read as ISO-2022-JP; read
 as UTF-8, its Japanese came out as ASCII gibberish.
 
 Only real declarations count. A legacy chapter's `<meta>` charset is found
-as the HTML standard's prescan finds it: a tag's attributes are read with
-their quotes, comments and CDATA sections are passed over, and a `content`
-declares a charset only for an `http-equiv="Content-Type"`. Beyond the
-prescan, the text of a script, a stylesheet, a title or a text area is passed
-over too, so a `"<!--"` in a script is not taken for a comment that hides the
-`<meta>` after it. A pattern over the text found `<meta>`s in comments and in
-other `<meta>`s' descriptions, and one version of it took a script's `<!--`
-for a comment.
+by parsing the chapter as it will be parsed once it is decoded: strictly if
+it is well-formed, by the HTML parser if not. Its markup is ASCII in any
+encoding it can name, so its bytes read as windows-1252 give the parser the
+same markup, and only what the parser takes for a `<meta>` counts, whatever
+a script, a CDATA section, a comment or a DOCTYPE holds. A `content` names a
+charset only for an `http-equiv="Content-Type"`. A pattern over the text
+found `<meta>`s in comments and in other `<meta>`s' descriptions, and
+scanners after it took a script's `<!--` for a comment, a `</script>` in a
+CDATA section for the script's end, and a `>` in a DOCTYPE's comment or
+entity value for the DOCTYPE's.
 
 Only real declarations are renamed UTF-8, too: the XML declaration where it
 opens the chapter, and a `<meta>` element's `charset`, or the charset in an

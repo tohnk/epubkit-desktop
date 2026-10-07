@@ -436,6 +436,43 @@ fn only_a_real_meta_charset_decides_the_encoding() {
     }
 }
 
+/// What a script or stylesheet's CDATA section holds, and what a DOCTYPE's
+/// internal subset holds, is no markup of the chapter's: a `</script>` and a
+/// `<meta>` written there are text. Looked for in the text, the `<meta>` after
+/// a CDATA section's `"</script><meta charset='iso-8859-1'>"` was found first,
+/// and a `<script>` in a DOCTYPE's comment swallowed the real one. Each is
+/// tried well-formed, which the XML parser reads, and with a markup error in
+/// it, which the HTML parser recovers; the DOCTYPEs hold a `]` or a `>` that
+/// does not end them.
+#[test]
+fn markup_written_in_cdata_or_a_doctype_does_not_decide_the_encoding() {
+    let head = [
+        r#"<script><![CDATA[var html = "</script><meta charset='iso-8859-1'>";]]></script>"#,
+        r#"<style><![CDATA[p::before { content: "</style><meta charset='iso-8859-1'>" }]]></style>"#,
+    ];
+    let doctypes = [
+        "<!DOCTYPE html [<!-- > <script> -->]>",
+        r#"<!DOCTYPE html [<!ENTITY example " > <script>">]>"#,
+        r#"<!DOCTYPE html [<!-- ]> <script> --><!ENTITY bracket "]> <script>">]>"#,
+    ];
+    let chapter = |doctype: &str, head: &str, body_extra: &str| {
+        format!(
+            r#"{doctype}<html><head>{head}<meta charset="windows-1251"/><title>Title</title></head><body><p>{RUSSIAN}</p>{body_extra}</body></html>"#
+        )
+    };
+
+    for markup in head {
+        let output = read(&encoded(WINDOWS_1251, &chapter("", markup, "")));
+        assert!(output.contains(RUSSIAN), "{markup}: {output}");
+    }
+    for doctype in doctypes {
+        for body_extra in ["", "<br>"] {
+            let output = read(&encoded(WINDOWS_1251, &chapter(doctype, "", body_extra)));
+            assert!(output.contains(RUSSIAN), "{doctype}{body_extra}: {output}");
+        }
+    }
+}
+
 /// Finding the `<meta>` reads each byte before it once, however many tags,
 /// comments and scripts stand there.
 #[test]
