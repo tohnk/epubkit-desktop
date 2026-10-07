@@ -224,6 +224,15 @@ The port mends each of these in the recovered tree and then reads the result
 back strictly. A chapter that still does not read back is refused, which
 leaves it as it was.
 
+Nor can the HTML parser read a DOCTYPE's internal subset: it ends the
+DOCTYPE at the subset's first `>`, and the rest of the declarations become
+text. The port reads the subset as XML does, and fills in the entities it
+declares where the chapter uses them, those they refer to in turn too, but
+not in a CDATA section, a comment or a processing instruction, whose text a
+reference there is. Each reference is filled in whole or stays as written,
+within a bound on what filling in may cost, so a "billion laughs" stays a few
+references.
+
 ### Malformed chapters are read as UTF-8
 
 The reference's recovery parser left the encoding to libxml2, which obeys a

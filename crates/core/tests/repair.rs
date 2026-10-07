@@ -344,6 +344,71 @@ fn an_internal_subset_declares_what_xml_says_it_does() {
     assert_well_formed(&out);
 }
 
+/// An entity is filled in as XML fills it in: the entities it refers to are
+/// filled in too, and none is in a CDATA section, a comment or a processing
+/// instruction, whose text a reference there is. Filled in once, `By
+/// &author;` read so, and filled in everywhere, a script's string changed.
+#[test]
+fn entities_are_filled_in_where_xml_fills_them_in() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> <!ENTITY byline "By &author;"> <!ENTITY credit "&byline;, 2001"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><script type="text/javascript"><![CDATA[var who = "&author;";]]></script></head><body><p>&credit;<br></p><!-- &author; --><?note &author;?></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(out.contains("<p>By Jane Doe, 2001<br/></p>"), "{out}");
+    assert!(out.contains("var who = \"&author;\";"), "{out}");
+    assert!(out.contains("<!-- &author; -->"), "{out}");
+    // libxml2 2.9's HTML parser ends a processing instruction at its `>`, and
+    // 2.14's makes it a comment.
+    assert!(out.contains("note &author;"), "{out}");
+    assert_well_formed(&out);
+}
+
+/// A CDATA section or processing instruction that never ends holds nothing,
+/// and the HTML parser reads on past it, entities and all. Each kind is looked
+/// for to its end once: from every one that never ended, the time to fill a
+/// chapter in grew with the square of how many there were.
+#[test]
+fn what_never_ends_holds_no_entity() {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>if a <? b</p><p>by &author;<br></p><p>{}</p></body></html>
+"#,
+        "word <?pi> word <![CDATA[cd> ".repeat(20_000)
+    );
+
+    let (out, recovered) =
+        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
+
+    assert!(recovered);
+    assert!(out.contains("<p>by Jane Doe<br/></p>"), "{}", &out[..2000]);
+    assert_well_formed(&out);
+}
+
+/// An entity that refers to itself, which XML refuses, stays as written; the
+/// others are filled in. Filled in as far as it went, it was a heap of text
+/// with references left in it, and taken one reference after another, it was
+/// filled in for as long as the reference doubled at each step took.
+#[test]
+fn an_entity_that_refers_to_itself_stays_as_written() {
+    let (out, recovered) = common::finishes_within(Duration::from_secs(20), || {
+        repair(
+            br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY loop "&loop;&loop;"> <!ENTITY author "Jane Doe"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&loop; by &author;<br></p></body></html>
+"#,
+        )
+    });
+
+    assert!(recovered);
+    assert!(out.contains("<p>&amp;loop; by Jane Doe<br/></p>"), "{out}");
+    assert_well_formed(&out);
+}
+
 fn nested(depth: usize, closed: bool) -> String {
     let mut chapter = String::from(
         r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>"#,

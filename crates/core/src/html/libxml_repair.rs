@@ -83,14 +83,24 @@ static TAGS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"<[^>]
 static CHARACTER_REFERENCES: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"&#?[A-Za-z0-9]+;").unwrap());
 
-/// A reference to a named entity.
+/// A reference to a named entity, where a text starts.
 static ENTITY_REFERENCE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"&([A-Za-z_:][\w.:-]*);").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"^&([A-Za-z_:][\w.:-]*);").unwrap());
 
-/// How much filling in a subset's entities may grow a chapter, past which
-/// they are left as references: a few may be long, and used often, but not
-/// so much as to make a small chapter enormous.
-const MAX_ENTITY_GROWTH: usize = 1 << 20;
+/// What holds its text as written, references and all, as XML reads it: a
+/// CDATA section, a comment and a processing instruction, by how they start
+/// and end.
+const LITERAL_TEXT: [(&str, &str); 3] = [("<![CDATA[", "]]>"), ("<!--", "-->"), ("<?", "?>")];
+
+/// How much filling in a subset's entities may cost a chapter, in what the
+/// entities are filled in with and one more for each, past which the rest are
+/// left as references: a few may be long, and used often, but not so much as
+/// to make a small chapter enormous, or slow to fill in.
+const MAX_ENTITY_COST: usize = 1 << 20;
+
+/// How deep entities are filled in within one another: as deep as libxml2
+/// reads them. One that refers to itself goes deeper, until it is stopped.
+const MAX_ENTITY_DEPTH: usize = 40;
 
 const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
@@ -634,7 +644,8 @@ fn doctype_asides(doctype: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 /// `text` without its DOCTYPE, if that has an internal subset, and with the
-/// entities the subset declares filled in where they are used.
+/// entities the subset declares filled in where they are used
+/// ([`fill_entities`]).
 ///
 /// libxml2's HTML parser cannot read an internal subset. It stops the DOCTYPE
 /// at the subset's first `>`, and the rest of the declarations become text.
@@ -670,19 +681,81 @@ fn without_internal_subset(text: &str) -> Cow<'_, str> {
         }
     }
 
-    let rest = &text[start + length..];
-    let mut growth = 0usize;
-    let filled = ENTITY_REFERENCE.replace_all(rest, |reference: &regex::Captures| {
-        match entities.get(&reference[1]) {
-            Some(value) if growth + value.len() <= MAX_ENTITY_GROWTH => {
-                growth += value.len();
-                (*value).to_string()
-            }
-            _ => reference[0].to_string(),
-        }
-    });
+    let mut filled = text[..start].to_string();
+    fill_entities(&text[start + length..], &entities, &mut 0, 0, &mut filled);
+    Cow::Owned(filled)
+}
 
-    Cow::Owned(format!("{}{filled}", &text[..start]))
+/// Write `text` to `out` with the references to `entities` in it filled in,
+/// and those in what they stand for in turn, as XML fills them in: not in a
+/// CDATA section, comment or processing instruction, whose text they are. One
+/// that never ends is taken for none, since the HTML parser reads on past
+/// where some of them start.
+///
+/// A reference in the chapter, at `depth` 0, is filled in whole or stays as
+/// written, so that a "billion laughs" stays a few references, and one to an
+/// entity that refers to itself stays one: filled in as far as the bounds
+/// went, either was a heap of text with references left in it. The bounds
+/// are what filling in has cost, `spent`, which a reference that could not be
+/// filled in has spent too, and how deep in one another entities go. Deeper
+/// in, one that cannot be filled in stops the rest: `false`.
+fn fill_entities(
+    text: &str,
+    entities: &HashMap<&str, &str>,
+    spent: &mut usize,
+    depth: usize,
+    out: &mut String,
+) -> bool {
+    let mut written = 0;
+    let mut at = 0;
+    // What never ends from one place on ends nowhere after it either, so each
+    // kind is looked for to the end once.
+    let mut endless = [false; LITERAL_TEXT.len()];
+    while let Some(offset) = text[at..].find(['<', '&']) {
+        let from = at + offset;
+        let rest = &text[from..];
+        at = from + 1;
+        if let Some(kind) = LITERAL_TEXT
+            .iter()
+            .position(|(open, _)| rest.starts_with(open))
+        {
+            let (open, close) = LITERAL_TEXT[kind];
+            if !endless[kind] {
+                match rest[open.len()..].find(close) {
+                    Some(end) => at = from + open.len() + end + close.len(),
+                    None => endless[kind] = true,
+                }
+            }
+            continue;
+        }
+
+        let Some(reference) = ENTITY_REFERENCE.captures(rest) else {
+            continue;
+        };
+        let Some(value) = entities.get(&reference[1]) else {
+            continue;
+        };
+
+        out.push_str(&text[written..from]);
+        written = from;
+        let filled_from = out.len();
+        // An empty entity costs something too, or a heap of them would not.
+        let cost = value.len() + 1;
+        let filled = depth < MAX_ENTITY_DEPTH && *spent + cost <= MAX_ENTITY_COST && {
+            *spent += cost;
+            fill_entities(value, entities, spent, depth + 1, out)
+        };
+        if filled {
+            written = from + reference[0].len();
+            at = written;
+        } else if depth > 0 {
+            return false;
+        } else {
+            out.truncate(filled_from);
+        }
+    }
+    out.push_str(&text[written..]);
+    true
 }
 
 /// `text` with every control character XML forbids, NUL among them, made a
