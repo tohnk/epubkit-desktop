@@ -413,6 +413,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         progress(85, "Cleaning text content...");
         let text_options = TextCleanOptions {
             normalize_quotes: options.normalize_quotes,
+            language: metadata::extract_metadata(&opf)?.language,
             ..TextCleanOptions::default()
         };
 

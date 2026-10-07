@@ -65,6 +65,7 @@ const KEEP_QUOTES: TextCleanOptions = TextCleanOptions {
     fix_encoding: true,
     fix_punctuation: true,
     normalize_unicode: true,
+    language: String::new(),
 };
 
 /// Typographic punctuation is three bytes in UTF-8, so read as Latin-1 it
@@ -287,4 +288,118 @@ fn malformed_input_is_recovered_and_cleaned() {
     assert!(out.contains("bold with spaces"), "{out}");
     assert!(report.double_spaces_fixed >= 2);
     epubkit_core::xml::parse_strict(out.as_bytes()).expect("output should parse");
+}
+
+/// Space before a mark that does not end a word is not a stray space: it is
+/// a calibre, a file extension or a smiley. Gluing it on made "his.45".
+#[test]
+fn a_space_before_a_mark_that_starts_something_stays() {
+    let text = "He drew his .45 and fired. The .NET runtime, a .com site, ok :)";
+    let (out, report) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+    assert_eq!(report.total_fixes(), 0, "{report:?}");
+}
+
+/// French sets a space before `; : ! ?`, and a no-break space before any of
+/// them is someone's deliberate choice in any language.
+#[test]
+fn french_spacing_and_no_break_spaces_before_punctuation_stay() {
+    let french = "C\u{2019}est vrai ? Oui ! Voici : rien ; enfin.";
+    let (bytes, _) = clean_text_content(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="fr"><body><p>{french}</p></body></html>
+"#
+        )
+        .as_bytes(),
+        &KEEP_QUOTES,
+    )
+    .unwrap();
+    let out = String::from_utf8(bytes).unwrap();
+    assert!(out.contains(french), "{out}");
+
+    let (out, _) = clean("<p>Vrai\u{a0}? Yes\u{202f}!</p>");
+    assert!(out.contains("Vrai\u{a0}? Yes\u{202f}!"), "{out}");
+}
+
+/// A paragraph holding a no-break space is a visible blank line, a scene
+/// break; a plain space in its place collapses to nothing. And a no-break
+/// space keeps "10 km" or verse indentation together.
+#[test]
+fn no_break_spaces_are_kept() {
+    let (out, _) = clean("<p>\u{a0}</p><p>10\u{a0}km</p><p>\u{a0}\u{a0}\u{a0}Indented</p>");
+    assert!(out.contains("<p>\u{a0}</p>"), "{out}");
+    assert!(out.contains("10\u{a0}km"), "{out}");
+    assert!(out.contains("\u{a0}\u{a0}\u{a0}Indented"), "{out}");
+}
+
+/// German opens quotes low: „ and ‚. Folded with the rest, they become
+/// straight quotes too, not a comma.
+#[test]
+fn low_quotes_are_folded_as_quotes() {
+    let (out, _) = clean("<p>\u{201e}Komm\u{201c}, sagte sie. \u{201a}Nein\u{2018}</p>");
+    assert!(out.contains("\"Komm\", sagte sie. 'Nein'"), "{out}");
+}
+
+/// A full stop before a capital is not always a missing space: initials,
+/// abbreviations, numbered clauses, file names and web addresses have them
+/// too. Only one word ending and another starting is a run-on sentence.
+#[test]
+fn initials_abbreviations_and_dotted_names_keep_their_dots() {
+    let text = "U.S.A., J.R.R. Tolkien, 10 A.M., section 1.E.8, README.TXT, www.Example.Com";
+    let (out, _) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+
+    let (out, _) = clean("<p>It ended.Then it began.</p>");
+    assert!(out.contains("It ended. Then it began."), "{out}");
+}
+
+/// "Ã" followed by a no-break space or a soft hyphen is "à" or "í" read as
+/// Latin-1 inside a word, but after a capital it is a real Portuguese or
+/// Vietnamese "Ã".
+#[test]
+fn a_real_a_tilde_among_capitals_is_left_alone() {
+    let text =
+        "A MA\u{c7}\u{c3}\u{a0}VERDE, \u{110}\u{c3}\u{a0}\u{110}\u{1ebe}N, IRM\u{c3}\u{ad}ZINHA";
+    let (out, report) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+    assert_eq!(report.encoding_issues_fixed, 0);
+}
+
+/// Japanese and Chinese write their ellipsis and dash doubled, and a
+/// compatibility ideograph is a different glyph that names rely on.
+#[test]
+fn cjk_punctuation_and_ideographs_are_kept() {
+    let text = "\u{5f85}\u{3063}\u{3066}\u{2026}\u{2026}\u{305d}\u{3046}\u{2014}\u{2014}\u{5b9f}\u{306f}\u{3001}\u{fa10}\u{672c}\u{3055}\u{3093}";
+    let (out, _) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+}
+
+/// A chapter laid out with indentation has nothing wrong with its spaces.
+#[test]
+fn indentation_is_not_counted_as_extra_spaces() {
+    let (_, report) =
+        clean("\n    <p>One.</p>\n    <p>Two.</p>\n    <div>\n        <p>Three.</p>\n    </div>\n");
+    assert_eq!(report.total_fixes(), 0, "{report:?}");
+}
+
+/// Runs of marks are shortened, not changed: `?!?!` was `!!!`. Two commas
+/// before a word open a quote typed on a typewriter.
+#[test]
+fn punctuation_is_shortened_without_being_changed() {
+    let (out, _) = clean("<p>What?!?!?! Wow!!!!! Er sagte ,,Hallo'' und ging,,, weiter.</p>");
+    assert!(
+        out.contains("What?! Wow!!! Er sagte ,,Hallo'' und ging, weiter."),
+        "{out}"
+    );
+}
+
+/// Typewriter text, variables and mathematics are as literal as code.
+#[test]
+fn typewriter_variable_and_math_text_is_left_alone() {
+    let body = r#"<p><tt>ls  -la ,then</tt> <var>x ,y</var></p><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo> ,</mo><annotation encoding="TeX">a  ,b</annotation></math>"#;
+    let (out, _) = clean(body);
+    for literal in ["ls  -la ,then", "x ,y", "<mo> ,</mo>", "a  ,b"] {
+        assert!(out.contains(literal), "{literal:?}:\n{out}");
+    }
 }

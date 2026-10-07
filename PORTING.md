@@ -277,7 +277,31 @@ match at all: "à" read as Latin-1 ends in a no-break space, which quote
 normalization had already made a plain one. The port repairs encoding first.
 The table is upstream's current one (b1rdmania/epubkit#8), which adds UTF-8
 punctuation, "ß", the acute vowels and the capital umlauts to what `7cf9a65`
-had.
+had. Repairing first made the two patterns ending in a no-break space or a
+soft hyphen ("à" and "í") match a real "Ã" too, as in Portuguese "MAÇÃ", so
+they are only repaired where no capital comes before.
+
+### Text cleanup leaves correct text alone
+
+Several of the reference's text fixes changed text that was right:
+
+- Removing space before punctuation glued ".45", ".NET" and ".com" to the
+  word before, and stripped French spacing before `; : ! ?`. Only plain
+  spaces before a mark that ends a word are removed now, and in a French
+  chapter or book only before `.` and `,`.
+- No-break spaces were folded to plain ones, so a scene break written as a
+  paragraph holding one collapsed to nothing. They are kept.
+- `‚`, which opens a German quote, was folded to a comma, and `„` not at all.
+  Both fold to quotes.
+- A space was added after any full stop before a capital, splitting "U.S.A."
+  and "J.R.R. Tolkien", "1.E.8" and "README.TXT". It is added only between a
+  lowercase word and a capitalised one, in a word with no other stop in it.
+- Japanese and Chinese doubled ellipses and dashes were folded and then
+  shortened, and NFC replaced CJK compatibility ideographs with the unified
+  ones they stand for, changing glyphs that names rely on. Both are kept.
+- `?!?!` became `!!!`, and `,,Hallo''` lost a comma. `<tt>`, `<var>` and
+  MathML were cleaned like prose. Indentation between elements was counted as
+  extra spaces.
 
 ### CSS is edited in place, not reprinted
 
