@@ -367,8 +367,10 @@ An entity cannot be edited where it is written, so one an edit runs into is
 written out as what it stands for, and edited with the text around it, or
 in new text of its own in a `<style>` that is nothing but entities; one
 beside an edit stays as written. One declared to stand for nothing is read
-as that. One that stands for nothing that can be read, under a doctype that
-is never loaded, stops the edits that run into it.
+as that. One that cannot be read stops the edits that run into it: one a
+doctype that is never loaded declares, one whose value is in a file, which
+is never loaded either, and one whose value holds either of those, or an
+element, whose text is no part of the CSS.
 
 ### Empty paragraphs are collapsed among siblings
 

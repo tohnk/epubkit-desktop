@@ -8,7 +8,7 @@
 //! stylesheet rewords it — `cssutils`, which the reference used, into what it
 //! understood, a modern CSS library into syntax older engines do not read.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
@@ -17,6 +17,7 @@ use std::sync::LazyLock;
 
 use cssparser::{ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use libxml::bindings::xmlNodePtr;
 use libxml::tree::{Document, Node, NodeType};
 
 use crate::html;
@@ -235,11 +236,11 @@ pub fn remove_embedded_fonts_from_styles(xhtml_bytes: &[u8]) -> Result<(Vec<u8>,
 /// An edit beside one leaves it as it is. When an edit runs into one, the
 /// style's entities are written out as what they stand for, into the text
 /// before them, and edited with it; where there is no text, into new text put
-/// in their place. One the document does not declare, under a doctype that
-/// is never loaded, say, stands for nothing that can be read: it stays where
-/// it is, nothing is written out past it, and it stops the edits that run
-/// into it, since what it hides could change where they end. One declared to
-/// stand for nothing is read as that.
+/// in their place. One that cannot be read ([`can_be_read`]), one a doctype
+/// that is never loaded declares, say, stays where it is, nothing is written
+/// out past it, and it stops the edits that run into it, since what it hides
+/// could change where they end. One declared to stand for nothing is read as
+/// that.
 pub(crate) fn edit_style_element(
     doc: &Document,
     style: &Node,
@@ -247,12 +248,11 @@ pub(crate) fn edit_style_element(
 ) -> usize {
     let mut parts: Vec<StylePart> = Vec::new();
     let mut css = String::new();
+    let mut known = HashMap::new();
     for node in style.get_child_nodes() {
         let (entity, readable) = match node.get_type() {
             Some(NodeType::TextNode | NodeType::CDataSectionNode) => (false, true),
-            // libxml2 gives a reference to a declared entity the declaration
-            // as its child, and one to an undeclared entity nothing.
-            Some(NodeType::EntityRefNode) => (true, node.get_first_child().is_some()),
+            Some(NodeType::EntityRefNode) => (true, can_be_read(doc, &node, &mut known)),
             _ => continue,
         };
         let start = css.len();
@@ -411,8 +411,50 @@ struct StylePart {
     node: Node,
     range: Range<usize>,
     entity: bool,
-    /// Whether what it stands for can be read: an entity's declaration was.
+    /// Whether what it stands for can be read ([`can_be_read`]).
     readable: bool,
+}
+
+/// Whether what the entity `reference` stands for can be read, so written out
+/// as text: the document declares it, as libxml2 shows by giving a reference
+/// the declaration as its child, and one to an undeclared entity nothing; its
+/// value is in the document, not in a file it names, which is never loaded;
+/// and its value holds nothing but text and entities that can be read in turn.
+/// Written out, an entity it refers to would be lost, and an element too,
+/// whose text would become CSS.
+///
+/// `known` holds what is known of the declarations already looked through,
+/// so that each is looked through once.
+fn can_be_read(doc: &Document, reference: &Node, known: &mut HashMap<xmlNodePtr, bool>) -> bool {
+    let Some(declaration) = reference.get_first_child() else {
+        return false;
+    };
+    let key = declaration.node_ptr();
+    if let Some(&readable) = known.get(&key) {
+        return readable;
+    }
+    // An entity that refers to itself, which libxml2 refuses to read, would
+    // end here.
+    known.insert(key, false);
+
+    // A declaration reads back as written: a value in quotes for one in the
+    // document, a SYSTEM or PUBLIC identifier for one in a file.
+    let in_document = doc
+        .node_to_string(&declaration)
+        .strip_prefix("<!ENTITY ")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(_, value)| value.starts_with(['"', '\'']));
+    let readable = in_document
+        && declaration
+            .get_child_nodes()
+            .iter()
+            .all(|node| match node.get_type() {
+                Some(NodeType::EntityRefNode) => can_be_read(doc, node, known),
+                Some(NodeType::ElementNode) => false,
+                _ => true,
+            });
+    known.insert(key, readable);
+    readable
 }
 
 /// Whether each of `edits` runs into one of `entities`: takes in some of what

@@ -418,6 +418,56 @@ fn a_font_rule_with_an_unknown_entity_in_it_stays() {
     );
 }
 
+/// An entity that refers to one that cannot be read cannot be read either, nor
+/// can one whose value is in a file that is never loaded, or one with an
+/// element in it, whose text is no part of the CSS. Each was written out as
+/// text to remove a font from it: the first lost the entity it referred to,
+/// here the dash a `content` showed, the second the entity, and the third its
+/// element, whose text became CSS.
+#[test]
+fn an_entity_holding_what_cannot_be_read_stays() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd" [<!ENTITY dashed "p:before {{ content: '&mdash;' }} @font-face {{ src: url(x.ttf) }}"><!ENTITY outer "&dashed;"><!ENTITY fonts SYSTEM "fonts.css"><!ENTITY linked "@font-face {{ src: url(&fonts;x.ttf) }}"><!ENTITY marked "p:before {{ content: 'x' }} <b>@font-face {{ src: url(z.ttf) }}</b>">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    for kept in [
+        "&dashed;",
+        "&outer;",
+        "&linked;",
+        "@font-face { src: url(&fonts;x.ttf) }",
+        "&marked;",
+    ] {
+        let chapter = chapter(&format!(
+            "{kept} @font-face {{ src: url(y.ttf) }} h1 {{ color: red }}"
+        ));
+        // libxml2 2.9 takes an entity's reference to one it was not given for
+        // an error, where 2.14 does not, and recovers the chapter, entities
+        // filled in.
+        if xml::parse_strict(chapter.as_bytes()).is_err() {
+            assert!(
+                ["&dashed;", "&outer;"].contains(&kept),
+                "{kept} should be read strictly"
+            );
+            continue;
+        }
+
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(removed, 1, "{kept}: {out}");
+        assert!(
+            out.contains(&format!(
+                r#"<style type="text/css">{kept} h1 {{ color: red }}</style>"#
+            )),
+            "{kept}: {out}"
+        );
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    }
+}
+
 /// A `<style>` in many pieces, each with an edit in it, is edited in time
 /// that grows with its length. Finding the piece each edit fell in from the
 /// first piece on took time growing with the square of it.
