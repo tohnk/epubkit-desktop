@@ -433,27 +433,59 @@ fn rewrite_references(doc: &Document, base: &Path, renames: &Renames) -> Result<
     Ok(updated)
 }
 
-/// A `srcset` with each candidate's URL rewritten: a URL, then optionally a
-/// width or a density, the candidates separated by commas.
+/// A `srcset` with each candidate's URL rewritten.
 fn rewrite_srcset(srcset: &str, base: &Path, renames: &Renames) -> String {
-    srcset
-        .split(',')
-        .map(|candidate| {
-            let url_start = candidate.len() - candidate.trim_start().len();
-            let url_end = candidate[url_start..]
-                .find(char::is_whitespace)
-                .map_or(candidate.len(), |end| url_start + end);
-            match rewrite_reference(&candidate[url_start..url_end], base, renames) {
-                Some(new_url) => format!(
-                    "{}{new_url}{}",
-                    &candidate[..url_start],
-                    &candidate[url_end..]
-                ),
-                None => candidate.to_string(),
-            }
+    let edits: Vec<Edit> = srcset_urls(srcset)
+        .into_iter()
+        .filter_map(|url| {
+            let new_url = rewrite_reference(&srcset[url.clone()], base, renames)?;
+            Some((url, new_url))
         })
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect();
+    css::apply_edits(srcset, &edits)
+}
+
+/// Where each candidate's URL in a `srcset` is, found as the HTML standard's
+/// algorithm for parsing a srcset attribute finds them. A URL runs to the
+/// first blank, commas and all, less any commas it ends with, which end its
+/// candidate; otherwise the candidate's descriptors run to the first comma
+/// outside parentheses. So `https://cdn.example/a,b.png 2x` is one URL, and a
+/// `data:` URL is whole.
+fn srcset_urls(srcset: &str) -> Vec<Range<usize>> {
+    let bytes = srcset.as_bytes();
+    let blank = |at: usize| matches!(bytes[at], b' ' | b'\t' | b'\n' | b'\x0C' | b'\r');
+    let mut urls = Vec::new();
+    let mut at = 0;
+
+    loop {
+        while at < bytes.len() && (blank(at) || bytes[at] == b',') {
+            at += 1;
+        }
+        if at == bytes.len() {
+            return urls;
+        }
+
+        let start = at;
+        while at < bytes.len() && !blank(at) {
+            at += 1;
+        }
+        let url = srcset[start..at].trim_end_matches(',');
+        urls.push(start..start + url.len());
+        if url.len() < at - start {
+            continue;
+        }
+
+        let mut in_parentheses = false;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'(' => in_parentheses = true,
+                b')' => in_parentheses = false,
+                b',' if !in_parentheses => break,
+                _ => {}
+            }
+            at += 1;
+        }
+    }
 }
 
 /// Rewrite `url()` references in a stylesheet, resolved against its own
@@ -509,7 +541,8 @@ pub fn declare_reshaped_pages(
 /// References should already point at the first page.
 ///
 /// An `<img>` of a reshaped image loses its `width` and `height`, which give
-/// the old shape, and is followed by a copy for each further page. An SVG
+/// the old shape, and anything else that would show another image in its
+/// place, and is followed by a copy for each further page. An SVG
 /// wrapper around one, its viewBox sized to the old shape too, gives way to a
 /// plain `<img>` per page. An SVG that draws more than the image is an
 /// illustration, and stays as it is, followed by the image's further pages.
@@ -603,6 +636,19 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 
         image.remove_attribute("width").ok();
         image.remove_attribute("height").ok();
+
+        // Each page is shown by its `src`. A `srcset` or `sizes`, or the
+        // sources of a `<picture>`, would show the one image they name on
+        // every page.
+        image.remove_attribute("srcset").ok();
+        image.remove_attribute("sizes").ok();
+        if local_name(&parent) == "picture" {
+            for mut source in parent.get_child_elements() {
+                if local_name(&source) == "source" {
+                    source.unlink();
+                }
+            }
+        }
 
         // Each further page is shown the way the first is: its attributes,
         // in the order they come, but no id, plain or `xml:id`, which must

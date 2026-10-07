@@ -458,7 +458,9 @@ now be renamed differently, a reference is followed by its path from the
 document that makes it, falling back to the bare filename only when the path
 leads nowhere and the filename is unambiguous. Only the filename in a
 reference changes; its directory, fragment, percent-encoding and quotes stay
-as written, and links to other sites are left alone.
+as written, and links to other sites are left alone. A `srcset` is split
+into candidates as the HTML standard splits it, so a URL with a comma in it
+is one URL, and a `data:` URL or another site's is left whole.
 
 ### Light Novel mode keeps every page it makes
 
@@ -466,7 +468,9 @@ The reference split a double-page spread into two images but pointed the book
 at only the last, the left half; the right half, which comes first, was
 packaged and never shown. The port declares every page in the manifest and
 shows them in reading order where the spread was, each the way the spread
-was shown, minus the `width` and `height` that described it. An SVG wrapper,
+was shown, minus the `width` and `height` that described it, and minus any
+`srcset`, `sizes` or `<picture>` sources, which would show one image on every
+page. An SVG wrapper,
 common around full-page illustrations and sized to the spread in its viewBox,
 gives way to a plain image per page. A rotated image sheds its old size and
 wrapper the same way. The report counts a split spread as one image.

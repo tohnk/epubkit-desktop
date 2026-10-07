@@ -469,6 +469,63 @@ fn css_urls_are_found_however_they_are_written() {
     }
 }
 
+/// A srcset is split as the HTML standard splits it: a URL runs to the first
+/// blank, commas and all, and only a comma after it, outside parentheses,
+/// ends a candidate. Split at every comma, a remote image whose URL held one
+/// had the tail of its path taken for an image in the book, and a local image
+/// with a comma in its name was not found.
+#[test]
+fn a_srcset_is_split_as_the_html_standard_splits_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let srcsets = [
+        (
+            "https://cdn.example/path,cover.png 2x",
+            "https://cdn.example/path,cover.png 2x",
+        ),
+        (
+            "../images/a,b.png 1x,../images/cover.png 2x",
+            "../images/a,b.jpg 1x,../images/cover.jpg 2x",
+        ),
+        (
+            "data:image/png;base64,AAAA 1x, ../images/cover.png 2x",
+            "data:image/png;base64,AAAA 1x, ../images/cover.jpg 2x",
+        ),
+        (
+            "../images/cover.png,&#10;../images/a,b.png 640w (max-width: 9em, x) ,../images/cover.png",
+            "../images/cover.jpg,\n../images/a,b.jpg 640w (max-width: 9em, x) ,../images/cover.jpg",
+        ),
+    ];
+    let images: String = srcsets
+        .iter()
+        .map(|(srcset, _)| format!(r#"<p><img src="../images/cover.png" srcset="{srcset}" alt=""/></p>"#))
+        .collect();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>{images}</body></html>
+"#
+        ),
+    );
+    let map = rename_map(&[
+        ("images/cover.png", "images/cover.jpg"),
+        ("images/a,b.png", "images/a,b.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    let doc = xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    let written: Vec<String> = xml::find_nodes(&doc, "//*[local-name()='img']")
+        .unwrap()
+        .iter()
+        .map(|image| image.get_attribute("srcset").unwrap_or_default())
+        .collect();
+    let expected: Vec<&str> = srcsets.iter().map(|(_, after)| *after).collect();
+    assert_eq!(written, expected, "{out}");
+}
+
 /// A `<style>` element's text and CDATA sections are one stylesheet, and a
 /// url can start in one and end in the next. Read one at a time, neither held
 /// a url.
@@ -1085,6 +1142,45 @@ fn a_split_image_is_followed_by_its_other_pages() {
         out.contains(r#"width="10" height="20""#),
         "an unrelated image keeps its size: {out}"
     );
+}
+
+/// Each page of a split image is shown by its `src`. A `srcset` or `sizes`,
+/// or the `<source>`s of a `<picture>`, would show the one image they name on
+/// every page instead: the first page, or the whole spread.
+#[test]
+fn a_split_images_pages_are_shown_by_src_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p><img src="../images/spread_part1.jpg" srcset="../images/spread_part1.jpg 1x, ../images/spread-hd.jpg 2x" sizes="100vw" alt=""/></p>
+<p><picture><source srcset="../images/spread.webp" type="image/webp"/><img src="../images/spread_part1.jpg" alt=""/></picture></p>
+<p><img src="../images/other.jpg" srcset="../images/other.jpg 1x" sizes="50vw" alt=""/></p>
+</body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
+        2
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert_eq!(out.matches("spread_part2.jpg").count(), 2, "{out}");
+    for gone in ["spread-hd.jpg", "100vw", "<source", "spread.webp"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
+    assert!(
+        out.contains(r#"srcset="../images/other.jpg 1x" sizes="50vw""#),
+        "an unrelated image keeps its srcset: {out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
 }
 
 /// An SVG wrapper's viewBox is sized to the old shape, so it would squash the
