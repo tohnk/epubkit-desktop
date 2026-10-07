@@ -337,6 +337,11 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for &path in &chapters {
             structure::update_xhtml_references(path, &renames)?;
         }
+        // An SVG document names images as a chapter does. One that is not
+        // well-formed is left as it is.
+        for path in svg_documents(&content.images) {
+            structure::update_svg_references(path, &renames).ok();
+        }
         for path in &content.css {
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
@@ -462,6 +467,15 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 }
 
 // ---------------------------------------------------------------- internals
+
+/// The SVG documents among a book's images.
+fn svg_documents(images: &[PathBuf]) -> impl Iterator<Item = &Path> {
+    images.iter().map(PathBuf::as_path).filter(|path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+            && path.is_file()
+    })
+}
 
 /// What the image step leaves for the steps after it. Paths are relative to
 /// the OPF's directory.

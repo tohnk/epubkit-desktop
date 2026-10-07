@@ -677,6 +677,48 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// An SVG document in the book names its images as a chapter does, and has to
+/// follow them when they are converted.
+#[test]
+fn an_svg_document_follows_the_images_it_draws() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svg</dc:identifier><dc:title>SVG</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="map" href="map.svg" media-type="image/svg+xml"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="map"/></spine>
+</package>
+"#;
+    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 64 64"><image width="64" height="64" xlink:href="images/plate.png"/><text x="5" y="60">Map</text></svg>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+            ("OEBPS/map.svg", svg),
+            ("OEBPS/images/plate.png", &solid(image::ImageFormat::Png, 0)),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let svg = fs::read_to_string(work.path().join("OEBPS/map.svg")).unwrap();
+    assert!(svg.contains(r#"xlink:href="images/plate.jpg""#), "{svg}");
+    assert!(work.path().join("OEBPS/images/plate.jpg").is_file());
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.

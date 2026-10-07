@@ -428,6 +428,108 @@ fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
     assert!(out.contains("url('images/plate.jpg')"), "{out}");
 }
 
+/// CSS as a browser reads it: `URL(` in capitals, a `)` inside a quoted url,
+/// the strings `image-set()` names images with, and padding inside the
+/// parentheses. A `//host` url is another site's, and a comment is not CSS.
+#[test]
+fn css_urls_are_found_however_they_are_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = put(
+        dir.path(),
+        "style.css",
+        ".a { background: URL(images/upper.png) }\n\
+         .b { background: url(\"images/paren(1).png\") }\n\
+         .c { background-image: image-set(\"images/set.png\" 1x, url(images/set2.png) 2x) }\n\
+         .d { background-image: -webkit-image-set(url( 'images/pad.png' ) 1x) }\n\
+         .e { background: url(//cdn.example.com/images/plate.png) }\n\
+         /* url(images/commented.png) */\n",
+    );
+    let map = rename_map(&[
+        ("images/upper.png", "images/upper.jpg"),
+        ("images/paren(1).png", "images/paren(1).jpg"),
+        ("images/set.png", "images/set.jpg"),
+        ("images/set2.png", "images/set2.jpg"),
+        ("images/pad.png", "images/pad.jpg"),
+        ("images/plate.png", "images/plate.jpg"),
+        ("images/commented.png", "images/commented.jpg"),
+    ]);
+
+    update_css_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&path).unwrap();
+    for rewritten in [
+        "URL(images/upper.jpg)",
+        r#"url("images/paren(1).jpg")"#,
+        r#"image-set("images/set.jpg" 1x, url(images/set2.jpg) 2x)"#,
+        "url( 'images/pad.jpg' )",
+        "url(//cdn.example.com/images/plate.png)",
+        "/* url(images/commented.png) */",
+    ] {
+        assert!(out.contains(rewritten), "{rewritten}:\n{out}");
+    }
+}
+
+/// An image is named by more than `<img src>`: by `srcset`, a link to the
+/// full size, a video's poster, an object's data, a page's background, SVG 2's
+/// plain `href` beside `xlink:href`, and `url()` in a `<style>` element as
+/// much as in a `style` attribute.
+#[test]
+fn every_attribute_that_names_an_image_follows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.banner { background: url(../images/banner.png) }</style></head>
+<body background="../images/paper.png">
+<p><img src="../images/a.png" srcset="../images/a.png 1x, ../images/big.png 2x" alt=""/></p>
+<p><a href="../images/a.png">full size</a></p>
+<video poster="../images/poster.png"/>
+<object data="../images/object.png" type="image/png"/>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><image href="../images/svg.png" xlink:href="../images/svg.png"/><style>.x { fill: url(../images/fill.png) }</style></svg>
+<p style="background: URL(../images/upper.png)">x</p>
+<p><img src=" ../images/padded.png " alt=""/><img src="//cdn.example.com/images/a.png" alt=""/></p>
+</body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("images/banner.png", "images/banner.jpg"),
+        ("images/paper.png", "images/paper.jpg"),
+        ("images/a.png", "images/a.jpg"),
+        ("images/big.png", "images/big.jpg"),
+        ("images/poster.png", "images/poster.jpg"),
+        ("images/object.png", "images/object.jpg"),
+        ("images/svg.png", "images/svg.jpg"),
+        ("images/fill.png", "images/fill.jpg"),
+        ("images/upper.png", "images/upper.jpg"),
+        ("images/padded.png", "images/padded.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    for gone in [
+        "banner.png",
+        "paper.png",
+        "../images/a.png",
+        "big.png",
+        "poster.png",
+        "object.png",
+        "svg.png",
+        "fill.png",
+        "upper.png",
+        "padded.png",
+    ] {
+        assert!(!out.contains(gone), "{gone} is still named:\n{out}");
+    }
+    assert!(
+        out.contains(r#"srcset="../images/a.jpg 1x, ../images/big.jpg 2x""#),
+        "{out}"
+    );
+    assert!(out.contains("//cdn.example.com/images/a.png"), "{out}");
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
 #[test]
 fn svg_wrapped_covers_become_plain_images() {
     let dir = tempfile::tempdir().unwrap();

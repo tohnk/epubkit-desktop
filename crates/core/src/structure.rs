@@ -6,7 +6,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use libxml::tree::{Document, Node};
+use std::ops::Range;
+
+use cssparser::{ParseError, Parser as CssParser, ParserInput, Token};
+use libxml::tree::{Document, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::html;
@@ -18,6 +21,15 @@ pub const NS_NCX: &str = "http://www.daisy.org/z3986/2005/ncx/";
 pub const NS_XLINK: &str = "http://www.w3.org/1999/xlink";
 
 const NCX_MEDIA_TYPE: &str = "application/x-dtbncx+xml";
+
+/// Attributes whose value is one URL a reader may fetch an image from: an
+/// image's own, a link to the full size, SVG 2's `href`, a video's poster, an
+/// object's data, an old-fashioned page background, MathML's fallback image.
+const URL_ATTRIBUTES: &[&str] = &["src", "href", "data", "poster", "background", "altimg"];
+
+/// How deep into CSS blocks and functions to look for urls. Real stylesheets
+/// nest a few levels; one nested deeper is left as it is there.
+const MAX_CSS_NESTING: usize = 32;
 
 /// Media types the OPF may use for embedded fonts.
 const FONT_MEDIA_TYPES: &[&str] = &[
@@ -315,8 +327,9 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite image references inside one XHTML file: `<img src>`, SVG
-/// `<image xlink:href>`, and `url()` in inline styles. Returns how many
+/// Rewrite image references inside one XHTML file: every attribute that names
+/// an image ([`URL_ATTRIBUTES`], `xlink:href` and each `srcset` candidate),
+/// and `url()` in `style` attributes and `<style>` elements. Returns how many
 /// references changed, writing the file only if any did.
 ///
 /// A reference is resolved against the file's own directory and matched by
@@ -327,62 +340,124 @@ pub fn update_xhtml_references(path: &Path, renames: &Renames) -> Result<usize> 
         return Ok(0);
     }
 
-    let base = path.parent().unwrap_or(renames.opf_dir);
-
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     let content = html::parse_content(&bytes)?;
+    let base = path.parent().unwrap_or(renames.opf_dir);
+
+    let updated = rewrite_references(&content.doc, base, renames)?;
+    if updated > 0 {
+        fs::write(path, html::serialize_content(&content)).map_err(|e| Error::io(path, e))?;
+    }
+
+    Ok(updated)
+}
+
+/// Rewrite image references inside one SVG document, as
+/// [`update_xhtml_references`] does inside a chapter.
+///
+/// Only an SVG that is well-formed is touched. The recovery that mends a
+/// chapter is an HTML parser's, which would make nonsense of an SVG.
+pub fn update_svg_references(path: &Path, renames: &Renames) -> Result<usize> {
+    if renames.is_empty() {
+        return Ok(0);
+    }
+
+    let doc = xml::parse_file(path)?;
+    let base = path.parent().unwrap_or(renames.opf_dir);
+
+    let updated = rewrite_references(&doc, base, renames)?;
+    if updated > 0 {
+        xml::write_file(&doc, path, false)?;
+    }
+
+    Ok(updated)
+}
+
+/// Rewrite every reference in `doc` to a renamed image. Returns how many
+/// changed.
+fn rewrite_references(doc: &Document, base: &Path, renames: &Renames) -> Result<usize> {
     let mut updated = 0;
 
-    for mut node in xml::find_nodes(&content.doc, "//*")? {
-        match local_name(&node).as_str() {
-            "img" => {
-                let src = node.get_attribute("src").unwrap_or_default();
-                if let Some(new_src) = rewrite_reference(&src, base, renames) {
-                    node.set_attribute("src", &new_src).ok();
-                    updated += 1;
-                }
+    for mut node in xml::find_nodes(doc, "//*")? {
+        for &name in URL_ATTRIBUTES {
+            let Some(value) = node.get_attribute_no_ns(name) else {
+                continue;
+            };
+            if let Some(new_value) = rewrite_reference(&value, base, renames) {
+                node.set_attribute(name, &new_value).ok();
+                updated += 1;
             }
-            // SVG's <image> carries its target in xlink:href, or plain href in
-            // SVG 2 documents.
-            "image" => {
-                let xlink = node.get_attribute_ns("href", NS_XLINK);
-                let value = xlink
-                    .clone()
-                    .unwrap_or_else(|| node.get_attribute("href").unwrap_or_default());
-
-                if let Some(new_value) = rewrite_reference(&value, base, renames) {
-                    let namespace = xlink
-                        .is_some()
-                        .then(|| xlink_namespace(&content.doc, &node));
-                    match namespace.flatten() {
-                        Some(ns) => {
-                            node.set_attribute_ns("href", &new_value, &ns).ok();
-                        }
-                        None => {
-                            node.set_attribute("href", &new_value).ok();
-                        }
-                    }
-                    updated += 1;
-                }
-            }
-            _ => {}
         }
 
-        let style = node.get_attribute("style").unwrap_or_default();
-        if style.contains("url(") {
+        // SVG's `<image>` before SVG 2, which may carry the plain `href` too.
+        if let Some(value) = node.get_attribute_ns("href", NS_XLINK) {
+            if let (Some(new_value), Some(namespace)) = (
+                rewrite_reference(&value, base, renames),
+                xlink_namespace(doc, &node),
+            ) {
+                node.set_attribute_ns("href", &new_value, &namespace).ok();
+                updated += 1;
+            }
+        }
+
+        if let Some(srcset) = node.get_attribute_no_ns("srcset") {
+            let new_srcset = rewrite_srcset(&srcset, base, renames);
+            if new_srcset != srcset {
+                node.set_attribute("srcset", &new_srcset).ok();
+                updated += 1;
+            }
+        }
+
+        if let Some(style) = node.get_attribute_no_ns("style") {
             let new_style = rewrite_css_urls(&style, base, renames);
             if new_style != style {
                 node.set_attribute("style", &new_style).ok();
                 updated += 1;
             }
         }
-    }
 
-    if updated > 0 {
-        fs::write(path, html::serialize_content(&content)).map_err(|e| Error::io(path, e))?;
+        if local_name(&node) == "style" {
+            for mut text in node.get_child_nodes() {
+                if !matches!(
+                    text.get_type(),
+                    Some(NodeType::TextNode | NodeType::CDataSectionNode)
+                ) {
+                    continue;
+                }
+                let css = text.get_content();
+                let new_css = rewrite_css_urls(&css, base, renames);
+                if new_css != css {
+                    text.set_content(&new_css).ok();
+                    updated += 1;
+                }
+            }
+        }
     }
 
     Ok(updated)
+}
+
+/// A `srcset` with each candidate's URL rewritten: a URL, then optionally a
+/// width or a density, the candidates separated by commas.
+fn rewrite_srcset(srcset: &str, base: &Path, renames: &Renames) -> String {
+    srcset
+        .split(',')
+        .map(|candidate| {
+            let url_start = candidate.len() - candidate.trim_start().len();
+            let url_end = candidate[url_start..]
+                .find(char::is_whitespace)
+                .map_or(candidate.len(), |end| url_start + end);
+            match rewrite_reference(&candidate[url_start..url_end], base, renames) {
+                Some(new_url) => format!(
+                    "{}{new_url}{}",
+                    &candidate[..url_start],
+                    &candidate[url_end..]
+                ),
+                None => candidate.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Rewrite `url()` references in a stylesheet, resolved against its own
@@ -928,9 +1003,12 @@ struct Reference<'a> {
 
 impl<'a> Reference<'a> {
     /// `None` for what is not a file in the book: a same-document fragment,
-    /// or anything with a scheme, such as http: or data:.
+    /// anything with a scheme, such as http: or data:, or a `//host` URL,
+    /// which names another site. Blanks around a URL in an attribute are no
+    /// part of it.
     fn parse(reference: &'a str) -> Option<Self> {
-        if reference.starts_with('#') || has_scheme(reference) {
+        let reference = reference.trim_matches(|c: char| c.is_ascii_whitespace());
+        if reference.starts_with('#') || reference.starts_with("//") || has_scheme(reference) {
             return None;
         }
 
@@ -980,40 +1058,160 @@ fn has_scheme(reference: &str) -> bool {
     })
 }
 
-/// Rewrite the `url(...)` targets in CSS text that name a renamed file. Every
-/// other byte, quotes included, stays as written.
+/// Rewrite the `url()` targets in CSS text that name a renamed file, and the
+/// strings `image-set()` names images with. Every other byte, quotes and
+/// padding included, stays as written.
+///
+/// The text is tokenized as a browser does: `URL(` in any case, a `)` inside a
+/// quoted url, escapes and comments are all read for what they are.
 fn rewrite_css_urls(css: &str, base: &Path, renames: &Renames) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
+    let mut edits = Vec::new();
+    let mut input = ParserInput::new(css);
+    let mut parser = CssParser::new(&mut input);
+    find_css_urls(
+        &mut parser,
+        css,
+        base,
+        renames,
+        MAX_CSS_NESTING,
+        false,
+        &mut edits,
+    );
 
-    while let Some(start) = rest.find("url(") {
-        let open = start + "url(".len();
-        let Some(close) = rest[open..].find(')').map(|end| open + end) else {
-            // Unterminated url( — leave the remainder untouched.
-            break;
-        };
-        out.push_str(&rest[..open]);
-
-        let inner = &rest[open..close];
-        let trimmed = inner.trim();
-        let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
-        let target = quote.map_or(trimmed, |q| trimmed.trim_matches(q));
-
-        match (rewrite_reference(target, base, renames), quote) {
-            (Some(new), Some(q)) => {
-                out.push(q);
-                out.push_str(&new);
-                out.push(q);
-            }
-            (Some(new), None) => out.push_str(&new),
-            (None, _) => out.push_str(inner),
-        }
-
-        rest = &rest[close..];
+    if edits.is_empty() {
+        return css.to_string();
     }
 
-    out.push_str(rest);
+    let mut out = String::with_capacity(css.len());
+    let mut kept_from = 0;
+    for (range, replacement) in edits {
+        out.push_str(&css[kept_from..range.start]);
+        out.push_str(&replacement);
+        kept_from = range.end;
+    }
+    out.push_str(&css[kept_from..]);
     out
+}
+
+/// Note, in order, what each url in `parser`'s input that names a renamed
+/// file becomes. Strings are urls when `in_image_set`.
+fn find_css_urls(
+    parser: &mut CssParser<'_, '_>,
+    css: &str,
+    base: &Path,
+    renames: &Renames,
+    depth: usize,
+    in_image_set: bool,
+    edits: &mut Vec<(Range<usize>, String)>,
+) {
+    loop {
+        let start = parser.position().byte_index();
+        let Ok(token) = parser.next_including_whitespace_and_comments().cloned() else {
+            break;
+        };
+        let end = parser.position().byte_index();
+
+        match token {
+            Token::UnquotedUrl(url) => {
+                if let Some(new_url) = rewrite_reference(&url, base, renames) {
+                    let written = &css[start..end];
+                    let opening = written.find('(').map_or(0, |at| at + 1);
+                    edits.push((
+                        start..end,
+                        format!("{}{})", &written[..opening], unquoted_css_url(&new_url)),
+                    ));
+                }
+            }
+            Token::QuotedString(url) if in_image_set => {
+                edit_css_string(css, start..end, &url, base, renames, edits);
+            }
+            Token::Function(name) if depth > 0 => {
+                let name = name.to_ascii_lowercase();
+                parser
+                    .parse_nested_block(|inner| {
+                        if name == "url" {
+                            // `url("…")`: the string is the url.
+                            inner.skip_whitespace();
+                            let start = inner.position().byte_index();
+                            if let Ok(Token::QuotedString(url)) = inner.next().cloned() {
+                                let end = inner.position().byte_index();
+                                edit_css_string(css, start..end, &url, base, renames, edits);
+                            }
+                        } else {
+                            let image_set =
+                                matches!(name.as_str(), "image-set" | "-webkit-image-set");
+                            find_css_urls(inner, css, base, renames, depth - 1, image_set, edits);
+                        }
+                        Ok::<_, ParseError<()>>(())
+                    })
+                    .ok();
+            }
+            Token::ParenthesisBlock | Token::SquareBracketBlock | Token::CurlyBracketBlock
+                if depth > 0 =>
+            {
+                parser
+                    .parse_nested_block(|inner| {
+                        find_css_urls(inner, css, base, renames, depth - 1, false, edits);
+                        Ok::<_, ParseError<()>>(())
+                    })
+                    .ok();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Note what the quoted string at `range`, whose value is `url`, becomes if it
+/// names a renamed file: the same quotes around the new url.
+fn edit_css_string(
+    css: &str,
+    range: Range<usize>,
+    url: &str,
+    base: &Path,
+    renames: &Renames,
+    edits: &mut Vec<(Range<usize>, String)>,
+) {
+    let Some(new_url) = rewrite_reference(url, base, renames) else {
+        return;
+    };
+    let quote = css[range.start..].chars().next().unwrap_or('"');
+    let mut escaped = String::with_capacity(new_url.len() + 2);
+    escaped.push(quote);
+    for c in new_url.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\a "),
+            c if c == quote => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped.push(quote);
+    edits.push((range, escaped));
+}
+
+/// `url` as written inside an unquoted `url()`, or quoted if it has anything
+/// an unquoted one cannot hold.
+fn unquoted_css_url(url: &str) -> String {
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "\"'()\\".contains(c))
+    {
+        let mut quoted = String::with_capacity(url.len() + 2);
+        quoted.push('"');
+        for c in url.chars() {
+            if matches!(c, '"' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        quoted.push('"');
+        quoted
+    } else {
+        url.to_string()
+    }
 }
 
 /// An NCX counts as usable when it parses, declares at least one navPoint, and
