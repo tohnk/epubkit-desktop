@@ -529,7 +529,7 @@ fn flatten_onto_white(img: DynamicImage) -> DynamicImage {
         return img;
     }
 
-    let rgba = img.to_rgba8();
+    let rgba = img.into_rgba8();
     let mut out = RgbImage::new(rgba.width(), rgba.height());
 
     for (target, source) in out.pixels_mut().zip(rgba.pixels()) {
