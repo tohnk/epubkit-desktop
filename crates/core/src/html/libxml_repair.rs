@@ -806,7 +806,8 @@ fn without_internal_subset(text: &str) -> Cow<'_, str> {
 /// attribute values, but not in a CDATA section, comment or processing
 /// instruction, whose text they are. One that never ends is taken for none,
 /// since the HTML parser reads on past where some of them start, and a
-/// `<!--` in a quoted attribute value is the value's text.
+/// `<!--` in a quoted attribute value is the value's text. So is what an
+/// entity in a value stands for ([`as_attribute_text`]).
 ///
 /// A reference in the chapter, at `depth` 0, is filled in whole or stays as
 /// written, so that a "billion laughs" stays a few references, and one to an
@@ -827,9 +828,12 @@ fn fill_entities(
     // What never ends from one place on ends nowhere after it either, so each
     // kind is looked for to the end once.
     let mut endless = [false; LITERAL_TEXT.len()];
-    // Where the tag being read ends. What a quoted value in it holds is the
-    // value's text, a `<!--` and all, and its entities are filled in.
+    // The tag being read: where it ends, and where its attribute values are.
+    // What a quoted value holds is the value's text, a `<!--` and all, and
+    // what an entity in a value stands for is filled in as text of the value.
     let mut tag_end = 0;
+    let mut values: Vec<TagValue> = Vec::new();
+    let mut next_value = 0;
     while let Some(offset) = text[at..].find(['<', '&']) {
         let from = at + offset;
         let rest = &text[from..];
@@ -838,7 +842,13 @@ fn fill_entities(
             continue;
         }
         if opens_tag(rest) {
-            tag_end = from + tag_length(rest);
+            let (length, found) = read_tag(rest);
+            tag_end = from + length;
+            values = found
+                .into_iter()
+                .map(|(range, quote)| (from + range.start..from + range.end, quote))
+                .collect();
+            next_value = 0;
             continue;
         }
         if let Some(kind) = LITERAL_TEXT
@@ -872,6 +882,23 @@ fn fill_entities(
             fill_entities(value, entities, spent, depth + 1, out)
         };
         if filled {
+            if from < tag_end {
+                while values
+                    .get(next_value)
+                    .is_some_and(|(range, _)| range.end <= from)
+                {
+                    next_value += 1;
+                }
+                if let Some((range, quote)) = values.get(next_value) {
+                    if range.start <= from {
+                        let filled = out.split_off(filled_from);
+                        let escaped = as_attribute_text(&filled, quote.is_some());
+                        // What writing it so adds costs too.
+                        *spent += escaped.len().saturating_sub(filled.len());
+                        out.push_str(&escaped);
+                    }
+                }
+            }
             written = from + reference[0].len();
             at = written;
         } else if depth > 0 {
@@ -891,30 +918,69 @@ fn opens_tag(text: &str) -> bool {
     bytes.first() == Some(&b'<') && bytes.get(name).is_some_and(u8::is_ascii_alphabetic)
 }
 
-/// How long the tag `text` starts with is: to its `>`, one in a quoted
-/// attribute value aside, or to the end if it never ends. A quote starts a
-/// value only after an `=`, as HTML reads a tag.
-fn tag_length(text: &str) -> usize {
+/// An attribute value of a tag: where it is, and the quote around it, if any.
+type TagValue = (std::ops::Range<usize>, Option<u8>);
+
+/// The tag `text` starts with, as HTML reads one: how long it is, to its `>`,
+/// one in a quoted attribute value aside, or to the end if it never ends; and
+/// where its attribute values are. A quote starts a value only after an `=`,
+/// and a value without one runs to white space or the `>`.
+fn read_tag(text: &str) -> (usize, Vec<TagValue>) {
     let bytes = text.as_bytes();
+    let mut values = Vec::new();
     let mut after_equals = false;
     let mut at = 1;
     while at < bytes.len() {
         match bytes[at] {
-            b'>' => return at + 1,
+            b'>' => return (at + 1, values),
             b'=' => after_equals = true,
-            quote @ (b'"' | b'\'') if after_equals => {
-                match bytes[at + 1..].iter().position(|&byte| byte == quote) {
-                    Some(length) => at += length + 1,
-                    None => return bytes.len(),
-                }
+            byte if byte.is_ascii_whitespace() => {}
+            _ if !after_equals => {}
+            quote @ (b'"' | b'\'') => {
+                let start = at + 1;
+                let Some(length) = bytes[start..].iter().position(|&byte| byte == quote) else {
+                    values.push((start..bytes.len(), Some(quote)));
+                    return (bytes.len(), values);
+                };
+                values.push((start..start + length, Some(quote)));
+                at = start + length;
                 after_equals = false;
             }
-            byte if byte.is_ascii_whitespace() => {}
-            _ => after_equals = false,
+            _ => {
+                let start = at;
+                at += bytes[start..]
+                    .iter()
+                    .position(|&byte| byte.is_ascii_whitespace() || byte == b'>')
+                    .unwrap_or(bytes.len() - start);
+                values.push((start..at, None));
+                after_equals = false;
+                continue;
+            }
         }
         at += 1;
     }
-    bytes.len()
+    (bytes.len(), values)
+}
+
+/// `filled`, what an entity in an attribute value stands for, as text of the
+/// value. XML takes a quote in it for a character, never for the value's
+/// end, and white space for a space. So a quote is written as a reference,
+/// which the HTML parser reads back as the character; white space is written
+/// as a space; and in a value without quotes, which white space or a `>`
+/// would end, those are written as references too.
+fn as_attribute_text(filled: &str, quoted: bool) -> String {
+    let mut text = String::with_capacity(filled.len());
+    for c in filled.chars() {
+        match c {
+            '"' => text.push_str("&#34;"),
+            '\'' => text.push_str("&#39;"),
+            ' ' | '\t' | '\n' | '\r' if !quoted => text.push_str("&#32;"),
+            '\t' | '\n' | '\r' => text.push(' '),
+            '>' if !quoted => text.push_str("&#62;"),
+            c => text.push(c),
+        }
+    }
+    text
 }
 
 /// `text` with every control character XML forbids, NUL among them, made a
@@ -1163,7 +1229,7 @@ fn without_cdata_in_text(text: &str) -> Cow<'_, str> {
         } else if rest.starts_with("<!") || rest.starts_with("<?") {
             at = rest.find('>').map_or(text.len(), |end| from + end + 1);
         } else if opens_tag(rest) {
-            let tag = &rest[..tag_length(rest)];
+            let tag = &rest[..read_tag(rest).0];
             at = from + tag.len();
             let name = &tag[1..];
             let name = &name[..name

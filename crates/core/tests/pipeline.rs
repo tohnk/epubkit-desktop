@@ -720,6 +720,58 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// An image named through an entity that stands for a quote, in a chapter that
+/// is recovered, follows its image: filled into the `src` as written, the
+/// quote ended it, and the chapter named a file that was never there.
+#[test]
+fn an_image_named_through_an_entity_with_a_quote_in_it_is_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:quoted</dc:identifier><dc:title>Quoted</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover" href="a&quot;b.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY image "a&#34;b.png">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>Text<br></p><img src="&image;" alt="cover"/></body></html>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter.as_bytes()),
+            ("OEBPS/a\"b.png", &solid(image::ImageFormat::Png, 0)),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let options = ProcessingOptions {
+        text_cleanup: false,
+        ..ProcessingOptions::default()
+    };
+    process_epub(&input, &output, &options, |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    let doc = epubkit_core::xml::parse_strict(chapter.as_bytes()).unwrap();
+    let images = epubkit_core::xml::find_nodes(&doc, "//*[local-name()='img']").unwrap();
+    let source = images[0].get_attribute("src").unwrap();
+    assert_eq!(source, "a\"b.jpg", "{chapter}");
+    assert!(
+        work.path().join("OEBPS").join(&source).is_file(),
+        "{source} is not in the book: {chapter}"
+    );
+}
+
 /// Every image a chapter's `<style>` names is still there after the images are
 /// converted, whatever entities the style holds: one beside a url, one in it,
 /// one standing for another site, whose url is that site's, one that is the

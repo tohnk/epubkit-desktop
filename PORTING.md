@@ -231,9 +231,11 @@ reading a parameter entity's declarations where it is used and replacing a
 value's character references as it goes. It fills in the entities the subset
 declares where the chapter uses them, in text and attribute values, those
 they refer to in turn too, but not in a CDATA section, a comment or a
-processing instruction, whose text a reference there is. Each reference is
-filled in whole or stays as written, within a bound on what filling in may
-cost, so a "billion laughs" stays a few references.
+processing instruction, whose text a reference there is. In an attribute
+value, what an entity stands for is the value's text, and a quote in it ends
+nothing. Each reference is filled in whole or stays as written, within a
+bound on what filling in may cost, so a "billion laughs" stays a few
+references.
 
 ### Malformed chapters are read as UTF-8
 

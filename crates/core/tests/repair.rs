@@ -433,6 +433,89 @@ fn a_subset_declares_what_xml_reads_it_to_declare() {
     }
 }
 
+/// The attributes of the first element named `name` in `out`, in order, as
+/// XML reads them.
+fn attributes_of(out: &str, name: &str) -> Vec<(String, String)> {
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    let found = epubkit_core::xml::find_nodes(&doc, &format!("//*[local-name()='{name}']"))
+        .expect("a query that runs");
+    let element = found
+        .first()
+        .unwrap_or_else(|| panic!("no {name} in {out}"));
+    let mut attributes: Vec<(String, String)> = element.get_attributes().into_iter().collect();
+    attributes.sort();
+    attributes
+}
+
+/// What an entity stands for, filled into an attribute value, is text of the
+/// value, whichever quotes are around it: XML takes a quote in it for a
+/// character, never for the value's end. Filled in as written, the `"` that
+/// `&#34;` stands for ended `title="Say &q; now"` after "Say ", and "Right"
+/// and "now" became attributes of their own.
+#[test]
+fn an_entity_filled_into_an_attribute_value_stays_in_it() {
+    let cases = [
+        (
+            r#"<!ENTITY q "&#34;Right&#34;">"#,
+            r#"title="Say &q; now""#,
+            r#"Say "Right" now"#,
+        ),
+        (
+            r#"<!ENTITY q "&#39;Right&#39;">"#,
+            "title='Say &q; now'",
+            "Say 'Right' now",
+        ),
+        (
+            r#"<!ENTITY quote "&#34;"> <!ENTITY q "&quote;Right&quote;">"#,
+            r#"title="Say &q; now""#,
+            r#"Say "Right" now"#,
+        ),
+    ];
+    for (subset, attribute, expected) in cases {
+        // Well-formed, libxml2 fills the value in; with a markup error,
+        // recovery does.
+        for markup_error in [false, true] {
+            let br = if markup_error { "<br>" } else { "<br/>" };
+            let chapter = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [{subset}]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p {attribute}>Text{br}</p></body></html>
+"#
+            );
+            let (out, recovered) = repair(chapter.as_bytes());
+            assert_eq!(recovered, markup_error, "{subset}");
+            assert_eq!(
+                attributes_of(&out, "p"),
+                [("title".to_string(), expected.to_string())],
+                "{subset} {attribute}{br}: {out}"
+            );
+        }
+    }
+
+    // White space it stands for is a space, as XML reads an attribute's
+    // value; and a value without quotes, which only the HTML parser reads,
+    // keeps all of it, spaces and all.
+    for (attribute, expected) in [
+        (r#"title="&q;""#, "two lines here"),
+        ("title=&q;", "two lines here"),
+    ] {
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [<!ENTITY q "two&#10;lines here">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p {attribute}>Text<br></p></body></html>
+"#
+        );
+        let (out, recovered) = repair(chapter.as_bytes());
+        assert!(recovered);
+        assert_eq!(
+            attributes_of(&out, "p"),
+            [("title".to_string(), expected.to_string())],
+            "{attribute}: {out}"
+        );
+    }
+}
+
 /// In a chapter the HTML parser recovers, a `<!--`, a `<![CDATA[` or a `<?`
 /// in a quoted attribute value is the value's text, and an entity beside it
 /// is filled in as in any value. Taken for the start of a comment, it kept
