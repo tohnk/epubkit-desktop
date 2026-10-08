@@ -472,6 +472,16 @@ filter kernel on downscale exactly as Pillow does — but `f32` coefficients
 rather than fixed-point) and error diffusion (classic Floyd–Steinberg on the
 grey channel, where Pillow diffuses against a palette in RGB).
 
+### Photos are turned the way their EXIF data says
+
+The reference decoded an image as stored and dropped its EXIF data,
+orientation tag and all. A phone photo stored sideways, with a tag saying
+to turn it a quarter clockwise, is shown upright by a reader, but came out
+of the reference sideways for good; in Light Novel mode, taken for
+landscape art and turned the other way, it came out upside down. The port
+turns each image as its orientation tag says (JPEG, PNG, WebP and TIFF can
+carry one) before anything looks at its shape.
+
 ### Cover generation is omitted
 
 `generate_cover_image` drew a title/author cover for books that lack one. It is

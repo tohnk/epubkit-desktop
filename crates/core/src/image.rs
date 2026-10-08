@@ -30,7 +30,8 @@ use std::io::Cursor;
 use std::path::Path;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GrayImage, ImageReader, Luma, Rgb, RgbImage};
+use image::metadata::Orientation;
+use image::{DynamicImage, GrayImage, ImageDecoder, ImageReader, Limits, Luma, Rgb, RgbImage};
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
 
 use crate::{Error, Result};
@@ -158,11 +159,7 @@ pub fn process_image(
         Some("jpg") | Some("jpeg")
     );
 
-    let decoded = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| Error::Image(format!("{filename}: {e}")))?
-        .decode()
-        .map_err(|e| Error::Image(format!("{filename}: {e}")))?;
+    let decoded = decode(bytes).map_err(|e| Error::Image(format!("{filename}: {e}")))?;
 
     // Alpha has to go before anything else; a transparent region would
     // otherwise quantize to whatever the undefined colour channel held.
@@ -461,6 +458,27 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 }
 
 // ---------------------------------------------------------------- internals
+
+/// Decode an image as a reader shows it: turned the way its EXIF orientation
+/// says. The tag does not survive conversion, so the pixels have to.
+fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+    let mut decoder = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_decoder()?;
+    // A tag that cannot be read leaves the image as it is stored, as a
+    // reader would.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+
+    // What `ImageReader::decode` would do: the decoded image comes out of
+    // the decoder's allocation budget before the decoder runs.
+    let mut limits = Limits::default();
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
 
 fn mean_level(total: u64, count: f64) -> u8 {
     // Pillow rounds the mean half-up before building its solid fill.

@@ -478,3 +478,94 @@ fn gray_conversion_goes_through_601() {
         "these are Pillow's values for pure red, green and blue"
     );
 }
+
+// ------------------------------------------------------------- orientation
+
+/// A JPEG stored `width` x `height`, black left of `width / 2` and white to
+/// the right, saying in its EXIF data that it is to be shown turned:
+/// orientation 6 means a quarter turn clockwise.
+fn turned_photo(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+    let mut rgb = RgbImage::new(width, height);
+    for (x, _, pixel) in rgb.enumerate_pixels_mut() {
+        *pixel = if x < width / 2 {
+            Rgb([0, 0, 0])
+        } else {
+            Rgb([255, 255, 255])
+        };
+    }
+    let mut jpeg = Vec::new();
+    DynamicImage::ImageRgb8(rgb)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+
+    // APP1 "Exif": a big-endian TIFF header and one IFD entry, Orientation.
+    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+    exif.extend_from_slice(&orientation.to_be_bytes());
+    exif.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut segment = vec![0xFF, 0xE1];
+    segment.extend_from_slice(&(exif.len() as u16 + 2).to_be_bytes());
+    segment.extend_from_slice(&exif);
+
+    jpeg.splice(2..2, segment);
+    jpeg
+}
+
+/// Mean grey of the top and the bottom half of an image.
+fn halves(image: &DynamicImage) -> (f64, f64) {
+    let gray = image.to_luma8();
+    let mean = |rows: std::ops::Range<u32>| {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for y in rows {
+            for x in 0..gray.width() {
+                total += gray.get_pixel(x, y)[0] as f64;
+                count += 1.0;
+            }
+        }
+        total / count
+    };
+    let middle = gray.height() / 2;
+    (mean(0..middle), mean(middle..gray.height()))
+}
+
+/// Readers show a photo the way its EXIF orientation says, so the converted
+/// image has to be turned that way: its tag does not survive conversion.
+#[test]
+fn a_photo_is_turned_the_way_its_exif_says() {
+    let source = turned_photo(60, 40, 6);
+
+    let out =
+        decode(&process_image(&source, "phone.jpg", &ImageOptions::default()).unwrap()[0].bytes);
+
+    assert_eq!((out.width(), out.height()), (40, 60), "shown portrait");
+    let (top, bottom) = halves(&out);
+    assert!(
+        top < 64.0 && bottom > 192.0,
+        "the stored left half is shown on top: top {top:.0}, bottom {bottom:.0}"
+    );
+}
+
+/// Light Novel mode turns landscape artwork. A photo stored landscape but
+/// shown portrait is not landscape artwork, and is not turned again.
+#[test]
+fn light_novel_mode_sees_a_photo_in_the_shape_it_is_shown() {
+    let source = turned_photo(60, 40, 6);
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..ImageOptions::default()
+    };
+
+    let results = process_image(&source, "phone.jpg", &options).unwrap();
+    assert!(!results[0].reshaped, "{}", results[0].details);
+
+    let out = decode(&results[0].bytes);
+    assert_eq!((out.width(), out.height()), (40, 60));
+    let (top, bottom) = halves(&out);
+    assert!(
+        top < 64.0 && bottom > 192.0,
+        "upright, not turned twice: top {top:.0}, bottom {bottom:.0}"
+    );
+}
