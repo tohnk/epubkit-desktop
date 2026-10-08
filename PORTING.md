@@ -504,8 +504,9 @@ fax-compressed (CCITT G3, or G4 written least significant bit first),
 JPEG-compressed, paletted, or grey at 2 or 4 bits. Two more TIFF variants it
 reads differently: an extra channel marked "unspecified" is taken for alpha,
 and premultiplied alpha is not undone. An image that cannot be decoded stays
-in the book as it was, and the summary counts it. Neither TIFF nor arithmetic
-coding is among the image types EPUB requires a reader to show.
+in the book as it was, and the summary counts it. TIFF is not among the image
+types EPUB requires a reader to show, and few readers decode arithmetic-coded
+JPEG either.
 
 Both refuse an image of more than 178,956,970 pixels as a likely
 decompression bomb. The `image` crate on its own refuses one whose decoded
