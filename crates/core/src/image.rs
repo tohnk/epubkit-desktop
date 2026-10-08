@@ -178,14 +178,14 @@ pub fn process_image(
     // otherwise quantize to whatever the undefined colour channel held.
     let flattened = flatten_onto_white(decoded);
 
-    // Light Novel mode turns every landscape image: rotated, or split in two.
-    let reshaped = options.light_novel_mode && flattened.width() > flattened.height();
-
+    // Light Novel mode turns landscape art: rotated, or split in two.
+    let shape = (flattened.width(), flattened.height());
     let pages = if options.light_novel_mode {
-        split_for_vertical_reading(flattened, options.light_novel_rotate_left)
+        split_for_vertical_reading(flattened, options)
     } else {
         vec![flattened]
     };
+    let reshaped = pages.len() > 1 || (pages[0].width(), pages[0].height()) != shape;
 
     let page_count = pages.len();
     let mut results = Vec::with_capacity(page_count);
@@ -547,28 +547,63 @@ fn flatten_onto_white(img: DynamicImage) -> DynamicImage {
 ///
 /// A double-page spread is split rather than shrunk to illegibility. The right
 /// half comes first, matching the reading order of the books this is for.
-fn split_for_vertical_reading(img: DynamicImage, rotate_left: bool) -> Vec<DynamicImage> {
+///
+/// Art is reshaped only if that shows it at least [`RESHAPE_GAIN`] times as
+/// big. The panel never enlarges an image, so one it already shows whole, an
+/// ornament or a small figure, gains nothing, nor does one nearly square. And
+/// an image more than [`MAX_SPREAD_ASPECT`] times as wide as it is tall is a
+/// rule or a banner rather than a page or a spread of two, and stays whole.
+fn split_for_vertical_reading(img: DynamicImage, options: &ImageOptions) -> Vec<DynamicImage> {
     let (width, height) = (img.width(), img.height());
     if width <= height {
         return vec![img];
     }
 
-    const SPREAD_ASPECT: f32 = 1.8;
-    if width as f32 / height as f32 > SPREAD_ASPECT {
+    let aspect = width as f64 / height as f64;
+    if aspect > MAX_SPREAD_ASPECT {
+        return vec![img];
+    }
+    let shown = shown_scale(width, height, options);
+
+    const SPREAD_ASPECT: f64 = 1.8;
+    if aspect > SPREAD_ASPECT {
         let mid = width / 2;
+        if shown_scale(width - mid, height, options) < shown * RESHAPE_GAIN {
+            return vec![img];
+        }
         return vec![
             img.crop_imm(mid, 0, width - mid, height),
             img.crop_imm(0, 0, mid, height),
         ];
     }
 
+    if shown_scale(height, width, options) < shown * RESHAPE_GAIN {
+        return vec![img];
+    }
     // Pillow's `rotate(90)` turns counter-clockwise, which is this crate's
     // `rotate270`.
-    vec![if rotate_left {
+    vec![if options.light_novel_rotate_left {
         img.rotate270()
     } else {
         img.rotate90()
     }]
+}
+
+/// How much bigger Light Novel mode has to show art to reshape it.
+const RESHAPE_GAIN: f64 = 1.15;
+
+/// The widest a page or a spread of two pages is, for its height: two pages
+/// side by side, each at most a little wider than tall.
+const MAX_SPREAD_ASPECT: f64 = 2.6;
+
+/// The scale the device shows an image `width` x `height` at: fitted to its
+/// box, never enlarged.
+fn shown_scale(width: u32, height: u32, options: &ImageOptions) -> f64 {
+    let box_width = options.max_width.min(MAX_IMAGE_DIMENSION) as f64;
+    let box_height = options.max_height.min(MAX_IMAGE_DIMENSION) as f64;
+    (box_width / width as f64)
+        .min(box_height / height as f64)
+        .min(1.0)
 }
 
 /// Fit within a box, preserving aspect ratio and never enlarging.

@@ -675,3 +675,53 @@ fn a_grey_image_kept_in_colour_is_not_coded_as_colour() {
     let colourful = process_image(&photo(240, 360), "colour.png", &options).unwrap();
     assert_eq!(luma_sampling(&colourful[0].bytes), 0x11);
 }
+
+// ---------------------------------------- Light Novel mode: what is reshaped
+
+fn light_novel(source: &[u8]) -> Vec<epubkit_core::image::ProcessedImage> {
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..ImageOptions::default()
+    };
+    process_image(source, "art.png", &options).unwrap()
+}
+
+/// The panel never enlarges an image, so one it already shows whole, an
+/// ornament or a small figure, is shown no bigger turned: turning it only
+/// stands it on end.
+#[test]
+fn light_novel_mode_leaves_an_image_the_panel_shows_whole_alone() {
+    let results = light_novel(&photo(300, 200));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+    let out = decode(&results[0].bytes);
+    assert_eq!((out.width(), out.height()), (300, 200));
+}
+
+/// Turned, a nearly square image is shown hardly bigger, which is not worth
+/// turning the reader for.
+#[test]
+fn light_novel_mode_leaves_a_nearly_square_image_alone() {
+    let results = light_novel(&photo(1300, 1200));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+}
+
+/// An image far wider than tall is a rule or a banner, not a spread of two
+/// pages, and its halves would be nonsense.
+#[test]
+fn light_novel_mode_does_not_split_a_banner() {
+    let results = light_novel(&photo(1500, 400));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+    let out = decode(&results[0].bytes);
+    assert!(
+        out.width() > out.height() * 3,
+        "{}x{}",
+        out.width(),
+        out.height()
+    );
+}

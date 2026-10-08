@@ -585,6 +585,13 @@ stylesheet or `style`, an image in text or a heading, a link to the file, a
 repaired before the image step rather than after it, which changes nothing
 else, since neither step reads what the other writes.
 
+Even shown as a page, an image is reshaped only if that shows it at least
+15% bigger: the panel never enlarges an image, so one it already shows whole,
+a small figure or an ornament on a line of its own, gains nothing from being
+turned, and nor does one nearly square. And an image more than 2.6 times as
+wide as it is tall, wider than two pages side by side, is a rule or a banner
+and stays whole; the reference split a 600 x 10 rule into two.
+
 ### One unreadable file does not sink the book
 
 A chapter nothing can parse, an empty or blank file say, is left exactly as
