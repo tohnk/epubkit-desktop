@@ -597,7 +597,8 @@ fn gray_to_rgb(gray: &GrayImage) -> RgbImage {
 ///
 /// Grayscale output is written as RGB with 4:2:0 subsampling, matching the
 /// reference: the three channels are identical, so the halved chroma planes
-/// cost nothing and save 15-20%. Encoding it as a single-component grayscale
+/// cost nothing and save 15-20%. So is a grey image kept in colour, whose
+/// chroma is just as flat. Encoding either as a single-component grayscale
 /// JPEG would be smaller still, but that changes the file's structure and
 /// wants testing on real hardware first.
 ///
@@ -611,7 +612,8 @@ fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, grayscale: bool) -> Result<
     let mut out = Vec::new();
     let mut encoder = JpegEncoder::new(&mut out, quality);
 
-    encoder.set_sampling_factor(if grayscale {
+    let grey = grayscale || rgb.pixels().all(|p| p[0] == p[1] && p[1] == p[2]);
+    encoder.set_sampling_factor(if grey {
         SamplingFactor::F_2_2
     } else {
         SamplingFactor::F_1_1

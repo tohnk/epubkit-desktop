@@ -639,3 +639,39 @@ fn an_image_past_pillows_limit_is_refused_before_it_is_decoded() {
         .to_string();
     assert!(error.contains("limit"), "{error}");
 }
+
+/// How the first component of a JPEG is sampled, as its frame header says:
+/// `0x22` for luma at twice the chroma's resolution each way, `0x11` for not.
+fn luma_sampling(jpeg: &[u8]) -> u8 {
+    let frame = jpeg
+        .windows(2)
+        .position(|marker| marker == [0xFF, 0xC0])
+        .expect("a baseline frame");
+    jpeg[frame + 11]
+}
+
+/// A grey image kept in colour is still grey: its chroma is flat, and
+/// halving it costs nothing, where a full-resolution copy of nothing made the
+/// file an eighth bigger. The upstream code saved it as greyscale.
+#[test]
+fn a_grey_image_kept_in_colour_is_not_coded_as_colour() {
+    let gradient = GrayImage::from_fn(240, 360, |x, y| Luma([((x + 2 * y) % 256) as u8]));
+    let mut source = Vec::new();
+    DynamicImage::ImageLuma8(gradient)
+        .write_to(
+            &mut std::io::Cursor::new(&mut source),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let options = ImageOptions {
+        grayscale: false,
+        ..ImageOptions::default()
+    };
+
+    let colour = process_image(&source, "grey.png", &options).unwrap();
+    assert_eq!(luma_sampling(&colour[0].bytes), 0x22);
+
+    // An image with colour in it keeps its chroma at full resolution.
+    let colourful = process_image(&photo(240, 360), "colour.png", &options).unwrap();
+    assert_eq!(luma_sampling(&colourful[0].bytes), 0x11);
+}
