@@ -2,3 +2,7 @@
 tmp/
 .env
 *.epub
+
+# flatpak-builder's working directories
+/.flatpak-builder/
+/build-dir/
