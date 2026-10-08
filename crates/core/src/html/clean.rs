@@ -55,13 +55,27 @@ const STRIP_ATTRS: &[&str] = &[
     "autocorrect",
     "autocapitalize",
     "autofocus",
-    "dir",
     "translate",
     "inputmode",
     "enterkeyhint",
-    "hidden",
-    "inert",
-    "popover",
+];
+
+/// Entities for a space of some width. A block holding only these is spacing,
+/// like one holding only blanks; any other entity is content.
+const SPACE_ENTITIES: &[&str] = &[
+    "nbsp",
+    "ensp",
+    "emsp",
+    "emsp13",
+    "emsp14",
+    "numsp",
+    "puncsp",
+    "thinsp",
+    "ThinSpace",
+    "hairsp",
+    "VeryThinSpace",
+    "MediumSpace",
+    "ZeroWidthSpace",
 ];
 
 /// The rule injected by [`add_chapter_page_breaks`].
@@ -148,11 +162,21 @@ pub fn add_chapter_page_breaks(xhtml_bytes: &[u8]) -> Result<Vec<u8>> {
         return Ok(xhtml_bytes.to_vec());
     }
 
+    // Ahead of the book's own stylesheets, so where they say otherwise about a
+    // heading, at the same specificity, they win.
+    let first_stylesheet = head
+        .get_child_elements()
+        .into_iter()
+        .find(|child| matches!(local_name(child).as_str(), "link" | "style"));
+
     // Inherit head's namespace so the new element stays in the XHTML one.
     let namespace = head.get_namespace();
     if let Ok(mut style) = head.new_child(namespace, "style") {
         style.set_attribute("type", "text/css").ok();
         style.set_content(PAGE_BREAK_CSS).ok();
+        if let Some(mut first) = first_stylesheet {
+            first.add_prev_sibling(&mut style).ok();
+        }
     }
 
     Ok(serialize_content(&content))
@@ -178,24 +202,46 @@ fn should_strip(attribute_name: &str) -> bool {
 }
 
 /// A `<p>` or `<div>` holding neither text nor elements — spacing, not content.
+///
+/// One with an id is a link target, and one with `epub:type` or the like a
+/// marker, a page break say; only `class` and `style` leave it plain spacing.
+/// An entity it holds is content unless it is a space: under a doctype that
+/// is never loaded, `&bull;` stays a reference with no text of its own.
+///
+/// What it holds is looked at first, since most blocks hold something.
 fn is_empty_block(node: &Node) -> bool {
-    let name = node
-        .get_name()
-        .rsplit(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if name != "p" && name != "div" {
+    if !matches!(local_name(node).as_str(), "p" | "div") {
         return false;
     }
 
-    let has_element_child = node
+    let blank = node
         .get_child_nodes()
         .iter()
-        .any(|child| child.get_type() == Some(NodeType::ElementNode));
+        .all(|child| match child.get_type() {
+            Some(NodeType::ElementNode) => false,
+            Some(NodeType::EntityRefNode) => {
+                SPACE_ENTITIES.contains(&child.get_name().as_str())
+                    && child.get_content().trim().is_empty()
+            }
+            Some(NodeType::TextNode | NodeType::CDataSectionNode) => {
+                child.get_content().trim().is_empty()
+            }
+            _ => true,
+        });
 
-    !has_element_child && node.get_content().trim().is_empty()
+    blank
+        && node
+            .get_attributes()
+            .keys()
+            .all(|name| matches!(name.as_str(), "class" | "style"))
+}
+
+fn local_name(node: &Node) -> String {
+    node.get_name()
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 /// Keep the first element of a run and unlink the rest.

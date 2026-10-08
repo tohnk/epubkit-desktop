@@ -1,4 +1,8 @@
-use epubkit_core::text::{clean_text_content, TextCleanOptions, TextCleanReport};
+mod common;
+
+use std::time::Duration;
+
+use epubkit_core::text::{clean_string, clean_text_content, TextCleanOptions, TextCleanReport};
 
 fn wrap(body: &str) -> Vec<u8> {
     format!(
@@ -65,6 +69,7 @@ const KEEP_QUOTES: TextCleanOptions = TextCleanOptions {
     fix_encoding: true,
     fix_punctuation: true,
     normalize_unicode: true,
+    language: String::new(),
 };
 
 /// Typographic punctuation is three bytes in UTF-8, so read as Latin-1 it
@@ -287,4 +292,222 @@ fn malformed_input_is_recovered_and_cleaned() {
     assert!(out.contains("bold with spaces"), "{out}");
     assert!(report.double_spaces_fixed >= 2);
     epubkit_core::xml::parse_strict(out.as_bytes()).expect("output should parse");
+}
+
+/// Space before a mark that does not end a word is not a stray space: it is
+/// a calibre, a file extension or a smiley. Gluing it on made "his.45".
+#[test]
+fn a_space_before_a_mark_that_starts_something_stays() {
+    let text = "He drew his .45 and fired. The .NET runtime, a .com site, ok :)";
+    let (out, report) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+    assert_eq!(report.total_fixes(), 0, "{report:?}");
+}
+
+/// French sets a space before `; : ! ?`, and a no-break space before any of
+/// them is someone's deliberate choice in any language.
+#[test]
+fn french_spacing_and_no_break_spaces_before_punctuation_stay() {
+    let french = "C\u{2019}est vrai ? Oui ! Voici : rien ; enfin.";
+    let (bytes, _) = clean_text_content(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="fr"><body><p>{french}</p></body></html>
+"#
+        )
+        .as_bytes(),
+        &KEEP_QUOTES,
+    )
+    .unwrap();
+    let out = String::from_utf8(bytes).unwrap();
+    assert!(out.contains(french), "{out}");
+
+    let (out, _) = clean("<p>Vrai\u{a0}? Yes\u{202f}!</p>");
+    assert!(out.contains("Vrai\u{a0}? Yes\u{202f}!"), "{out}");
+}
+
+/// Clean a chapter whose root has `root_attributes`, in a book in
+/// `book_language`.
+fn clean_in(root_attributes: &str, body: &str, book_language: &str) -> String {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" {root_attributes}><head><title>T</title></head>{body}</html>
+"#
+    );
+    let options = TextCleanOptions {
+        language: book_language.to_string(),
+        ..KEEP_QUOTES
+    };
+    let (bytes, _) = clean_text_content(chapter.as_bytes(), &options).unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
+/// Text is in the language of the nearest element that gives one, as a
+/// browser reads it: a French passage in an English book keeps its spacing,
+/// and an English one in a French book does not.
+#[test]
+fn the_nearest_language_decides_french_spacing() {
+    let out = clean_in(
+        r#"xml:lang="en" lang="en""#,
+        r#"<body><p>Hello ! <span xml:lang="fr">Bonjour ! Comment allez-vous ?</span> Bye !</p><p lang="fr">Oui ! <em lang="en">Yes !</em> Non !</p></body>"#,
+        "en",
+    );
+    for kept in ["Bonjour ! Comment allez-vous ?", "Oui ! ", " Non !"] {
+        assert!(out.contains(kept), "{kept}: {out}");
+    }
+    for fixed in ["Hello! ", " Bye!", "Yes!"] {
+        assert!(out.contains(fixed), "{fixed}: {out}");
+    }
+
+    let out = clean_in(
+        "",
+        r#"<body><p>Oui ! <span xml:lang="en-GB">Yes !</span></p></body>"#,
+        "fr",
+    );
+    assert!(out.contains("Oui ! "), "{out}");
+    assert!(out.contains("Yes!"), "{out}");
+}
+
+/// A body that gives a language other than its root's is in that one.
+#[test]
+fn a_french_body_under_an_english_root_is_french() {
+    let out = clean_in(
+        r#"lang="en""#,
+        r#"<body xml:lang="fr"><p>Oui ! Non ?</p></body>"#,
+        "en",
+    );
+    assert!(out.contains("Oui ! Non ?"), "{out}");
+}
+
+/// `xml:lang` is what XHTML reads where an element gives both.
+#[test]
+fn xml_lang_outranks_lang() {
+    let out = clean_in(
+        "",
+        r#"<body><p lang="en" xml:lang="fr">Oui !</p><p xml:lang="en" lang="fr">Yes !</p></body>"#,
+        "",
+    );
+    assert!(out.contains("Oui !"), "{out}");
+    assert!(out.contains("Yes!"), "{out}");
+}
+
+/// A paragraph holding a no-break space is a visible blank line, a scene
+/// break; a plain space in its place collapses to nothing. And a no-break
+/// space keeps "10 km" or verse indentation together.
+#[test]
+fn no_break_spaces_are_kept() {
+    let (out, _) = clean("<p>\u{a0}</p><p>10\u{a0}km</p><p>\u{a0}\u{a0}\u{a0}Indented</p>");
+    assert!(out.contains("<p>\u{a0}</p>"), "{out}");
+    assert!(out.contains("10\u{a0}km"), "{out}");
+    assert!(out.contains("\u{a0}\u{a0}\u{a0}Indented"), "{out}");
+}
+
+/// German opens quotes low: „ and ‚. Folded with the rest, they become
+/// straight quotes too, not a comma.
+#[test]
+fn low_quotes_are_folded_as_quotes() {
+    let (out, _) = clean("<p>\u{201e}Komm\u{201c}, sagte sie. \u{201a}Nein\u{2018}</p>");
+    assert!(out.contains("\"Komm\", sagte sie. 'Nein'"), "{out}");
+}
+
+/// A full stop before a capital is not always a missing space: initials,
+/// abbreviations, numbered clauses, file names and web addresses have them
+/// too. Only one word ending and another starting is a run-on sentence.
+#[test]
+fn initials_abbreviations_and_dotted_names_keep_their_dots() {
+    let text = "U.S.A., J.R.R. Tolkien, 10 A.M., section 1.E.8, README.TXT, www.Example.Com";
+    let (out, _) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+
+    let (out, _) = clean("<p>It ended.Then it began.</p>");
+    assert!(out.contains("It ended. Then it began."), "{out}");
+}
+
+/// "Ã" followed by a no-break space or a soft hyphen is "à" or "í" read as
+/// Latin-1 inside a word, but after a capital it is a real Portuguese or
+/// Vietnamese "Ã".
+#[test]
+fn a_real_a_tilde_among_capitals_is_left_alone() {
+    let text =
+        "A MA\u{c7}\u{c3}\u{a0}VERDE, \u{110}\u{c3}\u{a0}\u{110}\u{1ebe}N, IRM\u{c3}\u{ad}ZINHA";
+    let (out, report) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+    assert_eq!(report.encoding_issues_fixed, 0);
+}
+
+/// Japanese and Chinese write their ellipsis and dash doubled, and a
+/// compatibility ideograph is a different glyph that names rely on.
+#[test]
+fn cjk_punctuation_and_ideographs_are_kept() {
+    let text = "\u{5f85}\u{3063}\u{3066}\u{2026}\u{2026}\u{305d}\u{3046}\u{2014}\u{2014}\u{5b9f}\u{306f}\u{3001}\u{fa10}\u{672c}\u{3055}\u{3093}";
+    let (out, _) = clean(&format!("<p>{text}</p>"));
+    assert!(out.contains(text), "{out}");
+}
+
+/// A chapter laid out with indentation has nothing wrong with its spaces.
+#[test]
+fn indentation_is_not_counted_as_extra_spaces() {
+    let (_, report) =
+        clean("\n    <p>One.</p>\n    <p>Two.</p>\n    <div>\n        <p>Three.</p>\n    </div>\n");
+    assert_eq!(report.total_fixes(), 0, "{report:?}");
+}
+
+/// Runs of marks are shortened, not changed: `?!?!` was `!!!`. Two commas
+/// before a word open a quote typed on a typewriter.
+#[test]
+fn punctuation_is_shortened_without_being_changed() {
+    let (out, _) = clean("<p>What?!?!?! Wow!!!!! Er sagte ,,Hallo'' und ging,,, weiter.</p>");
+    assert!(
+        out.contains("What?! Wow!!! Er sagte ,,Hallo'' und ging, weiter."),
+        "{out}"
+    );
+}
+
+/// Typewriter text, variables and mathematics are as literal as code.
+#[test]
+fn typewriter_variable_and_math_text_is_left_alone() {
+    let body = r#"<p><tt>ls  -la ,then</tt> <var>x ,y</var></p><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>a</mi><mo> ,</mo><annotation encoding="TeX">a  ,b</annotation></math>"#;
+    let (out, _) = clean(body);
+    for literal in ["ls  -la ,then", "x ,y", "<mo> ,</mo>", "a  ,b"] {
+        assert!(out.contains(literal), "{literal:?}:\n{out}");
+    }
+}
+
+/// Old HTML wrote Word's punctuation as `&#146;`, `&#150;` and `&#133;`, the
+/// bytes it has in windows-1252, and HTML parsers read them that way. XML
+/// reads them as the invisible control characters at those code points.
+#[test]
+fn control_characters_where_punctuation_belongs_are_read_as_windows_1252() {
+    let (out, report) = clean_with(
+        "<p>Don&#146;t &#150; wait&#133; &#147;now&#148;</p>",
+        &KEEP_QUOTES,
+    );
+    assert!(
+        out.contains("Don\u{2019}t \u{2013} wait\u{2026} \u{201c}now\u{201d}"),
+        "{out}"
+    );
+    assert_eq!(report.encoding_issues_fixed, 5);
+}
+
+/// A word the run-on pattern finds in again and again is looked at once. It
+/// was read through again for every find, so 36 KB of "word.Word" took ten
+/// seconds, four times as long for twice the text. The words after it are
+/// still looked at.
+#[test]
+fn a_long_run_on_word_is_read_once() {
+    let word = "word.Word".repeat(50_000);
+    let text = format!("{word} ended.Then");
+
+    let (out, report) = common::finishes_within(Duration::from_secs(20), move || {
+        let mut report = TextCleanReport::default();
+        let out = clean_string(&text, &TextCleanOptions::default(), &mut report);
+        (out, report)
+    });
+
+    assert!(
+        out == format!("{word} ended. Then"),
+        "{}",
+        &out[out.len() - 40..]
+    );
+    assert_eq!(report.punctuation_fixed, 1);
 }

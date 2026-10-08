@@ -209,6 +209,34 @@ whatever the parser was mid-way through. `cargo run -p epubkit-core --example
 probe -- <file>` prints all four parse/serialize combinations on a given file;
 that is the evidence behind the choice.
 
+### Recovered chapters come out as legal XML
+
+HTML allows what XML does not, and libxml2's HTML parser keeps it: `--`
+inside a comment, the words after a bare `<` as attribute names (as 2.14
+reads one), characters XML forbids written as references. Serialized as XML
+anyway, such a chapter was malformed again, so each later pass recovered it
+afresh and every run counted it as repaired. The parser also keeps a
+stylesheet's text as it stands, the author's `<![CDATA[` included, which the
+XML writer then wrapped in a CDATA section of its own; the CSS began with
+`<![CDATA[`, and its first rule was lost to it.
+
+The port mends each of these in the recovered tree and then reads the result
+back strictly. A chapter that still does not read back is refused, which
+leaves it as it was.
+
+Nor can the HTML parser read a DOCTYPE's internal subset: it ends the
+DOCTYPE at the subset's first `>`, and the rest of the declarations become
+text. The port reads the subset as XML does, declaration by declaration,
+reading a parameter entity's declarations where it is used and replacing a
+value's character references as it goes. It fills in the entities the subset
+declares where the chapter uses them, in text and attribute values, those
+they refer to in turn too, but not in a CDATA section, a comment or a
+processing instruction, whose text a reference there is. In an attribute
+value, what an entity stands for is the value's text, and a quote in it ends
+nothing. Each reference is filled in whole or stays as written, within a
+bound on what filling in may cost, so a "billion laughs" stays a few
+references.
+
 ### Malformed chapters are read as UTF-8
 
 The reference's recovery parser left the encoding to libxml2, which obeys a
@@ -225,16 +253,54 @@ anything non-ASCII to decode, prefixes a byte order mark. `tests/encoding.rs`
 pins the result, and must pass against libxml2 2.9 and 2.14 alike, which
 disagree about the default.
 
-A malformed chapter whose bytes are not UTF-8 is decoded before the parser
-sees it, and is parsed as UTF-8 in turn. A byte order mark decides, then an
-encoding named in the XML declaration, then one named in a `<meta>`, and
-otherwise windows-1252, which is also what browsers take a declared
-ISO-8859-1 to mean. Upstream still leaves such a chapter to libxml2, whose
-HTML parser ignores an encoding named in an XML declaration: 2.9 reads on as
-Latin-1 and 2.14 as UTF-8, so a Shift_JIS or windows-1251 chapter came out as
-nonsense, and under 2.14 Latin-1 accents came out as replacement characters.
-Both releases also read windows-1252's curly quotes and dashes as Latin-1's
-invisible control characters.
+A chapter whose bytes are not UTF-8 is decoded before either parser sees it,
+and is parsed as UTF-8 in turn, with its XML declaration and any `<meta>`
+charset saying so. A byte order mark decides, then an encoding named in the
+XML declaration, then one named in a `<meta>`, and otherwise the bytes are
+taken for UTF-8 with stray bytes pasted in, each read as windows-1252. That
+is also what browsers take a declared ISO-8859-1 to mean, and it reads a
+chapter that is windows-1252 throughout the same way. Upstream still leaves
+such a chapter to libxml2, whose HTML parser ignores an encoding named in an
+XML declaration: 2.9 reads on as Latin-1 and 2.14 as UTF-8, so a Shift_JIS or
+windows-1251 chapter came out as nonsense, and under 2.14 Latin-1 accents came
+out as replacement characters. Both releases also read windows-1252's curly
+quotes and dashes as Latin-1's invisible control characters.
+
+The same decision now holds for well-formed chapters, which the port first
+left to libxml2's XML parser. That parser obeys the declaration: a chapter
+declaring ISO-8859-1 kept Word's quotes and dashes as control characters, and
+one whose declaration had outlived a re-encoding to UTF-8 came out as "Ã¼".
+So a chapter reads the same with or without a markup error in it. And one
+stray byte no longer sends a whole UTF-8 chapter through windows-1252, which
+had turned every Cyrillic letter into two Latin ones.
+
+ISO-2022-JP is the exception to valid UTF-8 being UTF-8: it is written in
+seven bits, so its bytes are valid UTF-8 as well. A chapter that names it and
+has the escapes it switches character sets with is read as ISO-2022-JP; read
+as UTF-8, its Japanese came out as ASCII gibberish.
+
+Only real declarations count. A legacy chapter's `<meta>` charset is found
+by parsing the chapter as it will be parsed once it is decoded: strictly if
+it is well-formed, by the HTML parser if not. Its markup is ASCII in any
+encoding it can name, so its bytes read as windows-1252 give the parser the
+same markup, and only what the parser takes for a `<meta>` counts, whatever
+a script, a CDATA section, a comment or a DOCTYPE holds. Only a CDATA section
+in the chapter's text is kept from the HTML parser, which does not read it as
+the text XHTML takes it for; a `<![CDATA[` in a script, a title or an
+attribute value, whose section would end past it, is text to both. Only the `<meta>`'s own attributes count, not another
+vocabulary's with the same names, and a `content` names a charset only for an
+`http-equiv="Content-Type"`. A pattern over the text found `<meta>`s in
+comments and in other `<meta>`s' descriptions, and scanners after it took a
+script's `<!--` for a comment, a `</script>` in a CDATA section for the
+script's end, and a `>` in a DOCTYPE's comment or entity value for the
+DOCTYPE's.
+
+Only real declarations are renamed UTF-8, too: the XML declaration where it
+opens the chapter, and a `<meta>` element's `charset`, or the charset in an
+`http-equiv="Content-Type"`'s `content`, found on the parsed chapter. The same
+words in a CDATA section, a comment or another `<meta>`'s `content` are text,
+and stay as written. Renaming by pattern over the text changed them too, and
+a `<meta>` written inside the XML declaration's encoding made it panic.
 
 ### Prose after `<code>` and `<pre>` is cleaned
 
@@ -252,25 +318,76 @@ match at all: "à" read as Latin-1 ends in a no-break space, which quote
 normalization had already made a plain one. The port repairs encoding first.
 The table is upstream's current one (b1rdmania/epubkit#8), which adds UTF-8
 punctuation, "ß", the acute vowels and the capital umlauts to what `7cf9a65`
-had.
+had. Repairing first made the two patterns ending in a no-break space or a
+soft hyphen ("à" and "í") match a real "Ã" too, as in Portuguese "MAÇÃ", so
+they are only repaired where no capital comes before.
 
-### CSS goes through a real parser
+### Text cleanup leaves correct text alone
 
-`cssutils` is prone to dropping comments and reformatting at-rules. The port
-uses `lightningcss`, so comments, `@import` and `@media` blocks survive a
-round-trip. Rule *selection* is unchanged in outline: only top-level style
-rules are considered for removal, a rule survives if any part of any of its
-selectors is in use, and anything with a pseudo-class, pseudo-element or
+Several of the reference's text fixes changed text that was right:
+
+- Removing space before punctuation glued ".45", ".NET" and ".com" to the
+  word before, and stripped French spacing before `; : ! ?`. Only plain
+  spaces before a mark that ends a word are removed now, and in French text
+  only before `.` and `,`. Text is in the language of the nearest element
+  that gives one in `xml:lang` or `lang`, as a browser reads it, and in the
+  book's where none does: a French quotation in an English book keeps its
+  spacing.
+- No-break spaces were folded to plain ones, so a scene break written as a
+  paragraph holding one collapsed to nothing. They are kept.
+- `‚`, which opens a German quote, was folded to a comma, and `„` not at all.
+  Both fold to quotes.
+- A space was added after any full stop before a capital, splitting "U.S.A."
+  and "J.R.R. Tolkien", "1.E.8" and "README.TXT". It is added only between a
+  lowercase word and a capitalised one, in a word with no other stop in it.
+- Japanese and Chinese doubled ellipses and dashes were folded and then
+  shortened, and NFC replaced CJK compatibility ideographs with the unified
+  ones they stand for, changing glyphs that names rely on. Both are kept.
+- `?!?!` became `!!!`, and `,,Hallo''` lost a comma. `<tt>`, `<var>` and
+  MathML were cleaned like prose. Indentation between elements was counted as
+  extra spaces.
+
+### CSS is edited in place, not reprinted
+
+`cssutils` is prone to dropping comments and reformatting at-rules, and any
+library that parses a stylesheet and prints it back rewords it. An earlier
+version of the port did that with `lightningcss`, which printed for current
+browsers: `(max-width: 600px)` came back as `(width <= 600px)` and
+`transparent` as `#0000`, syntax older reading engines do not read, so the
+rules using it stopped applying. Comments and the `@charset` were dropped, and
+a minified sheet came back laid out at length.
+
+The port finds rules with `cssparser`'s tokenizer and cuts the ones that go
+out of the text where they stand. Everything else is left byte for byte as
+the book wrote it. Rule *selection* is unchanged in outline: only top-level
+style rules are considered for removal, a rule survives if any part of any of
+its selectors is in use, and anything with a pseudo-class, pseudo-element or
 attribute selector is kept outright.
 
-Two details differ. Names are read as CSS defines them, so one may begin with
-a non-ASCII character; the reference wanted ASCII there, and removed a rule
-like `.überschrift` while the book was using it. And a selector with an
+Three details differ. Names are read as CSS defines them, so one may begin
+with a non-ASCII character; the reference wanted ASCII there, and removed a
+rule like `.überschrift` while the book was using it. A selector with an
 escaped name, such as `.\31 st` for the class `1st`, is kept outright too,
-since reading escapes is beyond this scan.
+since reading escapes is beyond this scan, and so is anything else that is
+not plain names and combinators. And removing fonts reaches into `@media`
+and other grouping rules, where the reference left `@font-face` rules
+pointing at the files it deleted.
 
-Note that `lightningcss` is pre-1.0 (currently an alpha), so its API may move
-under a future upgrade. It is confined to `core::css`.
+A `<style>` element's text and CDATA sections are one stylesheet, read in
+order, as a reading engine reads them. Removing a font or rewriting a url
+edits them as one, then puts each piece back in the section it came from,
+so CDATA stays CDATA. Edited one section at a time, a rule split between two
+was cut in half, and the common `/*<![CDATA[*/ … /*]]>*/` wrapping hid every
+rule inside it. What an entity reference stands for is part of the CSS too,
+so `url(&cdn;cover.png)` is read as the url it is, not as `url(cover.png)`.
+An entity cannot be edited where it is written, so one an edit runs into is
+written out as what it stands for, and edited with the text around it, or
+in new text of its own in a `<style>` that is nothing but entities; one
+beside an edit stays as written. One declared to stand for nothing is read
+as that. One that cannot be read stops the edits that run into it: one a
+doctype that is never loaded declares, one whose value is in a file, which
+is never loaded either, and one whose value holds either of those, or an
+element, whose text is no part of the CSS.
 
 ### Empty paragraphs are collapsed among siblings
 
@@ -278,6 +395,20 @@ under a future upgrade. It is confined to `core::css`.
 so an empty paragraph could pair with an unrelated one elsewhere in the tree
 and be dropped. The port groups runs among siblings, which is what
 "consecutive empty paragraphs" means.
+
+What counts as empty is narrower too. An element with an id, an `epub:type`
+or any attribute but `class` and `style` is a link target or a marker, a
+page break the page list points at say, and stays. And a paragraph holding
+an entity other than a space, `&bull;` or `&mdash;` under an XHTML 1.1
+doctype that is never loaded, has content even though it has no text as such;
+the port's libxml2 parse had been dropping scene-break ornaments.
+
+### Direction and visibility are kept
+
+The reference stripped `dir`, `hidden`, `inert` and `popover` along with the
+interaction attributes. They change what is shown and how: without `dir` an
+Arabic or Hebrew book runs left to right, and without `hidden` a navigation
+document in the spine shows its landmarks and page list. The port keeps them.
 
 ### Optimized Huffman tables are applied by rewriting, not by the encoder
 
@@ -365,7 +496,9 @@ now be renamed differently, a reference is followed by its path from the
 document that makes it, falling back to the bare filename only when the path
 leads nowhere and the filename is unambiguous. Only the filename in a
 reference changes; its directory, fragment, percent-encoding and quotes stay
-as written, and links to other sites are left alone.
+as written, and links to other sites are left alone. A `srcset` is split
+into candidates as the HTML standard splits it, so a URL with a comma in it
+is one URL, and a `data:` URL or another site's is left whole.
 
 ### Light Novel mode keeps every page it makes
 
@@ -373,7 +506,9 @@ The reference split a double-page spread into two images but pointed the book
 at only the last, the left half; the right half, which comes first, was
 packaged and never shown. The port declares every page in the manifest and
 shows them in reading order where the spread was, each the way the spread
-was shown, minus the `width` and `height` that described it. An SVG wrapper,
+was shown, minus the `width` and `height` that described it, and minus any
+`srcset`, `sizes` or `<picture>` sources, which would show one image on every
+page. An SVG wrapper,
 common around full-page illustrations and sized to the spread in its viewBox,
 gives way to a plain image per page. A rotated image sheds its old size and
 wrapper the same way. The report counts a split spread as one image.

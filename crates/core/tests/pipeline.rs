@@ -111,7 +111,7 @@ fn every_step_reports_what_it_did() {
 
     assert_eq!(report.images_total, 2);
     assert_eq!(report.images_converted, 2);
-    assert!(report.fonts_removed >= 2, "css rule plus font file");
+    assert_eq!(report.fonts_removed, 1, "one font file");
     assert!(report.css_rules_removed >= 1);
     assert!(report.metadata_items_stripped >= 2, "calibre and ibooks");
     assert!(report.blank_elements_removed >= 2);
@@ -188,6 +188,49 @@ fn fonts_are_gone_from_the_archive_the_css_and_the_manifest() {
         .map(|i| i.href)
         .collect();
     assert!(!hrefs.iter().any(|h| h.contains(".otf")), "{hrefs:?}");
+}
+
+/// A font removed is removed from everywhere that names it: a stylesheet, a
+/// chapter's own `<style>`, and `encryption.xml`, which listed it as
+/// obfuscated. And it counts once, not once per place.
+#[test]
+fn nothing_is_left_naming_a_removed_font() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title>
+<style type="text/css">@font-face { font-family: Inline; src: url(fonts/body.otf) } p { margin: 0 }</style>
+</head><body><p>Text.</p></body></html>
+"#;
+    let encryption =
+        common::encryption_xml("http://www.idpf.org/2008/embedding", "OEBPS/fonts/body.otf");
+    demo_epub_with(
+        &input,
+        &[
+            ("OEBPS/chapter2.xhtml", chapter.as_bytes()),
+            ("META-INF/encryption.xml", &encryption),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    assert_eq!(report.fonts_removed, 1);
+    let names = entry_names(&output);
+    assert!(!names.iter().any(|n| n.ends_with(".otf")), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n == "META-INF/encryption.xml"),
+        "{names:?}"
+    );
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    for file in ["OEBPS/styles/main.css", "OEBPS/chapter2.xhtml"] {
+        let text = fs::read_to_string(work.path().join(file)).unwrap();
+        assert!(!text.contains("@font-face"), "{file}:\n{text}");
+    }
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter2.xhtml")).unwrap();
+    assert!(chapter.contains("p { margin: 0 }"), "{chapter}");
 }
 
 /// Every chapter in the output must parse strictly — including the one that
@@ -677,6 +720,243 @@ fn an_href_spelled_with_dot_segments_follows_its_image() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// An image named through an entity that stands for a quote, in a chapter that
+/// is recovered, follows its image: filled into the `src` as written, the
+/// quote ended it, and the chapter named a file that was never there.
+#[test]
+fn an_image_named_through_an_entity_with_a_quote_in_it_is_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:quoted</dc:identifier><dc:title>Quoted</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover" href="a&quot;b.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY image "a&#34;b.png">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>Text<br></p><img src="&image;" alt="cover"/></body></html>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter.as_bytes()),
+            ("OEBPS/a\"b.png", &solid(image::ImageFormat::Png, 0)),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let options = ProcessingOptions {
+        text_cleanup: false,
+        ..ProcessingOptions::default()
+    };
+    process_epub(&input, &output, &options, |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    let doc = epubkit_core::xml::parse_strict(chapter.as_bytes()).unwrap();
+    let images = epubkit_core::xml::find_nodes(&doc, "//*[local-name()='img']").unwrap();
+    let source = images[0].get_attribute("src").unwrap();
+    assert_eq!(source, "a\"b.jpg", "{chapter}");
+    assert!(
+        work.path().join("OEBPS").join(&source).is_file(),
+        "{source} is not in the book: {chapter}"
+    );
+}
+
+/// Every image a chapter's `<style>` names is still there after the images are
+/// converted, whatever entities the style holds: one beside a url, one in it,
+/// one standing for another site, whose url is that site's, one that is the
+/// whole style, or one that stands for nothing.
+#[test]
+fn a_style_with_entities_in_it_names_only_images_that_are_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:entities</dc:identifier><dc:title>Entities</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover" href="cover.png" media-type="image/png"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/"><!ENTITY cdn "https://cdn.example/"><!ENTITY image "cover.png"><!ENTITY rule ".d { background: url(&image;) }"><!ENTITY empty "">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.b { background: url(&dir;plate.png) }</style><style type="text/css">.c { background: url(&cdn;cover.png) }</style><style type="text/css">&rule;</style><style type="text/css">.e { background: url(&empty;cover.png) }</style></head>
+<body><p class="a b c d e">Body</p><p><img src="cover.png" alt=""/></p></body></html>
+"#;
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter.as_bytes()),
+            ("OEBPS/cover.png", &solid(image::ImageFormat::Png, 0)),
+            (
+                "OEBPS/images/plate.png",
+                &solid(image::ImageFormat::Png, 90),
+            ),
+        ],
+    );
+
+    let output = dir.path().join("out.epub");
+    let options = ProcessingOptions {
+        text_cleanup: false,
+        ..ProcessingOptions::default()
+    };
+    process_epub(&input, &output, &options, |_, _| {}).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+
+    let chapter = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    assert!(
+        chapter.contains(".a { font-family: &family;; background: url(cover.jpg) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".b { background: url(images/plate.jpg) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".c { background: url(&cdn;cover.png) }"),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(r#"<style type="text/css">.d { background: url(cover.jpg) }</style>"#),
+        "{chapter}"
+    );
+    assert!(
+        chapter.contains(".e { background: url(cover.jpg) }"),
+        "{chapter}"
+    );
+    for image in ["OEBPS/cover.jpg", "OEBPS/images/plate.jpg"] {
+        assert!(work.path().join(image).is_file(), "{image} is missing");
+    }
+    for gone in ["OEBPS/cover.png", "OEBPS/images/plate.png"] {
+        assert!(!work.path().join(gone).exists(), "{gone} is still there");
+    }
+}
+
+/// An SVG document in the book names its images as a chapter does, and has to
+/// follow them when they are converted. It is an SVG document by its media
+/// type, whatever its name.
+#[test]
+fn an_svg_document_follows_the_images_it_draws() {
+    for name in ["map.svg", "map"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svg</dc:identifier><dc:title>SVG</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="map" href="{name}" media-type="image/svg+xml"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="map"/></spine>
+</package>
+"#
+        );
+        let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 64 64"><image width="64" height="64" xlink:href="images/plate.png"/><text x="5" y="60">Map</text></svg>
+"#;
+        let svg_path = format!("OEBPS/{name}");
+        common::write_epub(
+            &input,
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("META-INF/container.xml", common::CONTAINER_XML),
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+                (&svg_path, svg),
+                ("OEBPS/images/plate.png", &solid(image::ImageFormat::Png, 0)),
+            ],
+        );
+
+        let output = dir.path().join("out.epub");
+        process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
+
+        let svg = fs::read_to_string(work.path().join(&svg_path)).unwrap();
+        assert!(
+            svg.contains(r#"xlink:href="images/plate.jpg""#),
+            "{name}: {svg}"
+        );
+        assert!(work.path().join("OEBPS/images/plate.jpg").is_file());
+    }
+}
+
+/// An SVG document can use a stylesheet's rules as much as a chapter can, so
+/// what it uses counts when deciding which rules nothing uses, whatever the
+/// document is called.
+#[test]
+fn rules_only_an_svg_document_uses_are_kept() {
+    for name in ["page2.svg", "page2"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:svgcss</dc:identifier><dc:title>SVG CSS</dc:title></metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="page" href="{name}" media-type="image/svg+xml"/>
+    <item id="css" href="style.css" media-type="text/css"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="page"/></spine>
+</package>
+"#
+        );
+        let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/css" href="style.css"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text class="balloon" x="10" y="50">Hello</text></svg>
+"#;
+        let svg_path = format!("OEBPS/{name}");
+        common::write_epub(
+            &input,
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("META-INF/container.xml", common::CONTAINER_XML),
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/chapter1.xhtml", CLEAN_CHAPTER.as_bytes()),
+                (&svg_path, svg),
+                (
+                    "OEBPS/style.css",
+                    b".balloon { font-size: 40px; fill: #333 }\n.unused { color: red }\n",
+                ),
+            ],
+        );
+
+        let output = dir.path().join("out.epub");
+        let report =
+            process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
+
+        let css = fs::read_to_string(work.path().join("OEBPS/style.css")).unwrap();
+        assert!(
+            css.contains(".balloon { font-size: 40px; fill: #333 }"),
+            "{name}: {css}"
+        );
+        assert!(!css.contains(".unused"), "{name}: {css}");
+        assert_eq!(report.css_rules_removed, 1, "{name}");
+    }
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.
@@ -827,9 +1107,11 @@ fn demo_epub_with(path: &Path, replacements: &[(&str, &[u8])]) {
         ("OEBPS/images/cover.png", &cover),
         ("OEBPS/images/plate.png", &plate),
     ];
-    for (name, bytes) in replacements {
-        let entry = entries.iter_mut().find(|(n, _)| n == name).unwrap();
-        entry.1 = bytes;
+    for &(name, bytes) in replacements {
+        match entries.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = bytes,
+            None => entries.push((name, bytes)),
+        }
     }
     common::write_epub(path, &entries);
 }

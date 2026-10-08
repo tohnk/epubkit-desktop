@@ -337,6 +337,11 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for &path in &chapters {
             structure::update_xhtml_references(path, &renames)?;
         }
+        // An SVG document names images as a chapter does. One that is not
+        // well-formed is left as it is.
+        for path in svg_documents(&content) {
+            structure::update_svg_references(path, &renames).ok();
+        }
         for path in &content.css {
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
@@ -362,6 +367,13 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             used.merge(&css::collect_used_selectors(&bytes)?);
         }
+        // An SVG document can use a stylesheet's rules as much as a chapter.
+        for path in svg_documents(&content) {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            if let Ok(used_here) = css::collect_used_selectors(&bytes) {
+                used.merge(&used_here);
+            }
+        }
 
         for path in &content.css {
             if !path.is_file() {
@@ -385,12 +397,21 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             }
             let stylesheet = css::read_stylesheet(path)?;
             let (cleaned, removed) = css::remove_embedded_fonts(&stylesheet);
-            report.fonts_removed += removed;
             if removed > 0 {
                 fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
             }
         }
 
+        // A chapter may declare a font in a <style> of its own.
+        for &path in &chapters {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            let (cleaned, removed) = css::remove_embedded_fonts_from_styles(&bytes)?;
+            if removed > 0 {
+                fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
+            }
+        }
+
+        // Fonts are counted, not the rules that named them.
         for path in &content.fonts {
             if path.is_file() && fs::remove_file(path).is_ok() {
                 report.fonts_removed += 1;
@@ -398,6 +419,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
 
         structure::update_opf_remove_fonts(&opf, &content.fonts)?;
+        // encryption.xml lists obfuscated fonts, which are gone now.
+        package::forget_missing_encrypted_files(work_dir)?;
     }
 
     progress(82, "Normalizing content...");
@@ -413,6 +436,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         progress(85, "Cleaning text content...");
         let text_options = TextCleanOptions {
             normalize_quotes: options.normalize_quotes,
+            language: metadata::extract_metadata(&opf)?.language,
             ..TextCleanOptions::default()
         };
 
@@ -461,6 +485,15 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 }
 
 // ---------------------------------------------------------------- internals
+
+/// The SVG documents in a book that are there to read.
+fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Path> {
+    content
+        .svg
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
+}
 
 /// What the image step leaves for the steps after it. Paths are relative to
 /// the OPF's directory.

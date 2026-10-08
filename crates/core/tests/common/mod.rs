@@ -6,6 +6,8 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -121,4 +123,20 @@ pub fn png_gradient(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .expect("encode fixture png");
     out
+}
+
+/// Run `work`, failing if it takes longer than `limit`: a check on input that
+/// once took time growing with its square. Work that is too slow goes on in
+/// the background, so a regression fails the test rather than hanging it.
+pub fn finishes_within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || sender.send(work()).ok());
+    match receiver.recv_timeout(limit) {
+        Ok(done) => done,
+        Err(RecvTimeoutError::Timeout) => panic!("took longer than {limit:?}"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the work panicked"),
+    }
 }

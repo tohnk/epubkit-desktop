@@ -1,6 +1,9 @@
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
@@ -93,6 +96,32 @@ fn classifies_fonts_by_extension_when_the_media_type_lies() {
         vec![
             Path::new("/book/fonts/body.otf"),
             Path::new("/book/fonts/legacy.ttf"),
+        ]
+    );
+}
+
+/// An SVG document is known by its media type, whatever its name; and by its
+/// name where the book gives it some other media type, since a wrong guess
+/// only costs a parse that fails.
+#[test]
+fn svg_documents_are_known_by_media_type_or_name() {
+    let manifest = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="diagram" href="images/diagram" media-type="image/svg+xml"/>
+    <item id="map" href="images/Map.SVG" media-type="application/octet-stream"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+</package>
+"#;
+    let files = find_content_files(book(), book(), &opf(manifest)).unwrap();
+
+    assert_eq!(
+        files.svg,
+        vec![
+            Path::new("/book/images/diagram"),
+            Path::new("/book/images/Map.SVG")
         ]
     );
 }
@@ -426,6 +455,292 @@ fn css_urls_keep_their_quotes_and_unrelated_ones_are_untouched() {
     let out = fs::read_to_string(&css).unwrap();
     assert!(out.contains(r#"url("fonts/My Font.otf")"#), "{out}");
     assert!(out.contains("url('images/plate.jpg')"), "{out}");
+}
+
+/// CSS as a browser reads it: `URL(` in capitals, a `)` inside a quoted url,
+/// the strings `image-set()` names images with, and padding inside the
+/// parentheses. A `//host` url is another site's, and a comment is not CSS.
+#[test]
+fn css_urls_are_found_however_they_are_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = put(
+        dir.path(),
+        "style.css",
+        ".a { background: URL(images/upper.png) }\n\
+         .b { background: url(\"images/paren(1).png\") }\n\
+         .c { background-image: image-set(\"images/set.png\" 1x, url(images/set2.png) 2x) }\n\
+         .d { background-image: -webkit-image-set(url( 'images/pad.png' ) 1x) }\n\
+         .e { background: url(//cdn.example.com/images/plate.png) }\n\
+         /* url(images/commented.png) */\n",
+    );
+    let map = rename_map(&[
+        ("images/upper.png", "images/upper.jpg"),
+        ("images/paren(1).png", "images/paren(1).jpg"),
+        ("images/set.png", "images/set.jpg"),
+        ("images/set2.png", "images/set2.jpg"),
+        ("images/pad.png", "images/pad.jpg"),
+        ("images/plate.png", "images/plate.jpg"),
+        ("images/commented.png", "images/commented.jpg"),
+    ]);
+
+    update_css_references(&path, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&path).unwrap();
+    for rewritten in [
+        "URL(images/upper.jpg)",
+        r#"url("images/paren(1).jpg")"#,
+        r#"image-set("images/set.jpg" 1x, url(images/set2.jpg) 2x)"#,
+        "url( 'images/pad.jpg' )",
+        "url(//cdn.example.com/images/plate.png)",
+        "/* url(images/commented.png) */",
+    ] {
+        assert!(out.contains(rewritten), "{rewritten}:\n{out}");
+    }
+}
+
+/// What an entity stands for is part of a `<style>`'s CSS, though it is not
+/// text there. Read as if it were not there, `url(&cdn;cover.png)` named the
+/// book's own `cover.png`, and was rewritten with the entity left behind
+/// outside the url.
+#[test]
+fn a_url_with_an_entity_in_it_is_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY cdn "https://cdn.example/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.remote { background: url(&cdn;cover.png) }</style></head>
+<body><p><img src="cover.png" alt=""/></p></body></html>
+"#,
+    );
+    let map = rename_map(&[("cover.png", "cover.jpg")]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".remote { background: url(&cdn;cover.png) }"),
+        "{out}"
+    );
+    assert!(out.contains(r#"<img src="cover.jpg""#), "{out}");
+}
+
+/// A url beside an entity follows its image, and the entity stays as written.
+/// One with an entity in it follows its image too, the entity written out as
+/// what it stands for. Leaving a `<style>` with an entity in it alone left its
+/// urls naming images that were gone.
+#[test]
+fn urls_beside_and_through_entities_follow_their_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY family "serif"><!ENTITY dir "images/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { font-family: &family;; background: url(cover.png) }</style><style type="text/css">.c { background: url(&dir;plate.png) }</style></head>
+<body><p class="a c"><img src="cover.png" alt=""/></p></body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("cover.png", "cover.jpg"),
+        ("images/plate.png", "images/plate.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".a { font-family: &family;; background: url(cover.jpg) }"),
+        "{out}"
+    );
+    assert!(
+        out.contains(".c { background: url(images/plate.jpg) }"),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// An entity that stands for nothing this can read, under a doctype that is
+/// never loaded, stays where it is. A url with a readable entity in it still
+/// follows its image, the entity written out beside the one that stays.
+#[test]
+fn a_readable_entity_is_written_out_beside_one_that_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd" [<!ENTITY dir "images/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">p:before { content: "&mdash;" } .c { background: url(&dir;plate.png) }</style></head>
+<body><p class="c">x</p></body></html>
+"#,
+    );
+    let map = rename_map(&[("images/plate.png", "images/plate.jpg")]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(r#"p:before { content: "&mdash;" } .c { background: url(images/plate.jpg) }"#),
+        "{out}"
+    );
+}
+
+/// A srcset is split as the HTML standard splits it: a URL runs to the first
+/// blank, commas and all, and only a comma after it, outside parentheses,
+/// ends a candidate. Split at every comma, a remote image whose URL held one
+/// had the tail of its path taken for an image in the book, and a local image
+/// with a comma in its name was not found.
+#[test]
+fn a_srcset_is_split_as_the_html_standard_splits_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let srcsets = [
+        (
+            "https://cdn.example/path,cover.png 2x",
+            "https://cdn.example/path,cover.png 2x",
+        ),
+        (
+            "../images/a,b.png 1x,../images/cover.png 2x",
+            "../images/a,b.jpg 1x,../images/cover.jpg 2x",
+        ),
+        (
+            "data:image/png;base64,AAAA 1x, ../images/cover.png 2x",
+            "data:image/png;base64,AAAA 1x, ../images/cover.jpg 2x",
+        ),
+        (
+            "../images/cover.png,&#10;../images/a,b.png 640w (max-width: 9em, x) ,../images/cover.png",
+            "../images/cover.jpg,\n../images/a,b.jpg 640w (max-width: 9em, x) ,../images/cover.jpg",
+        ),
+    ];
+    let images: String = srcsets
+        .iter()
+        .map(|(srcset, _)| {
+            format!(r#"<p><img src="../images/cover.png" srcset="{srcset}" alt=""/></p>"#)
+        })
+        .collect();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>{images}</body></html>
+"#
+        ),
+    );
+    let map = rename_map(&[
+        ("images/cover.png", "images/cover.jpg"),
+        ("images/a,b.png", "images/a,b.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    let doc = xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    let written: Vec<String> = xml::find_nodes(&doc, "//*[local-name()='img']")
+        .unwrap()
+        .iter()
+        .map(|image| image.get_attribute("srcset").unwrap_or_default())
+        .collect();
+    let expected: Vec<&str> = srcsets.iter().map(|(_, after)| *after).collect();
+    assert_eq!(written, expected, "{out}");
+}
+
+/// A `<style>` element's text and CDATA sections are one stylesheet, and a
+/// url can start in one and end in the next. Read one at a time, neither held
+/// a url.
+#[test]
+fn a_url_split_across_a_style_elements_cdata_follows_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.a { background: url(<![CDATA[../images/a.png]]>) }</style><style type="text/css">
+/*<![CDATA[*/
+.b { background: url(../images/b.png) }
+/*]]>*/
+</style></head><body><p>x</p></body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("images/a.png", "images/a.jpg"),
+        ("images/b.png", "images/b.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert!(
+        out.contains(".a { background: url(../images/a.jpg) }"),
+        "{out}"
+    );
+    assert!(
+        out.contains("/*<![CDATA[*/\n.b { background: url(../images/b.jpg) }\n/*]]>*/"),
+        "{out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// An image is named by more than `<img src>`: by `srcset`, a link to the
+/// full size, a video's poster, an object's data, a page's background, SVG 2's
+/// plain `href` beside `xlink:href`, and `url()` in a `<style>` element as
+/// much as in a `style` attribute.
+#[test]
+fn every_attribute_that_names_an_image_follows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">.banner { background: url(../images/banner.png) }</style></head>
+<body background="../images/paper.png">
+<p><img src="../images/a.png" srcset="../images/a.png 1x, ../images/big.png 2x" alt=""/></p>
+<p><a href="../images/a.png">full size</a></p>
+<video poster="../images/poster.png"/>
+<object data="../images/object.png" type="image/png"/>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><image href="../images/svg.png" xlink:href="../images/svg.png"/><style>.x { fill: url(../images/fill.png) }</style></svg>
+<p style="background: URL(../images/upper.png)">x</p>
+<p><img src=" ../images/padded.png " alt=""/><img src="//cdn.example.com/images/a.png" alt=""/></p>
+</body></html>
+"#,
+    );
+    let map = rename_map(&[
+        ("images/banner.png", "images/banner.jpg"),
+        ("images/paper.png", "images/paper.jpg"),
+        ("images/a.png", "images/a.jpg"),
+        ("images/big.png", "images/big.jpg"),
+        ("images/poster.png", "images/poster.jpg"),
+        ("images/object.png", "images/object.jpg"),
+        ("images/svg.png", "images/svg.jpg"),
+        ("images/fill.png", "images/fill.jpg"),
+        ("images/upper.png", "images/upper.jpg"),
+        ("images/padded.png", "images/padded.jpg"),
+    ]);
+
+    update_xhtml_references(&chapter, &Renames::new(dir.path(), dir.path(), &map)).unwrap();
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    for gone in [
+        "banner.png",
+        "paper.png",
+        "../images/a.png",
+        "big.png",
+        "poster.png",
+        "object.png",
+        "svg.png",
+        "fill.png",
+        "upper.png",
+        "padded.png",
+    ] {
+        assert!(!out.contains(gone), "{gone} is still named:\n{out}");
+    }
+    assert!(
+        out.contains(r#"srcset="../images/a.jpg 1x, ../images/big.jpg 2x""#),
+        "{out}"
+    );
+    assert!(out.contains("//cdn.example.com/images/a.png"), "{out}");
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
 }
 
 #[test]
@@ -949,6 +1264,71 @@ fn a_split_image_is_followed_by_its_other_pages() {
     );
 }
 
+/// Each page of a split image is shown by its `src`. A `srcset` or `sizes`,
+/// or the `<source>`s of a `<picture>`, would show the one image they name on
+/// every page instead: the first page, or the whole spread.
+#[test]
+fn a_split_images_pages_are_shown_by_src_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p><img src="../images/spread_part1.jpg" srcset="../images/spread_part1.jpg 1x, ../images/spread-hd.jpg 2x" sizes="100vw" alt=""/></p>
+<p><picture><source srcset="../images/spread.webp" type="image/webp"/><img src="../images/spread_part1.jpg" alt=""/></picture></p>
+<p><img src="../images/other.jpg" srcset="../images/other.jpg 1x" sizes="50vw" alt=""/></p>
+</body></html>
+"#,
+    );
+
+    assert_eq!(
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread())
+        )
+        .unwrap(),
+        2
+    );
+
+    let out = fs::read_to_string(&chapter).unwrap();
+    assert_eq!(out.matches("spread_part2.jpg").count(), 2, "{out}");
+    for gone in ["spread-hd.jpg", "100vw", "<source", "spread.webp"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
+    assert!(
+        out.contains(r#"srcset="../images/other.jpg 1x" sizes="50vw""#),
+        "an unrelated image keeps its srcset: {out}"
+    );
+    xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// A `<picture>` is cleared of its sources once, not once for each image in
+/// it: looked through again for every one, a picture of 4,000 split images
+/// took thirteen seconds, four times as long for twice as many.
+#[test]
+fn a_picture_of_many_split_images_is_cleared_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = 8_000;
+    let chapter = put(
+        dir.path(),
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><picture><source srcset="../images/spread.webp"/>{}</picture></body></html>
+"#,
+            r#"<img src="../images/spread_part1.jpg" alt=""/>"#.repeat(images)
+        ),
+    );
+    let root = dir.path().to_path_buf();
+
+    let changed = common::finishes_within(Duration::from_secs(20), move || {
+        show_reshaped_pages(&chapter, &ReshapedPages::new(&root, &root, &split_spread())).unwrap()
+    });
+
+    assert_eq!(changed, images);
+}
+
 /// An SVG wrapper's viewBox is sized to the old shape, so it would squash the
 /// new pages into it. It gives way to a plain image per page.
 #[test]
@@ -1022,6 +1402,106 @@ fn an_illustration_around_a_split_image_is_kept_and_followed_by_its_pages() {
         .expect("the second page is shown");
     assert!(second > svg_end, "{out}");
     xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+}
+
+/// Each further page is a copy of the first page's image. A prefix the image
+/// declared for itself has to be declared on each copy too, or the chapter
+/// stops being namespace-well-formed. An `xml:id` is an id like any other and
+/// stays with the first. And the copy is the same every run: its attributes
+/// come in the order the original has them.
+#[test]
+fn copied_page_images_declare_what_they_use_and_come_out_the_same_every_time() {
+    let chapter_text = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p><img xmlns:epub="http://www.idpf.org/2007/ops" xml:id="x1" id="spread" class="plate" epub:type="illustration" src="../images/spread_part1.jpg" alt="Both pages" title="A spread"/></p>
+</body></html>
+"#;
+
+    let mut outputs = Vec::new();
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let chapter = put(dir.path(), "text/chapter.xhtml", chapter_text);
+        show_reshaped_pages(
+            &chapter,
+            &ReshapedPages::new(dir.path(), dir.path(), &split_spread()),
+        )
+        .unwrap();
+        outputs.push(fs::read_to_string(&chapter).unwrap());
+    }
+    let out = &outputs[0];
+    assert!(outputs.iter().all(|other| other == out), "{outputs:#?}");
+
+    assert_eq!(out.matches("xml:id=").count(), 1, "{out}");
+    let doc = xml::parse_strict(out.as_bytes()).unwrap();
+    let images = xml::find_nodes(&doc, "//*[local-name()='img']").unwrap();
+    assert_eq!(images.len(), 2, "{out}");
+    assert_eq!(
+        images[1].get_attribute_ns("type", "http://www.idpf.org/2007/ops"),
+        Some("illustration".to_string()),
+        "the copy's epub:type is not in the epub namespace:\n{out}"
+    );
+    let copy = &out[out.rfind("<img").unwrap()..];
+    let copy = &copy[..copy.find("/>").unwrap()];
+    let order: Vec<usize> = ["class=", "epub:type=", "src=", "alt=", "title="]
+        .iter()
+        .map(|name| {
+            copy.find(name)
+                .unwrap_or_else(|| panic!("{name} missing: {copy}"))
+        })
+        .collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{copy}");
+}
+
+/// A chapter the manifest lists twice, under two spellings, is one file, and
+/// is processed once.
+#[test]
+fn a_file_listed_twice_is_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="a" href="Text/ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="b" href="Text/./ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c" href="Images/a.png" media-type="image/png"/>
+    <item id="d" href="Text/../Images/a.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="a"/></spine>
+</package>
+"#);
+
+    let content = find_content_files(dir.path(), dir.path(), &doc).unwrap();
+    assert_eq!(content.xhtml.len(), 1, "{:?}", content.xhtml);
+    assert_eq!(content.images.len(), 1, "{:?}", content.images);
+}
+
+/// The manifest follows an image by the file its href names. One whose file
+/// is missing named something else, and re-pointing it at another folder's
+/// image of the same name made two items share one file.
+#[test]
+fn a_manifest_item_for_a_missing_file_is_not_repointed() {
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest>
+    <item id="cover" href="Images/cover.png" media-type="image/png"/>
+    <item id="thumb" href="Thumbs/cover.png" media-type="image/png"/>
+  </manifest>
+  <spine/>
+</package>
+"#);
+    let map = rename_map(&[("Images/cover.png", "Images/cover.jpg")]);
+
+    assert_eq!(
+        update_opf(&doc, &Renames::new(book(), book(), &map)).unwrap(),
+        1
+    );
+    let hrefs: Vec<String> = manifest_items(&doc)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.href)
+        .collect();
+    assert_eq!(hrefs, ["Images/cover.jpg", "Thumbs/cover.png"]);
 }
 
 /// A rotated image is one page, but no longer the shape its size describes.
