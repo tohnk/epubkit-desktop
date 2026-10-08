@@ -1333,3 +1333,53 @@ fn the_container_cannot_point_at_a_package_outside_the_book() {
     );
     assert_eq!(report.output_filename, "A Writer - Test Book.epub");
 }
+
+/// An image that cannot be converted stays as it was, and the summary says
+/// so, rather than leaving it to be worked out from the count of converted
+/// images, which counts SVG images too.
+#[test]
+fn an_image_that_cannot_be_converted_is_counted_in_the_summary() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:unconverted</dc:identifier>
+    <dc:title>Unconverted</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="good" href="good.png" media-type="image/png"/>
+    <item id="bad" href="bad.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>
+<body><p><img src="good.png" alt=""/></p><p><img src="bad.png" alt=""/></p></body></html>
+"#;
+    let good = common::png_gradient(60, 80);
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter),
+            ("OEBPS/good.png", &good),
+            ("OEBPS/bad.png", b"not an image at all"),
+        ],
+    );
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    assert_eq!(report.images_converted, 1);
+    let summary = report.summary();
+    assert!(
+        summary.contains("Left 1 image that could not be converted as it was"),
+        "{summary}"
+    );
+    assert!(entry_names(&output).contains(&"OEBPS/bad.png".to_string()));
+}

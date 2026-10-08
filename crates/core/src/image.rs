@@ -29,6 +29,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use image::error::{ImageError, LimitError, LimitErrorKind};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, GrayImage, ImageDecoder, ImageReader, Limits, Luma, Rgb, RgbImage};
@@ -41,6 +42,14 @@ pub const SSD1677_LEVELS: &[u8] = &[0, 85, 170, 255];
 
 /// Hard ceiling from the Xteink JPEG spec, applied before the device box.
 pub const MAX_IMAGE_DIMENSION: u32 = 1024;
+
+/// The most pixels an image may have to be converted: Pillow's limit, past
+/// which it takes an image for a decompression bomb.
+pub const MAX_PIXELS: u64 = 178_956_970;
+
+/// What decoding one image may allocate: room for an image of [`MAX_PIXELS`]
+/// at sixteen bits a channel with alpha, and for the decoder's own buffers.
+const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 8 + 128 * 1024 * 1024;
 
 pub const DEFAULT_DEVICE: &str = "x4";
 
@@ -469,9 +478,16 @@ fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
     // reader would.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 
-    // What `ImageReader::decode` would do: the decoded image comes out of
-    // the decoder's allocation budget before the decoder runs.
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(ImageError::Limits(LimitError::from_kind(
+            LimitErrorKind::DimensionError,
+        )));
+    }
+    // The decoded image comes out of the budget before the decoder runs, as
+    // `ImageReader::decode` would have it, and the rest is the decoder's.
     let mut limits = Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
 

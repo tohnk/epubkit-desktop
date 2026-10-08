@@ -89,6 +89,8 @@ pub struct ProcessingReport {
     /// Source images converted. A split spread counts once.
     pub images_converted: usize,
     pub images_total: usize,
+    /// Images the image step could not convert, left as they were.
+    pub images_unconverted: usize,
     /// Double-page spreads Light Novel mode split into pages.
     pub spreads_split: usize,
     /// e.g. `{"PNG→JPEG": 5}` — how the images were transformed.
@@ -132,6 +134,17 @@ impl ProcessingReport {
                 self.images_converted,
                 self.images_total,
                 formats.join(", ")
+            ));
+        }
+        if self.images_unconverted > 0 {
+            let n = self.images_unconverted;
+            let (plural, as_it_was) = if n == 1 {
+                ("", "it was")
+            } else {
+                ("s", "they were")
+            };
+            parts.push(format!(
+                "Left {n} image{plural} that could not be converted as {as_it_was}"
             ));
         }
         if self.spreads_split > 0 {
@@ -551,6 +564,7 @@ fn convert_images<P: FnMut(u8, &str)>(
 
         // A single unreadable image must not sink the whole book.
         let Ok(outputs) = image::process_image(&bytes, &name, &image_options) else {
+            report.images_unconverted += 1;
             report
                 .image_details
                 .push(format!("{name}: skipped (could not be decoded)"));

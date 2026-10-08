@@ -482,6 +482,24 @@ landscape art and turned the other way, it came out upside down. The port
 turns each image as its orientation tag says (JPEG, PNG, WebP and TIFF can
 carry one) before anything looks at its shape.
 
+### Images are decoded by the `image` crate, not Pillow
+
+The two read what a book's images are normally in alike: JPEG (progressive,
+CMYK and YCCK included), PNG, GIF, WebP and BMP. A few rarer kinds Pillow
+reads, the `image` crate does not: arithmetic-coded JPEG, and TIFF that is
+fax-compressed (CCITT G3, or G4 written least significant bit first),
+JPEG-compressed, paletted, or grey at 2 or 4 bits. Two more TIFF variants it
+reads differently: an extra channel marked "unspecified" is taken for alpha,
+and premultiplied alpha is not undone. An image that cannot be decoded stays
+in the book as it was, and the summary counts it. Neither TIFF nor arithmetic
+coding is among the image types EPUB requires a reader to show.
+
+Both refuse an image of more than 178,956,970 pixels as a likely
+decompression bomb. The `image` crate on its own refuses one whose decoded
+pixels take more than 512 MiB, which left a 12000 x 12000 RGBA image, 144
+million pixels, unconverted at full size; the port lets decoding allocate
+enough for an image at Pillow's limit, at sixteen bits a channel.
+
 ### Cover generation is omitted
 
 `generate_cover_image` drew a title/author cover for books that lack one. It is

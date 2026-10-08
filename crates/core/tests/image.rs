@@ -569,3 +569,73 @@ fn light_novel_mode_sees_a_photo_in_the_shape_it_is_shown() {
         "upright, not turned twice: top {top:.0}, bottom {bottom:.0}"
     );
 }
+
+// ------------------------------------------------------------------- size
+
+/// A PNG that says it is `width` x `height` RGBA and holds no pixels: enough
+/// for a decoder to judge its size by, with nothing to decode.
+fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]); // eight-bit RGBA
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    // An empty zlib stream.
+    chunk(
+        &mut png,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Pillow converts an image of up to about 179 million pixels. The image
+/// crate's default allocation limit refused a 12000 x 12000 RGBA one, 144
+/// million, which was then left in the book at full size.
+#[test]
+fn an_image_pillow_would_convert_is_not_refused_for_its_size() {
+    let source = png_claiming(12_000, 12_000);
+
+    let error = process_image(&source, "plate.png", &ImageOptions::default())
+        .expect_err("it has no pixels to convert")
+        .to_string();
+    assert!(!error.contains("limit"), "refused for its size: {error}");
+}
+
+/// Past Pillow's limit an image is taken for a decompression bomb, and is
+/// refused before anything is set aside for its pixels.
+#[test]
+fn an_image_past_pillows_limit_is_refused_before_it_is_decoded() {
+    let source = png_claiming(15_000, 15_000);
+
+    let error = process_image(&source, "bomb.png", &ImageOptions::default())
+        .expect_err("too large")
+        .to_string();
+    assert!(error.contains("limit"), "{error}");
+}
