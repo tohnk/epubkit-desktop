@@ -552,6 +552,15 @@ converted under its own name, a PNG named `plate.jpg` say, is declared
 `image/jpeg` in the manifest as a renamed one is; the reference changed the
 media type only of an image it renamed.
 
+### Images are converted on every core
+
+The reference converted one image after another. The port converts as many
+at once as the machine runs threads, each holding while it converts about as
+much memory as its image needs, out of 1 GiB for all of them, so very large
+images wait their turn. Each image is then named, written and reported in the
+manifest's order, so the book that comes out is the same whatever order they
+finished in.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book

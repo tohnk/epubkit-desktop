@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -1683,5 +1684,59 @@ fn light_novel_mode_still_splits_a_spread_shown_on_its_own() {
     assert_eq!(
         chapter_sources(work.path()),
         ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+}
+
+// --------------------------------------------- images converted in parallel
+
+/// Images are converted on several threads, and finish in whatever order
+/// they finish, a large one last. Which takes which name is settled in the
+/// manifest's order all the same, so a book converts the same every time.
+#[test]
+fn images_take_their_names_in_manifest_order_whatever_finishes_first() {
+    let large = image::GrayImage::from_pixel(1200, 1800, image::Luma([0]));
+    let mut large_png = Vec::new();
+    image::DynamicImage::ImageLuma8(large)
+        .write_to(
+            &mut std::io::Cursor::new(&mut large_png),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let images = [
+        ("images/plate.png", large_png),
+        ("images/plate.gif", solid(image::ImageFormat::Png, 128)),
+        ("images/plate.bmp", solid(image::ImageFormat::Png, 255)),
+        ("images/plate.jpeg", solid(image::ImageFormat::Jpeg, 128)),
+        ("images/plate.webp", solid(image::ImageFormat::Png, 0)),
+    ];
+
+    let mut books = Vec::new();
+    for _ in 0..3 {
+        let work = convert_images_book(&images);
+        assert_eq!(
+            chapter_sources(work.path()),
+            [
+                "../images/plate.jpg",
+                "../images/plate-2.jpg",
+                "../images/plate-3.jpg",
+                "../images/plate-4.jpg",
+                "../images/plate-5.jpg",
+            ]
+        );
+        assert_eq!(shown_greys(work.path()), [0, 128, 255, 128, 0]);
+        assert_manifest_matches_archive(work.path());
+        books.push(
+            image_files(work.path())
+                .iter()
+                .map(|file| {
+                    let name = file.strip_prefix(work.path()).unwrap().to_path_buf();
+                    (name, fs::read(file).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+    assert!(
+        books.windows(2).all(|pair| pair[0] == pair[1]),
+        "converted differently"
     );
 }

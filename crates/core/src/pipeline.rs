@@ -13,6 +13,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Condvar, Mutex, PoisonError};
 
 use crate::html::{self, HtmlRepair};
 use crate::image::{self, DeviceProfile, ImageOptions};
@@ -522,6 +524,7 @@ fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Pat
 
 /// What the image step leaves for the steps after it. Paths are relative to
 /// the OPF's directory.
+#[derive(Default)]
 struct ConvertedImages {
     /// Source path → the filename of its (first) output.
     renames: BTreeMap<String, String>,
@@ -536,6 +539,11 @@ struct ConvertedImages {
 /// Convert every image in the manifest. Those in `keep_shape`, by path, are
 /// converted as they are shaped, whatever Light Novel mode would make of
 /// them.
+///
+/// Images are converted on as many threads as the machine runs at once. What
+/// is then done with each, naming, writing, deleting its source, reporting,
+/// is done in manifest order, so that a book converts the same however its
+/// threads ran.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
     root: &Path,
@@ -553,52 +561,93 @@ fn convert_images<P: FnMut(u8, &str)>(
         light_novel_mode: false,
         ..image_options.clone()
     };
-    let mut renames = BTreeMap::new();
-    let mut reshaped = BTreeMap::new();
-    let mut in_place = Vec::new();
-    let mut taken = TakenNames::default();
     report.images_total = images.len();
 
-    for (index, path) in images.iter().enumerate() {
-        let percent = START + SPAN * (index as f64 / images.len().max(1) as f64);
-        progress(
-            percent as u8,
-            &format!("Processing image {}/{}...", index + 1, images.len()),
-        );
+    let jobs: Vec<ImageJob> = images
+        .iter()
+        .filter_map(|path| {
+            if !path.is_file() {
+                return None;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !image::should_process(&name) {
+                return None;
+            }
+            // What the rename map calls the image: its path from the OPF's
+            // directory, which may climb out of it. An image the map could
+            // not name would lose its references, so it is left as it is.
+            let relative = structure::relative_path(root, opf_dir, path)?;
+            let options = if keep_shape.contains(path) {
+                &as_shaped
+            } else {
+                &image_options
+            };
+            Some(ImageJob {
+                path,
+                name,
+                relative,
+                options,
+            })
+        })
+        .collect();
 
-        if !path.is_file() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !image::should_process(&name) {
-            continue;
-        }
-        // What the rename map calls the image: its path from the OPF's
-        // directory, which may climb out of it. An image the map could not
-        // name would lose its references, so it is left as it is.
-        let Some(relative) = structure::relative_path(root, opf_dir, path) else {
-            continue;
-        };
+    let mut converted = ConvertedImages::default();
+    let mut taken = TakenNames::default();
+    let budget = MemoryBudget::new(IMAGE_MEMORY_BUDGET);
 
-        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    in_order_in_parallel(
+        &jobs,
+        |job| -> Result<Option<Vec<image::ProcessedImage>>> {
+            let bytes = fs::read(job.path).map_err(|e| Error::io(job.path, e))?;
+            let _held = budget.hold(image::memory_needed(&bytes));
+            // A single unreadable image must not sink the whole book.
+            Ok(image::process_image(&bytes, &job.name, job.options).ok())
+        },
+        |finished| {
+            let percent = START + SPAN * (finished as f64 / jobs.len() as f64);
+            progress(
+                percent as u8,
+                &format!("Processing image {finished}/{}...", jobs.len()),
+            );
+        },
+        |job, outputs| {
+            let Some(outputs) = outputs? else {
+                report.images_unconverted += 1;
+                report
+                    .image_details
+                    .push(format!("{}: skipped (could not be decoded)", job.name));
+                return Ok(());
+            };
+            converted.take(job, outputs, &mut taken, opf_dir, report)
+        },
+    )?;
 
-        // A single unreadable image must not sink the whole book.
-        let options = if keep_shape.contains(path) {
-            &as_shaped
-        } else {
-            &image_options
-        };
-        let Ok(outputs) = image::process_image(&bytes, &name, options) else {
-            report.images_unconverted += 1;
-            report
-                .image_details
-                .push(format!("{name}: skipped (could not be decoded)"));
-            continue;
-        };
+    Ok(converted)
+}
 
+/// One image the image step tries to convert.
+struct ImageJob<'a> {
+    path: &'a Path,
+    name: String,
+    /// Its path from the OPF's directory.
+    relative: String,
+    options: &'a ImageOptions,
+}
+
+impl ConvertedImages {
+    /// Write what `job`'s image converted to, and note it.
+    fn take(
+        &mut self,
+        job: &ImageJob,
+        outputs: Vec<image::ProcessedImage>,
+        taken: &mut TakenNames,
+        opf_dir: &Path,
+        report: &mut ProcessingReport,
+    ) -> Result<()> {
+        let (path, name, relative) = (job.path, &job.name, &job.relative);
         let parent = path.parent().unwrap_or(opf_dir);
 
         // Settle every output's name before writing any. One named like its
@@ -610,7 +659,7 @@ fn convert_images<P: FnMut(u8, &str)>(
         let names: Vec<String> = outputs
             .iter()
             .map(|output| {
-                if same_name(&output.filename, &name) {
+                if same_name(&output.filename, name) {
                     name.clone()
                 } else {
                     taken.claim(parent, &output.filename)
@@ -638,31 +687,140 @@ fn convert_images<P: FnMut(u8, &str)>(
             let pages: Vec<String> = names
                 .iter()
                 .map(|page| {
-                    Path::new(&relative)
+                    Path::new(relative)
                         .with_file_name(page)
                         .to_string_lossy()
                         .replace('\\', "/")
                 })
                 .collect();
-            reshaped.insert(pages[0].clone(), pages);
+            self.reshaped.insert(pages[0].clone(), pages);
         }
-        if names[0] == name {
-            in_place.push(relative.clone());
+        if names[0] == *name {
+            self.in_place.push(relative.clone());
         }
-        renames.insert(relative, names[0].clone());
+        self.renames.insert(relative.clone(), names[0].clone());
 
         // The source only goes once its replacement is safely written, and
         // never when the replacement took its place.
-        if !names.contains(&name) && path.is_file() {
+        if !names.contains(name) && path.is_file() {
             fs::remove_file(path).ok();
+        }
+        Ok(())
+    }
+}
+
+/// Memory the image step's threads may hold at once for the images they are
+/// converting, as [`image::memory_needed`] reckons it. Enough for the four or
+/// so a machine converts at once, unless they are very large, when they wait
+/// their turn.
+const IMAGE_MEMORY_BUDGET: u64 = 1 << 30;
+
+/// Run `work` on each of `jobs` on as many threads as the machine runs at
+/// once, telling `finished` how many are done each time one is, and hand
+/// each result to `take` in the order of `jobs`, as soon as it and every one
+/// before it are done. Stops at the first error `take` returns; threads
+/// finish only the jobs they have begun.
+fn in_order_in_parallel<J: Sync, T: Send>(
+    jobs: &[J],
+    work: impl Fn(&J) -> T + Sync,
+    mut finished: impl FnMut(usize),
+    mut take: impl FnMut(&J, T) -> Result<()>,
+) -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(jobs.len());
+    if threads <= 1 {
+        for (index, job) in jobs.iter().enumerate() {
+            let result = work(job);
+            finished(index + 1);
+            take(job, result)?;
+        }
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..threads {
+            let sender = sender.clone();
+            let (next, work) = (&next, &work);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(index) else {
+                    break;
+                };
+                if sender.send((index, work(job))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+
+        let mut ready = BTreeMap::new();
+        let mut taken = 0;
+        for (count, (index, result)) in receiver.iter().enumerate() {
+            finished(count + 1);
+            ready.insert(index, result);
+            while let Some(result) = ready.remove(&taken) {
+                take(&jobs[taken], result)?;
+                taken += 1;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Memory to be shared out among threads, each holding some for as long as
+/// it needs it, and waiting while too little is left.
+struct MemoryBudget {
+    left: Mutex<u64>,
+    freed: Condvar,
+    total: u64,
+}
+
+impl MemoryBudget {
+    fn new(total: u64) -> Self {
+        Self {
+            left: Mutex::new(total),
+            freed: Condvar::new(),
+            total,
         }
     }
 
-    Ok(ConvertedImages {
-        renames,
-        reshaped,
-        in_place,
-    })
+    /// Hold `amount`, or the whole budget if it is more, waiting until that
+    /// much is left. It is given back when what this returns is dropped.
+    fn hold(&self, amount: u64) -> HeldMemory<'_> {
+        let amount = amount.min(self.total);
+        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
+        while *left < amount {
+            left = self
+                .freed
+                .wait(left)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *left -= amount;
+        HeldMemory {
+            budget: self,
+            amount,
+        }
+    }
+}
+
+struct HeldMemory<'a> {
+    budget: &'a MemoryBudget,
+    amount: u64,
+}
+
+impl Drop for HeldMemory<'_> {
+    fn drop(&mut self) {
+        let mut left = self
+            .budget
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *left += self.amount;
+        self.budget.freed.notify_all();
+    }
 }
 
 /// Filenames in use, per directory, so that a converted image never lands on

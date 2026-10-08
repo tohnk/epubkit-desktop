@@ -151,6 +151,19 @@ pub fn should_process(filename: &str) -> bool {
         .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+/// About as much memory as converting `bytes` will hold at once, reckoned
+/// from the size its header gives: the decoded image, and the copies made of
+/// it on the way. Nothing, for what has no header to read.
+pub fn memory_needed(bytes: &[u8]) -> u64 {
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+        .map_or(0, |(width, height)| {
+            u64::from(width) * u64::from(height) * 12
+        })
+}
+
 /// Convert one image for the device.
 pub fn process_image(
     bytes: &[u8],
