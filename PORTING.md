@@ -432,18 +432,31 @@ symbols. No dequantization and no IDCT are involved, so nothing is
 approximated; SOF, DQT, scan header, component order and every DCT coefficient
 are copied through byte for byte. It is what `jpegtran -optimize` does.
 
-The output is therefore structurally identical to what the reference emits, and
-it is verified three ways: the rewritten file must decode to the same pixels,
-must be smaller, and must re-decode to the exact symbol stream it was built
-from — that last check runs inside `optimize_huffman` itself, so a bug degrades
-to "no saving" rather than to a corrupt book. Anything unrecognized
-(progressive, restart markers, multiple scans, 12-bit) is declined and the
-original kept. Set `EPUBKIT_JPEG_TRACE=1` to see why a file was declined.
+One more thing changes, as libjpeg would have it. An interleaved scan codes
+whole MCUs, so where an image's luma does not fill out the last one, 4:2:0
+greyscale being the case here, blocks past the image's edge are coded that no
+decoder shows. libjpeg codes each as the DC of the block before it and no AC;
+`jpeg-encoder` fills them with the image's last row or column repeated, which
+in a dithered image cost 0.4% of a page-sized file and a quarter of a strip
+eight pixels high. The rewrite codes them as libjpeg does.
+
+The output is therefore built as the reference's is, but for two legal
+differences that come from `jpeg-encoder`: its frame header comes before its
+quantization tables, and its components are numbered 0 to 2 rather than 1 to
+3. No decoder tried minds either, but they are the first thing to look at if
+a reader ever cannot show an image. The rewrite is verified three ways: the
+rewritten file must decode to the same pixels, must be smaller, and must
+re-decode to the exact symbol stream it was built from — that last check runs
+inside `optimize_huffman` itself, so a bug degrades to "no saving" rather than
+to a corrupt book. Anything unrecognized (progressive, restart markers,
+multiple scans, 12-bit) is declined and the original kept. Set
+`EPUBKIT_JPEG_TRACE=1` to see why a file was declined.
 
 Measured against the unoptimized file, on images that have been through the
 full pipeline: ~7.5% on photographic content, ~6% on line art, ~3% on a page of
 text, ~4% on 4-level dithered noise, and 40–55% on near-empty images. Sizes
-land within 0.05% of what libjpeg produces from the same pixels.
+land within 0.3% of what libjpeg produces from the same pixels at the same
+quality, whose quantization tables are the same.
 
 ### Pixel operations are checked against Pillow, not eyeballed
 

@@ -18,10 +18,12 @@
 //! 3. re-encode the identical symbol stream against the new tables.
 //!
 //! Everything else in the file is copied through untouched: SOF, DQT, the scan
-//! header, component order, sampling factors, and every DCT coefficient. The
-//! result decodes to the same pixels, byte for byte, and differs only in the
-//! DHT segments and the entropy bits. It is the same transformation
-//! `jpegtran -optimize` performs.
+//! header, component order, sampling factors, and every DCT coefficient of
+//! the image. Only blocks past the image's edge, which no decoder shows, are
+//! coded afresh, as libjpeg codes them: see `without_padding`. The result
+//! decodes to the same pixels, byte for byte, and differs only in the DHT
+//! segments and the entropy bits. It is the same transformation
+//! `jpegtran -optimize` performs on a file libjpeg wrote.
 //!
 //! Anything unexpected — progressive, restart markers, multiple scans, 12-bit —
 //! returns `None`, and the caller keeps the original file.
@@ -90,6 +92,7 @@ pub fn optimize_huffman(jpeg: &[u8]) -> Option<Vec<u8>> {
     if symbols.is_empty() {
         return None;
     }
+    let symbols = stage!(without_padding(&parsed, &symbols), "padding");
 
     let tables = stage!(build_tables(&parsed, &symbols), "table building");
     let entropy = encode_symbols(&symbols, &tables);
@@ -117,10 +120,7 @@ pub fn optimize_huffman(jpeg: &[u8]) -> Option<Vec<u8>> {
 // ------------------------------------------------------------------ parsing
 
 fn be16(bytes: &[u8], at: usize) -> Option<usize> {
-    Some(u16::from_be_bytes([
-        *bytes.get(at)?,
-        *bytes.get(at + 1)?,
-    ]) as usize)
+    Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]) as usize)
 }
 
 fn parse(jpeg: &[u8]) -> Option<Parsed<'_>> {
@@ -459,6 +459,120 @@ fn decode_symbols(parsed: &Parsed) -> Option<Vec<Sym>> {
     Some(symbols)
 }
 
+/// The same blocks, but each one past its component's edge coded as libjpeg
+/// codes it: its DC that of the block before, so a difference of zero, and
+/// no AC. An interleaved scan codes whole MCUs, so where a component does not
+/// fill out the last one, the encoder codes blocks past the image's edge that
+/// no decoder shows; `jpeg-encoder` fills them by repeating the image's last
+/// row or column, at a real cost in a dithered image. Every other block keeps
+/// its coefficients, its DC difference worked out again from the block that
+/// now comes before it.
+fn without_padding(parsed: &Parsed, symbols: &[Sym]) -> Option<Vec<Sym>> {
+    let hmax = parsed.components.iter().map(|c| c.h).max()?;
+    let vmax = parsed.components.iter().map(|c| c.v).max()?;
+    let mcus_x = parsed.width.div_ceil(8 * hmax);
+
+    // Each component's extent in blocks (A.1.1).
+    let extents: Vec<(u32, u32)> = parsed
+        .components
+        .iter()
+        .map(|c| {
+            let width = (parsed.width * c.h).div_ceil(hmax);
+            let height = (parsed.height * c.v).div_ceil(vmax);
+            (width.div_ceil(8), height.div_ceil(8))
+        })
+        .collect();
+
+    // Each component's DC as the scan had it, and as it is rewritten.
+    let mut written = vec![0i32; parsed.components.len()];
+    let mut rewritten = vec![0i32; parsed.components.len()];
+
+    let mut out = Vec::with_capacity(symbols.len());
+    let mut at = 0;
+    let mut mcu = 0;
+    while at < symbols.len() {
+        let (mcu_x, mcu_y) = (mcu % mcus_x, mcu / mcus_x);
+        for (index, component) in parsed.components.iter().enumerate() {
+            for block in 0..component.h * component.v {
+                let x = mcu_x * component.h + block % component.h;
+                let y = mcu_y * component.v + block / component.h;
+                let past_edge = x >= extents[index].0 || y >= extents[index].1;
+
+                let dc = *symbols.get(at)?;
+                written[index] += extend(dc.extra, dc.extra_len);
+                let end = block_end(symbols, at + 1)?;
+
+                if past_edge {
+                    out.push(Sym {
+                        symbol: 0,
+                        extra: 0,
+                        extra_len: 0,
+                        ..dc
+                    });
+                    out.push(Sym {
+                        symbol: 0,
+                        extra: 0,
+                        extra_len: 0,
+                        ..*symbols.get(at + 1)?
+                    });
+                } else {
+                    let (category, extra) = magnitude(written[index] - rewritten[index]);
+                    rewritten[index] = written[index];
+                    out.push(Sym {
+                        symbol: category,
+                        extra,
+                        extra_len: category,
+                        ..dc
+                    });
+                    out.extend_from_slice(&symbols[at + 1..end]);
+                }
+                at = end;
+            }
+        }
+        mcu += 1;
+    }
+
+    Some(out)
+}
+
+/// Where the AC symbols of a block that start at `at` end: after an end of
+/// block, or once 63 coefficients are accounted for.
+fn block_end(symbols: &[Sym], mut at: usize) -> Option<usize> {
+    let mut k = 1;
+    while k <= 63 {
+        let rs = symbols.get(at)?.symbol;
+        at += 1;
+        match rs {
+            0x00 => break,
+            0xF0 => k += 16,
+            rs => k += (rs >> 4) as u32 + 1,
+        }
+    }
+    Some(at)
+}
+
+/// The value `extra_len` magnitude bits stand for (F.2.2.1, EXTEND).
+fn extend(extra: u16, extra_len: u8) -> i32 {
+    if extra_len == 0 {
+        0
+    } else if i32::from(extra) < 1 << (extra_len - 1) {
+        i32::from(extra) - (1 << extra_len) + 1
+    } else {
+        i32::from(extra)
+    }
+}
+
+/// A difference's magnitude category and the bits that follow it (F.1.2.1).
+fn magnitude(value: i32) -> (u8, u16) {
+    let category = (32 - value.unsigned_abs().leading_zeros()) as u8;
+    let extra = if value < 0 {
+        value + (1 << category) - 1
+    } else {
+        value
+    };
+    (category, extra as u16)
+}
+
 // ------------------------------------------------------------ table building
 
 /// Build the optimal table for one symbol distribution, per Annex K.2
@@ -659,8 +773,8 @@ fn encode_symbols(symbols: &[Sym], tables: &[Option<Table>]) -> Vec<u8> {
     };
 
     for sym in symbols {
-        let (length, code) = codes[sym.slot as usize].as_ref().expect("table present")
-            [sym.symbol as usize];
+        let (length, code) =
+            codes[sym.slot as usize].as_ref().expect("table present")[sym.symbol as usize];
         debug_assert!(length > 0, "symbol {} has no code", sym.symbol);
         writer.put(code, length);
         if sym.extra_len > 0 {
@@ -771,6 +885,75 @@ mod tests {
     fn a_marker_ends_the_entropy_data() {
         let mut reader = BitReader::new(&[0xFF, 0xD9]);
         assert_eq!(reader.bit(), None);
+    }
+
+    /// An interleaved scan codes whole MCUs, so where an image's luma does
+    /// not fill out the last MCU, it codes blocks past the image's edge that
+    /// no decoder shows. libjpeg codes each as its DC unchanged and no AC;
+    /// `jpeg-encoder` repeats the image's last row or column into them, at a
+    /// cost of a quarter of the size of a strip eight pixels high.
+    #[test]
+    fn blocks_past_the_edge_are_coded_as_nothing() {
+        // 4-level noise, so a block repeating the edge has AC to code.
+        let (width, height) = (40u16, 24u16);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rgb = Vec::new();
+        for _ in 0..width as usize * height as usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let v = [0u8, 85, 170, 255][(seed >> 33) as usize % 4];
+            rgb.extend_from_slice(&[v, v, v]);
+        }
+        let mut plain = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut plain, 70);
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+        encoder
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+
+        let rewritten = optimize_huffman(&plain).expect("rewritten");
+        let parsed = parse(&rewritten).unwrap();
+        let symbols = decode_symbols(&parsed).unwrap();
+
+        // Walk the blocks as a decoder does, and look at the luma ones past
+        // the image's edge: 40 x 24 is coded as 48 x 32.
+        let mut next = symbols.iter();
+        let mut padding = 0;
+        for mcu in 0..(3 * 2) {
+            let (mcu_x, mcu_y) = (mcu % 3, mcu / 3);
+            for (index, component) in parsed.components.iter().enumerate() {
+                for block in 0..component.h * component.v {
+                    let x = mcu_x * component.h + block % component.h;
+                    let y = mcu_y * component.v + block / component.h;
+                    let past_edge = index == 0 && (x >= 5 || y >= 3);
+
+                    let mut coded = vec![*next.next().unwrap()];
+                    let mut k = 1;
+                    while k <= 63 {
+                        let ac = *next.next().unwrap();
+                        coded.push(ac);
+                        match ac.symbol {
+                            0x00 => break,
+                            0xF0 => k += 16,
+                            rs => k += (rs >> 4) as u32 + 1,
+                        }
+                    }
+
+                    if past_edge {
+                        padding += 1;
+                        let symbols: Vec<u8> = coded.iter().map(|sym| sym.symbol).collect();
+                        assert_eq!(
+                            symbols,
+                            [0, 0],
+                            "block ({x}, {y}) is past the edge: a DC difference of 0 and an end of block"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(padding, 6 * 4 - 5 * 3, "luma blocks past the edge");
+        assert!(next.next().is_none(), "every symbol was walked");
     }
 
     #[test]
