@@ -297,6 +297,43 @@ pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
     Ok(updated)
 }
 
+/// Declare as JPEGs the images the image step converted under their own
+/// names: `paths`, relative to `opf_dir` in the book unpacked at `root`. A
+/// renamed image is declared one by [`update_opf`]. Returns how many entries
+/// changed.
+pub fn declare_jpegs(
+    doc: &Document,
+    root: &Path,
+    opf_dir: &Path,
+    paths: &[String],
+) -> Result<usize> {
+    let converted: HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|path| resolve_href(root, opf_dir, path))
+        .collect();
+    if converted.is_empty() {
+        return Ok(0);
+    }
+
+    let nodes = xml::find_nodes(
+        doc,
+        &format!("//{}/{}", xml::local("manifest"), xml::local("item")),
+    )?;
+
+    let mut changed = 0;
+    for mut node in nodes {
+        let href = decode(&node.get_attribute("href").unwrap_or_default());
+        let is_converted =
+            resolve_href(root, opf_dir, &href).is_some_and(|target| converted.contains(&target));
+        if is_converted && node.get_attribute("media-type").as_deref() != Some("image/jpeg") {
+            node.set_attribute("media-type", "image/jpeg").ok();
+            changed += 1;
+        }
+    }
+
+    Ok(changed)
+}
+
 /// Drop font entries from the manifest. Returns how many went.
 pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result<usize> {
     let font_names: Vec<String> = font_paths

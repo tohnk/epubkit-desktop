@@ -135,6 +135,9 @@ pub struct ProcessedImage {
     pub new_size: usize,
     /// Human-readable account of what was done, for the processing report.
     pub details: String,
+    /// How the format changed, which the report counts images by:
+    /// `PNG→JPEG`, say, or `baseline JPEG` for a JPEG written again.
+    pub conversion: String,
     /// Light Novel mode rotated or split the image, so its proportions no
     /// longer match the source's, nor any size a document gives for it.
     pub reshaped: bool,
@@ -159,14 +162,15 @@ pub fn process_image(
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "image".to_string());
-    let was_jpeg = matches!(
-        Path::new(filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("jpg") | Some("jpeg")
-    );
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("image")
+        .to_ascii_uppercase();
+    let conversion = match extension.as_str() {
+        "JPG" | "JPEG" => "baseline JPEG".to_string(),
+        from => format!("{from}→JPEG"),
+    };
 
     let decoded = decode(bytes).map_err(|e| Error::Image(format!("{filename}: {e}")))?;
 
@@ -189,13 +193,8 @@ pub fn process_image(
     for (index, page) in pages.into_iter().enumerate() {
         let mut details = Vec::new();
 
-        if !was_jpeg {
-            let from = Path::new(filename)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("image")
-                .to_ascii_uppercase();
-            details.push(format!("{from}→JPEG"));
+        if conversion != "baseline JPEG" {
+            details.push(conversion.clone());
         }
 
         let (before_w, before_h) = (page.width(), page.height());
@@ -276,6 +275,7 @@ pub fn process_image(
                 details.join(", ")
             },
             bytes: encoded,
+            conversion: conversion.clone(),
             reshaped,
         });
     }

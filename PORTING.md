@@ -528,6 +528,17 @@ as written, and links to other sites are left alone. A `srcset` is split
 into candidates as the HTML standard splits it, so a URL with a comma in it
 is one URL, and a `data:` URL or another site's is left whole.
 
+### Converted images are counted and declared as what they became
+
+The reference's summary counted images by the first thing said about each,
+meant to be the format change (its own comment gives
+`{"PNG→JPEG": 5, "baseline JPEG": 3}`), but for a JPEG that was how it was
+resized, so a book of JPEGs listed one entry per size. The port counts by
+the format change, a JPEG written again as `baseline JPEG`. And an image
+converted under its own name, a PNG named `plate.jpg` say, is declared
+`image/jpeg` in the manifest as a renamed one is; the reference changed the
+media type only of an image it renamed.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book

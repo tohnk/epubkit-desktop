@@ -448,6 +448,15 @@ fn optimize_book(
     body: &str,
     options: &ProcessingOptions,
 ) -> tempfile::TempDir {
+    optimize_book_with_report(images, body, options).0
+}
+
+/// [`optimize_book`], and what the run reported.
+fn optimize_book_with_report(
+    images: &[(&str, Vec<u8>)],
+    body: &str,
+    options: &ProcessingOptions,
+) -> (tempfile::TempDir, ProcessingReport) {
     let mut manifest = String::new();
     for (index, (href, _)) in images.iter().enumerate() {
         let media_type = if href.to_ascii_lowercase().ends_with(".png") {
@@ -502,11 +511,11 @@ fn optimize_book(
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
     common::write_epub(&input, &entries);
-    process_epub(&input, &output, options, |_, _| {}).unwrap();
+    let report = process_epub(&input, &output, options, |_, _| {}).unwrap();
 
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
-    work
+    (work, report)
 }
 
 /// Where `href`, from the archive directory `base`, leads in the archive,
@@ -1382,4 +1391,89 @@ fn an_image_that_cannot_be_converted_is_counted_in_the_summary() {
         "{summary}"
     );
     assert!(entry_names(&output).contains(&"OEBPS/bad.png".to_string()));
+}
+
+/// The summary counts images by how their format changed. It counted them by
+/// the first thing said about each, which for a JPEG is how it was resized,
+/// so a book of JPEGs listed one entry per size.
+#[test]
+fn the_summary_counts_images_by_format_not_by_size() {
+    let images = [
+        ("images/a.jpg", solid(image::ImageFormat::Jpeg, 40)),
+        ("images/b.jpg", jpeg_of(1200, 1600)),
+        ("images/c.jpg", jpeg_of(900, 1200)),
+        ("images/d.png", solid(image::ImageFormat::Png, 200)),
+    ];
+    let body = "<p>Text.</p>";
+
+    let (_, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 4/4 images (1 PNG→JPEG, 3 baseline JPEG)"),
+        "{summary}"
+    );
+}
+
+fn jpeg_of(width: u32, height: u32) -> Vec<u8> {
+    let image =
+        image::GrayImage::from_fn(width, height, |x, y| image::Luma([((x ^ y) & 0xFF) as u8]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut out),
+            image::ImageFormat::Jpeg,
+        )
+        .expect("encode fixture image");
+    out
+}
+
+/// A converted image is a JPEG whatever it was before, and its manifest entry
+/// has to say so, under its old name too: a PNG named `plate.jpg` and
+/// declared `image/png` came out a JPEG still declared a PNG.
+#[test]
+fn an_image_converted_under_its_own_name_is_declared_a_jpeg() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:in-place</dc:identifier>
+    <dc:title>In place</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="plate.jpg" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>
+<body><p><img src="plate.jpg" alt=""/></p></body></html>
+"#;
+    let png = solid(image::ImageFormat::Png, 120);
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter),
+            ("OEBPS/plate.jpg", &png),
+        ],
+    );
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    let plate = fs::read(work.path().join("OEBPS/plate.jpg")).unwrap();
+    assert_eq!(&plate[..2], &[0xFF, 0xD8], "converted to JPEG");
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    assert!(
+        opf.contains(r#"<item id="plate" href="plate.jpg" media-type="image/jpeg"/>"#),
+        "{opf}"
+    );
 }

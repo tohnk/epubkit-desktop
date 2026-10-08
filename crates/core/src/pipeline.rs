@@ -361,6 +361,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             }
         }
     }
+    // A renamed image's entry is declared a JPEG as it is pointed at its new
+    // file. One that kept its name is a JPEG now all the same.
+    structure::declare_jpegs(&opf, work_dir, &opf_dir, &converted.in_place)?;
 
     // A rotated image or a split spread no longer has the shape its pages
     // describe, and a split one has pages no page shows yet.
@@ -516,6 +519,9 @@ struct ConvertedImages {
     /// For each image Light Novel mode rotated or split: its pages in reading
     /// order, keyed by the first.
     reshaped: BTreeMap<String, Vec<String>>,
+    /// Sources replaced in place by an image of their own name, which no
+    /// rename points the manifest at.
+    in_place: Vec<String>,
 }
 
 /// Convert every image in the manifest.
@@ -533,6 +539,7 @@ fn convert_images<P: FnMut(u8, &str)>(
     let image_options = options.image_options();
     let mut renames = BTreeMap::new();
     let mut reshaped = BTreeMap::new();
+    let mut in_place = Vec::new();
     let mut taken = TakenNames::default();
     report.images_total = images.len();
 
@@ -596,21 +603,15 @@ fn convert_images<P: FnMut(u8, &str)>(
             report.image_details.push(output.details.clone());
         }
 
-        // Counted once per source, however many pages it became. The leading
-        // clause of the details line is the format change, which is what the
-        // summary counts.
+        // Counted once per source, however many pages it became.
         report.images_converted += 1;
         if names.len() > 1 {
             report.spreads_split += 1;
         }
-        let kind = outputs[0]
-            .details
-            .split(',')
-            .next()
-            .unwrap_or("processed")
-            .trim()
-            .to_string();
-        *report.image_formats.entry(kind).or_insert(0) += 1;
+        *report
+            .image_formats
+            .entry(outputs[0].conversion.clone())
+            .or_insert(0) += 1;
 
         if outputs[0].reshaped {
             let pages: Vec<String> = names
@@ -624,6 +625,9 @@ fn convert_images<P: FnMut(u8, &str)>(
                 .collect();
             reshaped.insert(pages[0].clone(), pages);
         }
+        if names[0] == name {
+            in_place.push(relative.clone());
+        }
         renames.insert(relative, names[0].clone());
 
         // The source only goes once its replacement is safely written, and
@@ -633,7 +637,11 @@ fn convert_images<P: FnMut(u8, &str)>(
         }
     }
 
-    Ok(ConvertedImages { renames, reshaped })
+    Ok(ConvertedImages {
+        renames,
+        reshaped,
+        in_place,
+    })
 }
 
 /// Filenames in use, per directory, so that a converted image never lands on
