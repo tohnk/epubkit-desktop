@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use epubkit_core::metadata::{FilenameFormat, FilenameOptions, TEMPLATE_FIELDS};
 use epubkit_core::settings::Settings;
 use epubkit_desktop::commands;
@@ -122,7 +123,8 @@ fn a_cover_comes_back_as_a_data_url_the_page_can_render() {
         .cover
         .expect("the book has a cover");
 
-    assert!(cover.starts_with("data:image/png;base64,"), "{cover}");
+    // A thumbnail, whatever the cover was.
+    assert!(cover.starts_with("data:image/jpeg;base64,"), "{cover}");
 }
 
 /// A bad file must not sink the whole drop — it comes back as one failed entry
@@ -573,4 +575,80 @@ fn a_cover_href_cannot_reach_a_file_outside_the_book() {
     let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
     assert!(book.error.is_none(), "{:?}", book.error);
     assert!(book.cover.is_none(), "the cover came from outside the book");
+}
+
+/// An uncompressed 24-bit BMP of `width` x `height`, a gradient.
+fn bmp(width: u32, height: u32) -> Vec<u8> {
+    let row = (width * 3).div_ceil(4) * 4;
+    let size = 54 + row * height;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 4]); // uncompressed
+    out.extend_from_slice(&(row * height).to_le_bytes());
+    out.extend_from_slice(&[0; 16]);
+    for y in 0..height {
+        let start = out.len();
+        for x in 0..width {
+            out.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 128]);
+        }
+        out.resize(start + row as usize, 0);
+    }
+    out
+}
+
+/// The width and height a baseline JPEG's frame header gives.
+fn jpeg_size(jpeg: &[u8]) -> (u32, u32) {
+    let frame = jpeg
+        .windows(2)
+        .position(|marker| marker == [0xFF, 0xC0])
+        .expect("a baseline JPEG");
+    let height = u16::from_be_bytes([jpeg[frame + 5], jpeg[frame + 6]]);
+    let width = u16::from_be_bytes([jpeg[frame + 7], jpeg[frame + 8]]);
+    (width.into(), height.into())
+}
+
+/// The list shows a cover at a few dozen pixels. Sent whole, every dropped
+/// book's cover, up to 8 MiB each, was held by the page as a data URL and
+/// again decoded at full size.
+#[test]
+fn a_cover_comes_back_as_a_thumbnail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("book.epub");
+    let opf = String::from_utf8(OPF.to_vec()).unwrap().replace(
+        r#"href="cover.png" media-type="image/png""#,
+        r#"href="cover.bmp" media-type="image/bmp""#,
+    );
+    let cover = bmp(1200, 1800);
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover.bmp", &cover),
+        ],
+    );
+
+    let url = inspect(vec![path.to_string_lossy().to_string()])
+        .swap_remove(0)
+        .cover
+        .expect("the book has a cover");
+
+    let (kind, data) = url.split_once(";base64,").expect("a data URL");
+    assert_eq!(kind, "data:image/jpeg");
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("base64");
+    let (width, height) = jpeg_size(&jpeg);
+    assert!(width <= 480 && height <= 720, "{width}x{height}");
+    assert!(jpeg.len() < 200_000, "{} bytes", jpeg.len());
 }

@@ -151,6 +151,24 @@ pub fn should_process(filename: &str) -> bool {
         .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+/// `bytes`, an image, as a JPEG to show it small: in colour, turned as its
+/// EXIF data says, and shrunk to fit within `max_width` x `max_height`.
+///
+/// Shrunk by averaging blocks of pixels, not resampled: at the size a
+/// thumbnail is shown, the two look alike, and averaging takes a third of the
+/// time.
+pub fn thumbnail(bytes: &[u8], max_width: u32, max_height: u32) -> Result<Vec<u8>> {
+    let image = flatten_onto_white(decode(bytes).map_err(|e| Error::Image(e.to_string()))?);
+    let (width, height) = fit_within(image.width(), image.height(), max_width, max_height);
+    let image = if (width, height) != (image.width(), image.height()) {
+        image.thumbnail_exact(width, height)
+    } else {
+        image
+    };
+    // Halved chroma is plenty for a picture this small.
+    encode_baseline_jpeg(&image.to_rgb8(), 80, true)
+}
+
 /// About as much memory as converting `bytes` will hold at once, reckoned
 /// from the size its header gives: the decoded image, and the copies made of
 /// it on the way. Nothing, for what has no header to read.
@@ -676,12 +694,12 @@ fn gray_to_rgb(gray: &GrayImage) -> RgbImage {
 /// interleaved scan into three, which several decoders mishandle. See
 /// [`crate::jpeg`]. The rewrite is lossless and leaves the file's structure
 /// alone; if anything about it fails, the unoptimized file is kept.
-fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, grayscale: bool) -> Result<Vec<u8>> {
+fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, halve_chroma: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut encoder = JpegEncoder::new(&mut out, quality);
 
-    let grey = grayscale || rgb.pixels().all(|p| p[0] == p[1] && p[1] == p[2]);
-    encoder.set_sampling_factor(if grey {
+    let halve_chroma = halve_chroma || rgb.pixels().all(|p| p[0] == p[1] && p[1] == p[2]);
+    encoder.set_sampling_factor(if halve_chroma {
         SamplingFactor::F_2_2
     } else {
         SamplingFactor::F_1_1

@@ -4,7 +4,9 @@
 //! preset means, what the pipeline does, how a filename is derived — lives in
 //! `epubkit-core` so the CLI and the window cannot drift apart.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine;
 use epubkit_core::metadata::{self, MetadataEdits};
@@ -145,11 +147,10 @@ impl BookInfo {
 /// thread, and the window would hang for as long as the books took to read.
 #[tauri::command]
 pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
+    // Making each cover's thumbnail is most of the time a drop takes, so the
+    // books are read a few at a time.
     tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .iter()
-            .map(|path| inspect_one(Path::new(path)))
-            .collect()
+        map_in_parallel(&paths, |path| inspect_one(Path::new(path)))
     })
     .await
     .map_err(to_message)
@@ -186,6 +187,48 @@ fn inspect_one(path: &Path) -> BookInfo {
         cover: preview.cover.as_ref().and_then(cover_data_url),
         error: None,
     }
+}
+
+/// `work` done for each of `items`, on as many threads as the machine runs at
+/// once, the results in the order of `items`.
+fn map_in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(items.len());
+    if threads <= 1 {
+        return items.iter().map(work).collect();
+    }
+
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<Option<R>> = items.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break done;
+                        };
+                        done.push((index, work(item)));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (index, result) in done {
+                results[index] = Some(result);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.expect("every item was worked on"))
+        .collect()
 }
 
 /// A book to process, with any per-book metadata edits the user typed.
@@ -324,10 +367,18 @@ fn file_name(path: &Path) -> String {
 
 /// Encode a cover for display.
 ///
+/// The list shows a cover at a few dozen pixels, so it goes as a thumbnail:
+/// sent whole, every cover in a batch of books was held by the page as a
+/// data URL and again decoded at full size. One that cannot be decoded here
+/// goes as it is, for the page to make what it can of.
+///
 /// The type written into the data URL is always one of a fixed few, never the
 /// book's own string: the page puts the URL in an `<img src>`, and a media
 /// type is whatever the book's author typed.
 fn cover_data_url(cover: &preview::Cover) -> Option<String> {
+    // Plenty for the list's 52 x 72 at any screen density, and about the
+    // width of the band a narrow window shows a cover in.
+    const THUMBNAIL: (u32, u32) = (480, 720);
     let extension = Path::new(&cover.path)
         .extension()
         .and_then(|e| e.to_str())
@@ -348,8 +399,12 @@ fn cover_data_url(cover: &preview::Cover) -> Option<String> {
         },
     };
 
+    let (mime, bytes) = match image::thumbnail(&cover.bytes, THUMBNAIL.0, THUMBNAIL.1) {
+        Ok(thumbnail) => ("image/jpeg", Cow::Owned(thumbnail)),
+        Err(_) => (mime, Cow::Borrowed(&cover.bytes)),
+    };
     Some(format!(
         "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&cover.bytes)
+        base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())
     ))
 }
