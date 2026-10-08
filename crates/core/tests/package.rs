@@ -280,3 +280,100 @@ fn unrecognized_encryption_is_drm() {
 
     assert!(package::has_drm(&input).unwrap());
 }
+
+fn with_encryption(path: &Path, encryption: &[u8]) {
+    common::write_epub(
+        path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("META-INF/encryption.xml", encryption),
+            ("OEBPS/content.opf", common::CONTENT_OPF),
+        ],
+    );
+}
+
+fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+    std::iter::once(0xFEFF)
+        .chain(text.encode_utf16())
+        .flat_map(|unit| {
+            if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            }
+        })
+        .collect()
+}
+
+/// Encryption metadata may be written in UTF-16 as validly as in UTF-8, and
+/// what it says is the same either way.
+#[test]
+fn encryption_metadata_in_utf16_is_read_all_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+
+    for big_endian in [false, true] {
+        for (algorithm, uri, drm) in [
+            (
+                "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+                "OEBPS/chapter1.xhtml",
+                true,
+            ),
+            (
+                "http://www.idpf.org/2008/embedding",
+                "OEBPS/fonts/body.otf",
+                false,
+            ),
+        ] {
+            let text = String::from_utf8(common::encryption_xml(algorithm, uri))
+                .unwrap()
+                .replace(r#"encoding="UTF-8""#, r#"encoding="UTF-16""#);
+            with_encryption(&input, &utf16(&text, big_endian));
+
+            assert_eq!(
+                package::has_drm(&input).unwrap(),
+                drm,
+                "{algorithm} on {uri}, big-endian: {big_endian}"
+            );
+        }
+    }
+}
+
+/// Encryption metadata that cannot be read could be hiding anything, so it is
+/// taken for DRM. A file that declares nothing declares nothing encrypted.
+#[test]
+fn unreadable_encryption_metadata_is_taken_for_drm() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+
+    with_encryption(&input, b"<encryption><EncryptedData");
+    assert!(package::has_drm(&input).unwrap());
+
+    with_encryption(&input, b"");
+    assert!(!package::has_drm(&input).unwrap());
+}
+
+/// Fonts are only obfuscated when the algorithm says so; a font encrypted
+/// for real is DRM like anything else.
+#[test]
+fn an_encrypted_font_is_drm_beside_obfuscated_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+
+    let encryption = br#"<?xml version="1.0" encoding="UTF-8"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#">
+    <EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>
+    <CipherData><CipherReference URI="OEBPS/fonts/body.otf"/></CipherData>
+  </EncryptedData>
+  <EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#">
+    <EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>
+    <CipherData><CipherReference URI="OEBPS/fonts/title.otf"/></CipherData>
+  </EncryptedData>
+</encryption>
+"#;
+    with_encryption(&input, encryption);
+
+    assert!(package::has_drm(&input).unwrap());
+}

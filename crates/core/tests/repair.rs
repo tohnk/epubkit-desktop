@@ -1,3 +1,7 @@
+mod common;
+
+use std::time::Duration;
+
 use epubkit_core::html::{default_backend, HtmlRepair, LibxmlRepair};
 
 fn repair(input: &[u8]) -> (String, bool) {
@@ -227,4 +231,545 @@ fn a_file_with_nothing_in_it_is_refused() {
             "{input:?} was not refused"
         );
     }
+}
+
+/// libxml2 has a serializer of its own for XHTML 1.0, chosen by the doctype
+/// alone. It injects a `<meta http-equiv>`, copies each `<a name>` into an
+/// `id` that duplicates the heading's, and mirrors `lang` into `xml:lang`. A
+/// well-formed chapter comes back as it was.
+#[test]
+fn an_xhtml_1_0_chapter_is_not_rewritten_as_xhtml_1_0_would_be_served() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>T</title></head><body><h2 id="chap01"><a name="chap01"></a>One</h2><p>Text.<br/>More.</p></body></html>
+"#;
+
+    let repaired = LibxmlRepair::new().repair(input).unwrap();
+    let out = String::from_utf8(repaired.bytes).unwrap();
+
+    assert!(!repaired.recovered);
+    assert!(!out.contains("http-equiv"), "{out}");
+    assert_eq!(out.matches(r#"id="chap01""#).count(), 1, "{out}");
+    assert!(!out.contains("xml:lang"), "{out}");
+    assert!(out.contains("<br/>"), "{out}");
+}
+
+/// A strict re-read of what repair produced: every chapter it hands on has to
+/// be well-formed XHTML, or each later pass recovers it all over again.
+fn assert_well_formed(out: &str) {
+    epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+}
+
+/// A NUL cost libxml2 2.9 everything after it, and other control characters
+/// went missing between words or into attributes raw. They are spaces now,
+/// under every release.
+#[test]
+fn control_characters_cost_nothing_around_them() {
+    let (out, _) = repair(
+        b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>One.</p>\0<p>Two.</p>\
+          <p class=\"a\x0bb\">Line\x0bone\x0cline\x07two\x1bdone.</p><p>Last.<br></p></body></html>",
+    );
+
+    for text in ["One.", "Two.", "Line one line two done.", "Last."] {
+        assert!(out.contains(text), "{text:?} is missing:\n{out}");
+    }
+    assert_well_formed(&out);
+}
+
+/// A byte order mark that went through windows-1252 and back, "ï»¿", or a
+/// stray U+FEFF after the declaration, sits before the root element. The
+/// HTML parser took it for body text, opened an implied `<html><body>` and
+/// dropped the real `<html>` and `<head>` with their namespace and language.
+#[test]
+fn a_stray_byte_order_mark_does_not_cost_the_chapter_its_head() {
+    for start in ["\u{ef}\u{bb}\u{bf}", "\u{feff}\u{feff}", ""] {
+        for between in ["", "\u{feff}", "\n\u{feff}\n"] {
+            let chapter = format!(
+                "{start}<?xml version=\"1.0\" encoding=\"utf-8\"?>{between}<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"de\"><head><title>Titel</title><link rel=\"stylesheet\" type=\"text/css\" href=\"s.css\"/></head><body><p>Text.<br></p></body></html>"
+            );
+            let (out, _) = repair(chapter.as_bytes());
+
+            assert!(
+                out.contains(r#"<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="de"><head>"#),
+                "{start:?} {between:?}:\n{out}"
+            );
+            assert!(
+                !out.contains('\u{feff}') && !out.contains('\u{ef}'),
+                "{out}"
+            );
+            assert_well_formed(&out);
+        }
+    }
+}
+
+/// libxml2's HTML parser cannot read a DOCTYPE's internal subset, and stops it
+/// at the first `>`; the rest of the declarations became text. The entities
+/// such a subset declares are filled in.
+#[test]
+fn an_internal_subset_is_read_before_recovery() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> <!ENTITY copy '&#169;'> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>By &author;, &copy; 2001 &amp; ever since.<br></p></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(
+        out.contains("By Jane Doe, \u{a9} 2001 &amp; ever since."),
+        "{out}"
+    );
+    assert!(!out.contains("ENTITY"), "{out}");
+    assert_well_formed(&out);
+}
+
+/// The subset is read as XML reads it: a declaration in a comment declares
+/// nothing, the first of two for one name is the one that counts, and a `]`
+/// or `>` in a quoted value or a comment ends nothing.
+#[test]
+fn an_internal_subset_declares_what_xml_says_it_does() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!-- <!ENTITY name "Commented"> ]> --> <!ENTITY name "First"> <!ENTITY name "Second"> <!ENTITY mark "]>"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>By &name; &mark;<br></p></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(out.contains("By First ]&gt;"), "{out}");
+    for gone in ["Commented", "Second", "ENTITY"] {
+        assert!(!out.contains(gone), "{gone}: {out}");
+    }
+    assert_well_formed(&out);
+}
+
+/// An entity is filled in as XML fills it in: the entities it refers to are
+/// filled in too, and none is in a CDATA section, a comment or a processing
+/// instruction, whose text a reference there is. Filled in once, `By
+/// &author;` read so, and filled in everywhere, a script's string changed.
+#[test]
+fn entities_are_filled_in_where_xml_fills_them_in() {
+    let (out, recovered) = repair(
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> <!ENTITY byline "By &author;"> <!ENTITY credit "&byline;, 2001"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><script type="text/javascript"><![CDATA[var who = "&author;";]]></script></head><body><p>&credit;<br></p><!-- &author; --><?note &author;?></body></html>
+"#,
+    );
+
+    assert!(recovered);
+    assert!(out.contains("<p>By Jane Doe, 2001<br/></p>"), "{out}");
+    assert!(out.contains("var who = \"&author;\";"), "{out}");
+    assert!(out.contains("<!-- &author; -->"), "{out}");
+    // libxml2 2.9's HTML parser ends a processing instruction at its `>`, and
+    // 2.14's makes it a comment.
+    assert!(out.contains("note &author;"), "{out}");
+    assert_well_formed(&out);
+}
+
+/// The text of the first element named `name` in `out`, entities and all, as
+/// XML reads it.
+fn text_of(out: &str, name: &str) -> String {
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    let found = epubkit_core::xml::find_nodes(&doc, &format!("//*[local-name()='{name}']"))
+        .expect("a query that runs");
+    found
+        .first()
+        .unwrap_or_else(|| panic!("no {name} in {out}"))
+        .get_content()
+}
+
+/// A subset declares what XML reads it to declare, recovered or not: a
+/// declaration in a parameter entity's value declares nothing until the
+/// entity is used, and then declares it there, first; a character reference
+/// in a value is replaced as the declaration is read, so `&#38;word;` refers
+/// to `word` where `&amp;word;` reads "&word;"; and a declaration after a
+/// parameter entity that is never read still counts, as libxml2 counts it.
+/// Found in the subset's text, the declaration written in an unused
+/// parameter entity's value counted first, and `&#38;word;` was read as text.
+#[test]
+fn a_subset_declares_what_xml_reads_it_to_declare() {
+    let cases = [
+        (
+            r#"<!ENTITY % unused "<!ENTITY author 'Wrong'>"> <!ENTITY author "Right">"#,
+            "Right",
+        ),
+        (
+            r#"<!ENTITY % used "<!ENTITY author 'First'>"> %used; <!ENTITY author "Second">"#,
+            "First",
+        ),
+        (
+            r#"<!ENTITY % a "<!ENTITY author 'Nested'>"> <!ENTITY % b "&#37;a;"> %b;"#,
+            "Nested",
+        ),
+        (
+            r#"<!ENTITY % far SYSTEM "far.dtd"> %far; <!ENTITY author "After">"#,
+            "After",
+        ),
+        (
+            r#"<!ENTITY word "Right"> <!ENTITY author "&#38;word;">"#,
+            "Right",
+        ),
+        (
+            r#"<!ENTITY word "Wrong"> <!ENTITY author "&amp;word;">"#,
+            "&word;",
+        ),
+    ];
+    for (subset, expected) in cases {
+        // Well-formed, libxml2 reads the subset; with a markup error, recovery does.
+        for markup_error in [false, true] {
+            let br = if markup_error { "<br>" } else { "<br/>" };
+            let chapter = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [{subset}]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&author;{br}</p></body></html>
+"#
+            );
+            let (out, recovered) = repair(chapter.as_bytes());
+            assert_eq!(recovered, markup_error, "{subset}");
+            assert_eq!(text_of(&out, "p"), expected, "{subset}{br}: {out}");
+        }
+    }
+}
+
+/// The attributes of the first element named `name` in `out`, in order, as
+/// XML reads them.
+fn attributes_of(out: &str, name: &str) -> Vec<(String, String)> {
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes())
+        .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    let found = epubkit_core::xml::find_nodes(&doc, &format!("//*[local-name()='{name}']"))
+        .expect("a query that runs");
+    let element = found
+        .first()
+        .unwrap_or_else(|| panic!("no {name} in {out}"));
+    let mut attributes: Vec<(String, String)> = element.get_attributes().into_iter().collect();
+    attributes.sort();
+    attributes
+}
+
+/// What an entity stands for, filled into an attribute value, is text of the
+/// value, whichever quotes are around it: XML takes a quote in it for a
+/// character, never for the value's end. Filled in as written, the `"` that
+/// `&#34;` stands for ended `title="Say &q; now"` after "Say ", and "Right"
+/// and "now" became attributes of their own.
+#[test]
+fn an_entity_filled_into_an_attribute_value_stays_in_it() {
+    let cases = [
+        (
+            r#"<!ENTITY q "&#34;Right&#34;">"#,
+            r#"title="Say &q; now""#,
+            r#"Say "Right" now"#,
+        ),
+        (
+            r#"<!ENTITY q "&#39;Right&#39;">"#,
+            "title='Say &q; now'",
+            "Say 'Right' now",
+        ),
+        (
+            r#"<!ENTITY quote "&#34;"> <!ENTITY q "&quote;Right&quote;">"#,
+            r#"title="Say &q; now""#,
+            r#"Say "Right" now"#,
+        ),
+    ];
+    for (subset, attribute, expected) in cases {
+        // Well-formed, libxml2 fills the value in; with a markup error,
+        // recovery does.
+        for markup_error in [false, true] {
+            let br = if markup_error { "<br>" } else { "<br/>" };
+            let chapter = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [{subset}]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p {attribute}>Text{br}</p></body></html>
+"#
+            );
+            let (out, recovered) = repair(chapter.as_bytes());
+            assert_eq!(recovered, markup_error, "{subset}");
+            assert_eq!(
+                attributes_of(&out, "p"),
+                [("title".to_string(), expected.to_string())],
+                "{subset} {attribute}{br}: {out}"
+            );
+        }
+    }
+
+    // White space it stands for is a space, as XML reads an attribute's
+    // value; and a value without quotes, which only the HTML parser reads,
+    // keeps all of it, spaces and all.
+    for (attribute, expected) in [
+        (r#"title="&q;""#, "two lines here"),
+        ("title=&q;", "two lines here"),
+    ] {
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [<!ENTITY q "two&#10;lines here">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p {attribute}>Text<br></p></body></html>
+"#
+        );
+        let (out, recovered) = repair(chapter.as_bytes());
+        assert!(recovered);
+        assert_eq!(
+            attributes_of(&out, "p"),
+            [("title".to_string(), expected.to_string())],
+            "{attribute}: {out}"
+        );
+    }
+}
+
+/// In a chapter the HTML parser recovers, a `<!--`, a `<![CDATA[` or a `<?`
+/// in a quoted attribute value is the value's text, and an entity beside it
+/// is filled in as in any value. Taken for the start of a comment, it kept
+/// `&word;` from being filled in, and the value read "<!-- &word; -->".
+#[test]
+fn an_entity_in_an_attribute_is_filled_in_whatever_the_value_holds() {
+    for value in ["<!-- &word; -->", "<![CDATA[&word;]]>", "<? &word; ?>"] {
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [<!ENTITY word "Right">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p title="{value}">Body<br></p></body></html>
+"#
+        );
+        let (out, recovered) = repair(chapter.as_bytes());
+        assert!(recovered, "{value}");
+        let doc = epubkit_core::xml::parse_strict(out.as_bytes()).expect("well-formed");
+        let p = epubkit_core::xml::find_nodes(&doc, "//*[local-name()='p']").unwrap();
+        assert_eq!(
+            p[0].get_attribute("title").as_deref(),
+            Some(value.replace("&word;", "Right").as_str()),
+            "{out}"
+        );
+    }
+}
+
+/// A CDATA section or processing instruction that never ends holds nothing,
+/// and the HTML parser reads on past it, entities and all. Each kind is looked
+/// for to its end once: from every one that never ended, the time to fill a
+/// chapter in grew with the square of how many there were.
+#[test]
+fn what_never_ends_holds_no_entity() {
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY author "Jane Doe"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>if a <? b</p><p>by &author;<br></p><p>{}</p></body></html>
+"#,
+        "word <?pi> word <![CDATA[cd> ".repeat(20_000)
+    );
+
+    let (out, recovered) =
+        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
+
+    assert!(recovered);
+    assert!(out.contains("<p>by Jane Doe<br/></p>"), "{}", &out[..2000]);
+    assert_well_formed(&out);
+}
+
+/// An entity that refers to itself, which XML refuses, stays as written; the
+/// others are filled in. Filled in as far as it went, it was a heap of text
+/// with references left in it, and taken one reference after another, it was
+/// filled in for as long as the reference doubled at each step took.
+#[test]
+fn an_entity_that_refers_to_itself_stays_as_written() {
+    let (out, recovered) = common::finishes_within(Duration::from_secs(20), || {
+        repair(
+            br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html [ <!ENTITY loop "&loop;&loop;"> <!ENTITY author "Jane Doe"> ]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&loop; by &author;<br></p></body></html>
+"#,
+        )
+    });
+
+    assert!(recovered);
+    assert!(out.contains("<p>&amp;loop; by Jane Doe<br/></p>"), "{out}");
+    assert_well_formed(&out);
+}
+
+fn nested(depth: usize, closed: bool) -> String {
+    let mut chapter = String::from(
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>"#,
+    );
+    for n in 1..=depth {
+        chapter.push_str(&format!(r#"<div class="para">Paragraph {n}."#));
+    }
+    if closed {
+        chapter.push_str(&"</div>".repeat(depth));
+    }
+    chapter.push_str("<p>THE END</p></body></html>");
+    chapter
+}
+
+/// libxml2 stops at 256 levels of nesting and hands back what it has. 300
+/// `<div>`s nobody closed came back as 255, the rest of the chapter gone, and
+/// a well-formed chapter nested that deep lost all its text; both counted as
+/// repaired.
+#[test]
+fn deep_nesting_is_not_cut_short() {
+    for closed in [false, true] {
+        let (out, _) = repair(nested(300, closed).as_bytes());
+
+        assert!(out.contains("Paragraph 300."), "closed: {closed}\n{out}");
+        assert!(out.contains("THE END"), "closed: {closed}\n{out}");
+        // Read back past the strict parser's own 256 levels.
+        let deep = libxml::parser::ParserOptions {
+            huge: true,
+            ..libxml::parser::ParserOptions::default()
+        };
+        libxml::parser::Parser::default()
+            .parse_string_with_options(&out, deep)
+            .unwrap_or_else(|e| panic!("not well-formed ({e}):\n{out}"));
+    }
+}
+
+/// Past even the raised limit, recovery would lose the rest of the chapter.
+/// It refuses instead, which leaves the chapter as it was; it never hands
+/// back part of one. (libxml2 2.9 recovers this depth whole; 2.14 stops at
+/// 2048 levels and has to refuse.)
+#[test]
+fn recovery_never_hands_back_part_of_a_chapter() {
+    if let Ok(out) = LibxmlRepair::new().repair(nested(5000, false).as_bytes()) {
+        let out = String::from_utf8(out.bytes).unwrap();
+        assert!(out.contains("Paragraph 5000."), "truncated");
+        assert!(out.contains("THE END"), "truncated");
+    }
+}
+
+/// What the HTML parser recovers is not always legal XML: a comment may hold
+/// `--`, and under libxml2 2.14 a bare `<` in prose opens an element whose
+/// "attributes" are the words after it. Written out as it stood, the chapter
+/// was malformed again, so every later pass recovered it anew and each run
+/// counted it as repaired once more.
+#[test]
+fn recovered_output_is_legal_xml_whatever_was_recovered() {
+    let (out, _) = repair(
+        br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<!-- ======== Chapter 1 -- start ======== -->
+<p>if i<n && ok, go on.</p><p>Next.<br></p><!-- trailing dash- -->
+</body></html>"#,
+    );
+
+    assert!(out.contains("Chapter 1"), "{out}");
+    assert!(out.contains("Next."), "{out}");
+    assert_well_formed(&out);
+}
+
+/// The HTML parser keeps a stylesheet's text as it stands, the author's own
+/// `<![CDATA[` included, and the XML writer then wrapped all of it in a
+/// CDATA section of its own. The CSS began with `<![CDATA[`, and its first
+/// rule was lost to it.
+#[test]
+fn a_stylesheet_in_cdata_survives_recovery() {
+    let (out, recovered) = repair(
+        br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css"><![CDATA[
+p.first { text-indent: 0 }
+h1 { margin: 0 }
+]]></style></head><body><p class="first">One & two.</p></body></html>"#,
+    );
+    assert!(recovered);
+
+    let doc = epubkit_core::xml::parse_strict(out.as_bytes()).unwrap();
+    let style = epubkit_core::xml::find_first(&doc, "//*[local-name()='style']")
+        .unwrap()
+        .unwrap()
+        .get_content();
+    assert!(!style.contains("CDATA"), "{style:?}\n{out}");
+    assert!(style.trim_start().starts_with("p.first"), "{style:?}");
+    assert!(style.contains("h1 { margin: 0 }"), "{style:?}");
+}
+
+/// HTML is case-insensitive and its parser lowercases every name, but SVG's
+/// are camelCase. `viewbox` and `<lineargradient>` mean nothing to an SVG
+/// renderer, so a recovered illustration lost its scaling and gradients.
+#[test]
+fn svg_and_mathml_names_keep_their_case_through_recovery() {
+    let (out, recovered) = repair(
+        br#"<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>&nbsp;</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50" preserveAspectRatio="xMidYMid meet"><defs><linearGradient id="g" gradientUnits="userSpaceOnUse"><stop offset="0"/></linearGradient><clipPath id="c"><rect width="1" height="1"/></clipPath></defs><foreignObject width="1" height="1"/><text textLength="10">x</text></svg>
+<math xmlns="http://www.w3.org/1998/Math/MathML"><csymbol definitionURL="http://example.org/f">f</csymbol></math>
+</body></html>"#,
+    );
+    assert!(recovered);
+
+    for name in [
+        "viewBox=",
+        "preserveAspectRatio=",
+        "<linearGradient ",
+        "gradientUnits=",
+        "<clipPath ",
+        "<foreignObject ",
+        "textLength=",
+        "definitionURL=",
+    ] {
+        assert!(out.contains(name), "{name} lost its case:\n{out}");
+    }
+    assert_well_formed(&out);
+}
+
+/// Names put back in their case stay where they were, so a recovered chapter
+/// comes out the same every time. They were taken out and added again, in
+/// whatever order a hash map gave them.
+#[test]
+fn restoring_case_keeps_the_order_of_attributes() {
+    let chapter = br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body><p>x<br></p>
+<svg xmlns="http://www.w3.org/2000/svg" viewbox="0 0 100 50" width="100%" preserveaspectratio="xMidYMid meet" textlength="1"><rect width="1" height="1"/></svg>
+</body></html>"#;
+
+    for _ in 0..20 {
+        let (out, recovered) = repair(chapter);
+        assert!(recovered);
+        assert!(
+            out.contains(r#"viewBox="0 0 100 50" width="100%" preserveAspectRatio="xMidYMid meet" textLength="1""#),
+            "{out}"
+        );
+    }
+}
+
+/// Finding where the root element starts passes each declaration before it
+/// once. Each was searched for an internal subset to the end of the chapter,
+/// so 160,000 of them took seconds; and then each subset for the end of a
+/// comment or processing instruction in it that never ends.
+#[test]
+fn declarations_before_the_root_are_passed_once() {
+    for (declaration, count) in [
+        ("<!x>", 400_000),
+        ("<!x [<!-- >] ", 100_000),
+        ("<!x [<? >] ", 100_000),
+    ] {
+        let chapter = format!(
+            "{}<html><head><title>T</title></head><body><p>Text</p></body></html>",
+            declaration.repeat(count)
+        );
+
+        let repaired = common::finishes_within(Duration::from_secs(20), move || {
+            LibxmlRepair::new().repair(chapter.as_bytes())
+        });
+        match repaired {
+            Ok(repaired) => {
+                let out = String::from_utf8(repaired.bytes).unwrap();
+                assert!(
+                    out.contains("<p>Text</p>"),
+                    "{declaration}: {}",
+                    &out[..200]
+                );
+            }
+            // libxml2 2.9's HTML parser takes the `<!--` for a comment that
+            // never ends, and a chapter that lost its text to it is refused.
+            Err(error) => assert_eq!(declaration, "<!x [<!-- >] ", "{error}"),
+        }
+    }
+}
+
+/// A recovered chapter is made legal XML in time that grows with it. Its
+/// comments were found by a query that libxml2 sorts, which took time growing
+/// with the square of a long run of them with no element between.
+#[test]
+fn a_long_run_of_comments_is_made_legal_in_one_pass() {
+    let comments = 80_000;
+    let chapter = format!(
+        "<html><head><title>T</title></head><body><p>Text<br></p>{}</body></html>",
+        "<!--x-->".repeat(comments)
+    );
+
+    let (out, recovered) =
+        common::finishes_within(Duration::from_secs(20), move || repair(chapter.as_bytes()));
+    assert!(recovered);
+    assert_eq!(out.matches("<!--x-->").count(), comments);
 }

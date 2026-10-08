@@ -279,12 +279,13 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         metadata::update_metadata(&opf, &options.metadata_edits)?;
     }
 
-    let content = structure::find_content_files(&opf_dir, &opf)?;
+    let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;
 
     // --- images (15-60%) -------------------------------------------------
     progress(15, "Processing images...");
     let converted = convert_images(
         &content.images,
+        work_dir,
         &opf_dir,
         options,
         &mut report,
@@ -325,18 +326,25 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     progress(66, "Fixing SVG covers...");
-    report.svg_covers_fixed = structure::fix_svg_covers(&opf_dir, &opf)?;
+    report.svg_covers_fixed = structure::fix_svg_covers(work_dir, &opf_dir, &opf)?;
 
     progress(68, "Updating references...");
     let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
-        structure::update_opf(&opf, &rename_map)?;
+        // Indexed once, not for each document.
+        let renames = structure::Renames::new(work_dir, &opf_dir, &rename_map);
+        structure::update_opf(&opf, &renames)?;
         for &path in &chapters {
-            structure::update_xhtml_references(&opf_dir, path, &rename_map)?;
+            structure::update_xhtml_references(path, &renames)?;
+        }
+        // An SVG document names images as a chapter does. One that is not
+        // well-formed is left as it is.
+        for path in svg_documents(&content) {
+            structure::update_svg_references(path, &renames).ok();
         }
         for path in &content.css {
             if path.is_file() {
-                structure::update_css_references(&opf_dir, path, &rename_map)?;
+                structure::update_css_references(path, &renames)?;
             }
         }
     }
@@ -346,8 +354,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !converted.reshaped.is_empty() {
         progress(72, "Showing reshaped pages...");
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
+        let reshaped = structure::ReshapedPages::new(work_dir, &opf_dir, &converted.reshaped);
         for &path in &chapters {
-            structure::show_reshaped_pages(&opf_dir, path, &converted.reshaped)?;
+            structure::show_reshaped_pages(path, &reshaped)?;
         }
     }
 
@@ -357,6 +366,13 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for &path in &chapters {
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             used.merge(&css::collect_used_selectors(&bytes)?);
+        }
+        // An SVG document can use a stylesheet's rules as much as a chapter.
+        for path in svg_documents(&content) {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            if let Ok(used_here) = css::collect_used_selectors(&bytes) {
+                used.merge(&used_here);
+            }
         }
 
         for path in &content.css {
@@ -381,12 +397,21 @@ pub fn process_epub<P: FnMut(u8, &str)>(
             }
             let stylesheet = css::read_stylesheet(path)?;
             let (cleaned, removed) = css::remove_embedded_fonts(&stylesheet);
-            report.fonts_removed += removed;
             if removed > 0 {
                 fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
             }
         }
 
+        // A chapter may declare a font in a <style> of its own.
+        for &path in &chapters {
+            let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+            let (cleaned, removed) = css::remove_embedded_fonts_from_styles(&bytes)?;
+            if removed > 0 {
+                fs::write(path, cleaned).map_err(|e| Error::io(path, e))?;
+            }
+        }
+
+        // Fonts are counted, not the rules that named them.
         for path in &content.fonts {
             if path.is_file() && fs::remove_file(path).is_ok() {
                 report.fonts_removed += 1;
@@ -394,6 +419,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
 
         structure::update_opf_remove_fonts(&opf, &content.fonts)?;
+        // encryption.xml lists obfuscated fonts, which are gone now.
+        package::forget_missing_encrypted_files(work_dir)?;
     }
 
     progress(82, "Normalizing content...");
@@ -409,6 +436,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         progress(85, "Cleaning text content...");
         let text_options = TextCleanOptions {
             normalize_quotes: options.normalize_quotes,
+            language: metadata::extract_metadata(&opf)?.language,
             ..TextCleanOptions::default()
         };
 
@@ -429,7 +457,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     progress(90, "Checking TOC...");
-    let toc = structure::fix_toc(&opf_dir, &opf)?;
+    let toc = structure::fix_toc(work_dir, &opf_dir, &opf)?;
     report.toc_status = toc.describe();
 
     // Every OPF edit lands in one write, rather than the reference's dozen.
@@ -458,6 +486,15 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
 // ---------------------------------------------------------------- internals
 
+/// The SVG documents in a book that are there to read.
+fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Path> {
+    content
+        .svg
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
+}
+
 /// What the image step leaves for the steps after it. Paths are relative to
 /// the OPF's directory.
 struct ConvertedImages {
@@ -471,6 +508,7 @@ struct ConvertedImages {
 /// Convert every image in the manifest.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
+    root: &Path,
     opf_dir: &Path,
     options: &ProcessingOptions,
     report: &mut ProcessingReport,
@@ -502,6 +540,12 @@ fn convert_images<P: FnMut(u8, &str)>(
         if !image::should_process(&name) {
             continue;
         }
+        // What the rename map calls the image: its path from the OPF's
+        // directory, which may climb out of it. An image the map could not
+        // name would lose its references, so it is left as it is.
+        let Some(relative) = structure::relative_path(root, opf_dir, path) else {
+            continue;
+        };
 
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
 
@@ -554,22 +598,19 @@ fn convert_images<P: FnMut(u8, &str)>(
             .to_string();
         *report.image_formats.entry(kind).or_insert(0) += 1;
 
-        if let Ok(relative) = path.strip_prefix(opf_dir) {
-            let source = relative.to_string_lossy().replace('\\', "/");
-            if outputs[0].reshaped {
-                let pages: Vec<String> = names
-                    .iter()
-                    .map(|page| {
-                        relative
-                            .with_file_name(page)
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    })
-                    .collect();
-                reshaped.insert(pages[0].clone(), pages);
-            }
-            renames.insert(source, names[0].clone());
+        if outputs[0].reshaped {
+            let pages: Vec<String> = names
+                .iter()
+                .map(|page| {
+                    Path::new(&relative)
+                        .with_file_name(page)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            reshaped.insert(pages[0].clone(), pages);
         }
+        renames.insert(relative, names[0].clone());
 
         // The source only goes once its replacement is safely written, and
         // never when the replacement took its place.

@@ -248,7 +248,6 @@ fn a_book_is_written_under_the_chosen_name() {
         &job(&book),
         out.path(),
         &naming(FilenameFormat::TitleAuthor),
-        0,
         |_, _| {},
     );
 
@@ -279,7 +278,6 @@ fn keeping_the_original_name_never_replaces_the_original() {
         &job(&book),
         dir.path(),
         &naming(FilenameFormat::Original),
-        0,
         |_, _| {},
     );
 
@@ -287,6 +285,109 @@ fn keeping_the_original_name_never_replaces_the_original() {
     let output = PathBuf::from(outcome.output.expect("a book was written"));
     assert_eq!(output.file_name().unwrap(), "book (2).epub");
     assert_eq!(std::fs::read(&book).unwrap(), before);
+}
+
+/// The demo book under another title, to tell two books' outputs apart.
+fn titled_epub(path: &Path, title: &str) {
+    let opf = String::from_utf8(OPF.to_vec())
+        .unwrap()
+        .replace("The Long Afternoon", title);
+    write_epub(
+        path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover.png", PNG),
+        ],
+    );
+}
+
+fn title_of(epub: &str) -> String {
+    epubkit_core::preview::read_preview(Path::new(epub), 0)
+        .unwrap()
+        .metadata
+        .title
+}
+
+/// A run that fails takes nothing with it but what it made itself.
+#[test]
+fn a_failed_run_removes_nothing_it_did_not_make() {
+    let out = tempfile::tempdir().unwrap();
+    let bystander = out.path().join(".epubkit-0.part");
+    std::fs::write(&bystander, b"someone else's file").unwrap();
+
+    let outcome = commands::optimize_one(
+        &job(&out.path().join("missing.epub")),
+        out.path(),
+        &naming(FilenameFormat::AuthorTitle),
+        |_, _| {},
+    );
+
+    assert!(outcome.error.is_some());
+    assert!(
+        std::fs::read(&bystander).ok().as_deref() == Some(b"someone else's file".as_slice()),
+        "a file the run did not make was removed or changed"
+    );
+}
+
+/// A book is written to a file of its own making, not through a link that
+/// happens to sit where it might have been written.
+#[cfg(unix)]
+#[test]
+fn a_book_is_not_written_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book.epub");
+    demo_epub(&book);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let precious = elsewhere.path().join("precious.txt");
+    std::fs::write(&precious, b"precious").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&precious, out.path().join(".epubkit-0.part")).unwrap();
+
+    let outcome = commands::optimize_one(
+        &job(&book),
+        out.path(),
+        &naming(FilenameFormat::AuthorTitle),
+        |_, _| {},
+    );
+
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(std::fs::read(&precious).unwrap(), b"precious");
+}
+
+/// Two runs into one folder, the second finishing inside the first, each
+/// end up with their own book under their own name.
+#[test]
+fn runs_side_by_side_keep_their_own_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.epub");
+    let second = dir.path().join("second.epub");
+    demo_epub(&first);
+    titled_epub(&second, "Another Book");
+    let out = tempfile::tempdir().unwrap();
+    let settings = naming(FilenameFormat::TitleAuthor);
+
+    let mut inner = None;
+    let outer = commands::optimize_one(&job(&first), out.path(), &settings, |percent, _| {
+        if percent == 100 && inner.is_none() {
+            inner = Some(commands::optimize_one(
+                &job(&second),
+                out.path(),
+                &settings,
+                |_, _| {},
+            ));
+        }
+    });
+    let inner = inner.expect("the second run happened");
+
+    for (outcome, title) in [(&outer, "The Long Afternoon"), (&inner, "Another Book")] {
+        assert!(outcome.error.is_none(), "{title}: {:?}", outcome.error);
+        let written = outcome.output.as_ref().unwrap();
+        assert!(written.contains(title), "{title} was written as {written}");
+        assert_eq!(title_of(written), title);
+    }
 }
 
 /// The page asks before a run whether a template will do, and shows the

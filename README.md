@@ -23,7 +23,7 @@ epubkit runs this pipeline on every EPUB:
 | 11 | **Remove unused CSS** — collects all used classes/IDs/elements across XHTML files, then strips CSS rules that don't match anything |
 | 12 | **Remove embedded fonts** — deletes @font-face rules from CSS, removes font files (.ttf, .otf, .woff, .woff2), and cleans them from the OPF manifest |
 | 13 | **Normalize whitespace** — strips excessive empty paragraphs/divs, adds CSS page-break-before to chapter headings (h1, h2) |
-| 14 | **Text cleanup** — scans all text nodes (skipping script/style/pre/code) and fixes: double spaces, OCR ligature artifacts (fi/fl/ffi/ffl/ff), smart quotes → straight quotes, mojibake encoding errors, punctuation issues, Unicode NFC normalization |
+| 14 | **Text cleanup** — scans all text nodes (skipping script, style, pre, code and other literal text) and fixes: double spaces, OCR ligature artifacts (fi/fl/ffi/ffl/ff), smart quotes → straight quotes, mojibake encoding errors, punctuation issues, Unicode NFC normalization |
 | 15 | **Clean metadata** — strips store-specific tags (Calibre, iBooks, Kindle, Amazon, Google Play, Kobo) |
 | 16 | **Fix TOC** — validates the Table of Contents, generates one from chapter headings if missing |
 | 17 | **Clean OS artifacts** — removes .DS_Store, Thumbs.db, __MACOSX, desktop.ini, etc. |
@@ -137,12 +137,12 @@ Note: stock Xteink firmware (X3 and X4 alike) does not render images inside EPUB
 
 ## Text cleanup details
 
-Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`):
+Scans all XHTML text nodes (skipping `<script>`, `<style>`, `<pre>`, `<code>`, `<kbd>`, `<samp>`, `<tt>`, `<var>` and MathML):
 
-- **Whitespace**: Multiple spaces/tabs → single space, removes spaces before punctuation
+- **Whitespace**: Multiple spaces/tabs between words → single space, removes plain spaces before punctuation that ends a word (French spacing and no-break spaces are left alone)
 - **OCR ligatures**: fi (U+FB01), fl (U+FB02), ffi (U+FB03), ffl (U+FB04), ff (U+FB00) → plain ASCII
 - **Smart quotes**: Typographic quotes/dashes → straight equivalents
-- **Mojibake**: Detects and repairs common UTF-8/Latin-1 double-encoding patterns
+- **Mojibake**: Detects and repairs common UTF-8/Latin-1 double-encoding patterns, and Word's punctuation written as Latin-1 control characters (`&#146;`)
 - **Punctuation**: 4+ dots → ellipsis, missing space after sentence-ending punctuation, duplicate commas
 - **Unicode**: NFC normalization
 
@@ -153,7 +153,7 @@ Rust: a library, a command-line tool, and a desktop app.
 - **[Tauri](https://tauri.app/)** — the desktop window, drawn by the system's own webview
 - **[libxml2](https://gitlab.gnome.org/GNOME/libxml2)** — XML/XHTML parsing and repair, via the `libxml` crate
 - **[image](https://crates.io/crates/image)** — decoding and Lanczos resampling
-- **[lightningcss](https://lightningcss.dev/)** — CSS parsing and cleanup
+- **[cssparser](https://crates.io/crates/cssparser)** — CSS tokenizing, to clean stylesheets without rewriting what stays
 - **[zip](https://crates.io/crates/zip)** — EPUB container handling
 
 This began as a Python/FastAPI web app. The port is described in

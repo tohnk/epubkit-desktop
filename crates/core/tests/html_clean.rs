@@ -32,11 +32,25 @@ fn strips_data_and_aria_attributes() {
 
 #[test]
 fn strips_interaction_attributes() {
-    let (out, removed) = strip(r#"<div role="doc-chapter" tabindex="0" hidden="hidden">X</div>"#);
+    let (out, removed) = strip(r#"<div role="doc-chapter" tabindex="0" accesskey="c">X</div>"#);
     assert_eq!(removed, 3);
     assert!(!out.contains("role="), "{out}");
     assert!(!out.contains("tabindex"), "{out}");
-    assert!(!out.contains("hidden"), "{out}");
+    assert!(!out.contains("accesskey"), "{out}");
+}
+
+/// Writing direction and whether something is shown at all are rendering, not
+/// interaction. Without `dir`, an Arabic or Hebrew book runs left to right;
+/// without `hidden`, a navigation document shows its landmarks list.
+#[test]
+fn direction_and_visibility_are_kept() {
+    let (out, removed) = strip(
+        r#"<p dir="rtl">x</p><nav hidden="">y</nav><div inert="">z</div><div popover="">w</div>"#,
+    );
+    assert_eq!(removed, 0, "{out}");
+    for attribute in ["dir=", "hidden=", "inert=", "popover="] {
+        assert!(out.contains(attribute), "{attribute} was dropped:\n{out}");
+    }
 }
 
 #[test]
@@ -112,6 +126,42 @@ fn whitespace_only_paragraphs_count_as_empty() {
     assert_eq!(removed, 2);
 }
 
+/// Under an XHTML 1.1 doctype, which is never loaded, `&bull;` and `&mdash;`
+/// stay entity references, and a paragraph made of them has no text as such.
+/// A scene-break ornament is content all the same. A paragraph holding only
+/// a no-break space is still spacing.
+#[test]
+fn paragraphs_made_of_entities_are_not_empty() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>&nbsp;</p><p class="center">&bull;&nbsp;&bull;&nbsp;&bull;</p><p>&nbsp;</p><p>&nbsp;</p>
+<p>The next scene.</p><p>&mdash;</p><p>&mdash;</p>
+</body></html>
+"#;
+
+    let (bytes, removed) = normalize_whitespace(input).unwrap();
+    let out = String::from_utf8(bytes).unwrap();
+
+    assert_eq!(removed, 1, "{out}");
+    assert!(out.contains("&bull;&nbsp;&bull;&nbsp;&bull;"), "{out}");
+    assert_eq!(out.matches("&mdash;").count(), 2, "{out}");
+}
+
+/// An empty element with an id is a link target: a page marker the page list
+/// points at, or the anchor a table of contents entry names.
+#[test]
+fn an_empty_element_with_an_id_is_kept() {
+    let (out, removed) = collapse(
+        r#"<div xmlns:epub="http://www.idpf.org/2007/ops" epub:type="pagebreak" id="page4"></div><div xmlns:epub="http://www.idpf.org/2007/ops" epub:type="pagebreak" id="page5"></div><div class="spacer"></div><div id="chapter-2"></div><h1>Two</h1>"#,
+    );
+
+    assert_eq!(removed, 0, "{out}");
+    for id in ["page4", "page5", "chapter-2"] {
+        assert!(out.contains(&format!(r#"id="{id}""#)), "{id} went:\n{out}");
+    }
+}
+
 #[test]
 fn adds_a_page_break_rule() {
     let out = String::from_utf8(add_chapter_page_breaks(&wrap("<h1>Ch</h1>")).unwrap()).unwrap();
@@ -119,6 +169,21 @@ fn adds_a_page_break_rule() {
     assert!(out.contains("h1, h2"), "{out}");
     assert!(out.contains(r#"type="text/css""#), "{out}");
     epubkit_core::xml::parse_strict(out.as_bytes()).expect("output should parse");
+}
+
+/// The book's own stylesheets come after the added rule, so where they say
+/// something else about a heading, at the same specificity, they win.
+#[test]
+fn the_page_break_rule_gives_way_to_the_books_own_styles() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/><style type="text/css">p { margin: 0; }</style></head><body><h1>Ch</h1></body></html>
+"#;
+
+    let out = String::from_utf8(add_chapter_page_breaks(input).unwrap()).unwrap();
+
+    let rule = out.find("page-break-before").expect("the rule was added");
+    assert!(rule < out.find("<link").unwrap(), "{out}");
+    assert!(rule < out.find("p { margin").unwrap(), "{out}");
 }
 
 #[test]

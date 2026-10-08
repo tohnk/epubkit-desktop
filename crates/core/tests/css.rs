@@ -1,7 +1,12 @@
+mod common;
+
+use std::time::Duration;
+
 use epubkit_core::css::{
-    collect_used_selectors, decode_stylesheet, remove_embedded_fonts, remove_unused_css,
-    UsedSelectors,
+    collect_used_selectors, decode_stylesheet, remove_embedded_fonts,
+    remove_embedded_fonts_from_styles, remove_unused_css, UsedSelectors,
 };
+use epubkit_core::xml;
 
 fn used_from(body: &str) -> UsedSelectors {
     let xhtml = format!(
@@ -196,8 +201,317 @@ fn comments_and_imports_survive() {
 
     let (out, _) = remove_unused_css(css, &used);
 
+    assert!(out.contains("/* chapter styles */"), "{out}");
     assert!(out.contains("@import"), "{out}");
     assert!(out.contains(".lead"), "{out}");
+}
+
+/// What stays is left exactly as the book wrote it. Reprinted by a CSS
+/// library, media queries and colours came back in syntax older reading
+/// engines do not read, `(width <= 600px)` and `#0000`. Comments and the
+/// `@charset` went, and a minified sheet came back laid out at length.
+#[test]
+fn what_is_kept_is_kept_exactly_as_written() {
+    let used = used_from(r#"<p class="lead">x</p><p class="end">y</p>"#);
+    let before = "@charset \"UTF-8\";\n\
+                  /*! licence */\n\
+                  @import url(\"print.css\") screen and (max-width: 500px);\n\
+                  @media screen and (max-width: 600px) { .lead { color: transparent } }\n\
+                  .lead{color:rgba(0,0,0,0.6);font-family:\"Default Sans\";quotes:\"\\201C\" \"\\201D\"}\n";
+    let after = ".end{border-bottom:1px solid transparent}\n";
+    let css = format!("{before}.orphan {{ color: hsla(0,0%,50%,.5) }}\n{after}");
+
+    let (out, removed) = remove_unused_css(&css, &used);
+
+    assert_eq!(removed, 1);
+    assert_eq!(out, format!("{before}{after}"));
+}
+
+/// A font declared inside an `@media` block, or in a stylesheet with an old
+/// browser hack in it, is as much a font as any. Its file is deleted with the
+/// rest, so its rule has to go too.
+#[test]
+fn every_font_face_rule_goes_wherever_it_is() {
+    let css = ".a { *zoom: 1; color: red }\n\
+               @font-face { font-family: Top; src: url(top.ttf) }\n\
+               @media screen {\n  @font-face { font-family: Nested; src: url(nested.ttf) }\n  p { margin: 0 }\n}\n\
+               @supports (display: grid) { @media print { @font-face { font-family: Deep; src: url(deep.ttf) } } }\n";
+
+    let (out, removed) = remove_embedded_fonts(css);
+
+    assert_eq!(removed, 3, "{out}");
+    assert!(!out.contains("@font-face"), "{out}");
+    assert!(out.starts_with(".a { *zoom: 1; color: red }\n"), "{out}");
+    assert!(out.contains("p { margin: 0 }"), "{out}");
+}
+
+/// A stylesheet nested thousands deep, which no book needs but any book can
+/// contain, is read without running out of stack, even on a thread with as
+/// little as the desktop app's workers.
+#[test]
+fn deeply_nested_css_does_not_exhaust_the_stack() {
+    let depth = 20_000;
+    let css = format!(
+        "{}.inner {{ color: red }}{}\n.orphan {{ color: blue }}\n@font-face {{ font-family: F; src: url(f.ttf) }}\n",
+        "@media screen { ".repeat(depth),
+        " }".repeat(depth)
+    );
+
+    let ((unused, removed_rules), (fonts, removed_fonts)) = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            (
+                remove_unused_css(&css, &UsedSelectors::default()),
+                remove_embedded_fonts(&css),
+            )
+        })
+        .unwrap()
+        .join()
+        .expect("reading the stylesheet should not overflow the stack");
+
+    assert_eq!(removed_rules, 1);
+    assert!(!unused.contains("orphan"));
+    assert!(unused.contains(".inner"));
+    assert_eq!(removed_fonts, 1);
+    assert!(!fonts.contains("@font-face"));
+}
+
+/// A `<style>` element's text and CDATA sections are one stylesheet, as a
+/// reading engine reads them. Cleaned one at a time, a rule that started in
+/// one and ended in the next was cut in half, and the common
+/// `/*<![CDATA[*/ … /*]]>*/` wrapping hid every rule inside it.
+#[test]
+fn a_style_elements_text_and_cdata_are_one_stylesheet() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    let cleaned = |style: &str| {
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter(style).as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+        (out, removed)
+    };
+
+    let (out, removed) = cleaned(
+        "@font-face { font-family: Test; <![CDATA[src: url(test.ttf);]]> } p { color: red; }",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(!out.contains("font-face"), "{out}");
+    assert!(!out.contains("test.ttf"), "{out}");
+    assert!(
+        out.contains(r#"<style type="text/css">p { color: red; }</style>"#),
+        "{out}"
+    );
+
+    let (out, removed) = cleaned(
+        "\n/*<![CDATA[*/\n@font-face { font-family: Wrapped; src: url(w.ttf) }\np { margin: 0 }\n/*]]>*/\n",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(
+        out.contains(
+            "<style type=\"text/css\">\n/*<![CDATA[*/\np { margin: 0 }\n/*]]>*/\n</style>"
+        ),
+        "{out}"
+    );
+}
+
+/// What an entity stands for is part of a `<style>`'s CSS, though it is not
+/// text there. A font rule beside one goes, and the entity stays as written;
+/// a font rule with one in it goes too, its entities written out as what they
+/// stand for, which cannot be edited where they are written. Read as if the
+/// entity were not there, a rule was cut around it, and the entity's text ran
+/// into the next rule's selector; leaving the whole `<style>` alone left its
+/// fonts.
+#[test]
+fn fonts_are_removed_beside_and_through_entities() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY fonts "fonts/"><!ENTITY family "serif">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    let cleaned = |style: &str| {
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter(style).as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+        (out, removed)
+    };
+
+    let (out, removed) = cleaned(
+        "p { font-family: &family;; } @font-face { font-family: X; src: url(y.ttf) } h1 { color: red }",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(
+        out.contains(
+            r#"<style type="text/css">p { font-family: &family;; } h1 { color: red }</style>"#
+        ),
+        "{out}"
+    );
+
+    let (out, removed) = cleaned(
+        "p { font-family: &family;; } @font-face { font-family: X; src: url(&fonts;x.ttf) } h1 { color: red }",
+    );
+    assert_eq!(removed, 1, "{out}");
+    assert!(
+        out.contains(
+            r#"<style type="text/css">p { font-family: serif; } h1 { color: red }</style>"#
+        ),
+        "{out}"
+    );
+}
+
+/// A `<style>` that is nothing but an entity has no text to edit, and its
+/// entity is written out as what it stands for to remove the font in it. An
+/// entity declared to stand for nothing is read as that, not as one that
+/// cannot be read. Either way the font rule stayed, naming a deleted font.
+#[test]
+fn fonts_are_removed_from_entities_alone_and_empty_ones() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY empty ""><!ENTITY fonts "@font-face {{ src: url(x.ttf) }} p {{ color: red }}">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    for (style, after) in [
+        ("&fonts;", "p { color: red }"),
+        (
+            "@font-face { src: url(&empty;x.ttf) } p { color: red }",
+            "p { color: red }",
+        ),
+    ] {
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter(style).as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(removed, 1, "{style}: {out}");
+        assert!(
+            out.contains(&format!(r#"<style type="text/css">{after}</style>"#)),
+            "{style}: {out}"
+        );
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    }
+}
+
+/// An entity a doctype that is never loaded declares stands for nothing this
+/// can read. A font rule with one in it stays, since where the rule ends is
+/// unknown; one beside it goes.
+#[test]
+fn a_font_rule_with_an_unknown_entity_in_it_stays() {
+    let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">p:before { content: "&mdash;" } @font-face { font-family: "A&mdash;B"; src: url(x.ttf) } @font-face { src: url(y.ttf) } h1 { color: red }</style></head><body><p>x</p></body></html>
+"#;
+
+    let (out, removed) = remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap();
+    let out = String::from_utf8(out).unwrap();
+
+    assert_eq!(removed, 1, "{out}");
+    assert!(
+        out.contains(r#"p:before { content: "&mdash;" } @font-face { font-family: "A&mdash;B"; src: url(x.ttf) } h1 { color: red }"#),
+        "{out}"
+    );
+}
+
+/// An entity that refers to one that cannot be read cannot be read either, nor
+/// can one whose value is in a file that is never loaded, or one with an
+/// element in it, whose text is no part of the CSS. Each was written out as
+/// text to remove a font from it: the first lost the entity it referred to,
+/// here the dash a `content` showed, the second the entity, and the third its
+/// element, whose text became CSS.
+#[test]
+fn an_entity_holding_what_cannot_be_read_stays() {
+    let chapter = |style: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd" [<!ENTITY dashed "p:before {{ content: '&mdash;' }} @font-face {{ src: url(x.ttf) }}"><!ENTITY outer "&dashed;"><!ENTITY fonts SYSTEM "fonts.css"><!ENTITY linked "@font-face {{ src: url(&fonts;x.ttf) }}"><!ENTITY marked "p:before {{ content: 'x' }} <b>@font-face {{ src: url(z.ttf) }}</b>">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{style}</style></head><body><p>x</p></body></html>
+"#
+        )
+    };
+    for kept in [
+        "&dashed;",
+        "&outer;",
+        "&linked;",
+        "@font-face { src: url(&fonts;x.ttf) }",
+        "&marked;",
+    ] {
+        let chapter = chapter(&format!(
+            "{kept} @font-face {{ src: url(y.ttf) }} h1 {{ color: red }}"
+        ));
+        // libxml2 2.9 takes an entity's reference to one it was not given for
+        // an error, where 2.14 does not, and recovers the chapter, entities
+        // filled in.
+        if xml::parse_strict(chapter.as_bytes()).is_err() {
+            assert!(
+                ["&dashed;", "&outer;"].contains(&kept),
+                "{kept} should be read strictly"
+            );
+            continue;
+        }
+
+        let (out, removed) = remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(removed, 1, "{kept}: {out}");
+        assert!(
+            out.contains(&format!(
+                r#"<style type="text/css">{kept} h1 {{ color: red }}</style>"#
+            )),
+            "{kept}: {out}"
+        );
+        xml::parse_strict(out.as_bytes()).expect("the chapter should stay well-formed");
+    }
+}
+
+/// A `<style>` in many pieces, each with an edit in it, is edited in time
+/// that grows with its length. Finding the piece each edit fell in from the
+/// first piece on took time growing with the square of it.
+#[test]
+fn a_style_in_many_pieces_is_edited_in_one_pass() {
+    let pieces = 40_000;
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{}</style></head><body><p>x</p></body></html>
+"#,
+        "@font-face{src:url(a.ttf)}<![CDATA[p{margin:0}]]>".repeat(pieces)
+    );
+
+    let (out, removed) = common::finishes_within(Duration::from_secs(20), move || {
+        remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap()
+    });
+
+    assert_eq!(removed, pieces);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("font-face"));
+    assert_eq!(out.matches("<![CDATA[p{margin:0}]]>").count(), pieces);
+}
+
+/// A `<style>` with many entities in it, readable and not, is edited in time
+/// that grows with its length.
+#[test]
+fn a_style_full_of_entities_is_edited_in_one_pass() {
+    let rules = 40_000;
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd" [<!ENTITY d "fonts/">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title><style type="text/css">{}</style></head><body><p>x</p></body></html>
+"#,
+        r#"p:before{content:"&mdash;"}@font-face{src:url(&d;a.ttf)}"#.repeat(rules)
+    );
+
+    let (out, removed) = common::finishes_within(Duration::from_secs(20), move || {
+        remove_embedded_fonts_from_styles(chapter.as_bytes()).unwrap()
+    });
+
+    assert_eq!(removed, rules);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("font-face"));
+    assert_eq!(out.matches(r#"p:before{content:"&mdash;"}"#).count(), rules);
 }
 
 // ------------------------------------------------------------- encodings
