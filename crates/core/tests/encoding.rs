@@ -476,18 +476,23 @@ fn markup_written_in_cdata_or_a_doctype_does_not_decide_the_encoding() {
     }
 }
 
-/// A `<![CDATA[` in a script, a stylesheet or a quoted attribute value is text
-/// there, to the HTML parser that recovers the chapter as to a browser, and
-/// starts no section for a later `]]>` to end. Taken for one, the section ran
-/// from there to the end of a real one further on, the `<meta>` between them
-/// was not read, and a windows-1251 chapter came out in Latin letters. A real
-/// section in the chapter's text is still text, `<meta>` and all.
+/// A `<![CDATA[` in a script, a stylesheet, a title, a text area or a quoted
+/// attribute value is text there, to the HTML parser that recovers the
+/// chapter as to a browser, and starts no section for a later `]]>` to end.
+/// Taken for one, the section ran from there to the end of a real one further
+/// on, the `<meta>` between them was not read, and a windows-1251 chapter came
+/// out in Latin letters. A real section in the chapter's text is still text,
+/// `<meta>` and all, and so is one that ends inside a title, whose markup
+/// libxml2 2.9 reads.
 #[test]
 fn a_cdata_marker_in_a_script_or_an_attribute_starts_no_section() {
     let markers = [
         r#"<script>var marker = "<![CDATA[";</script>"#,
         r#"<style>p::before { content: "<![CDATA[" }</style>"#,
         r#"<link rel="next" title="<![CDATA[" href="next.html"/>"#,
+        "<title>Literal <![CDATA[ syntax</title>",
+        "<textarea>Literal <![CDATA[ syntax</textarea>",
+        r#"<title><![CDATA[<meta charset="iso-8859-1">]]></title>"#,
     ];
     // A real section after the `<meta>`, as an SVG caption might be, and one
     // before it with a `<meta>` of its own.

@@ -1122,13 +1122,21 @@ fn declared_encodings(input: &[u8]) -> impl Iterator<Item = &'static Encoding> +
         .chain(std::iter::once_with(|| meta_charset(input)).flatten())
 }
 
+/// Elements whose text the HTML parser reads to their end tag, and a
+/// `<![CDATA[` in it as text.
+const TEXT_ELEMENTS: &[&str] = &[
+    "script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes",
+];
+
 /// `text` with each CDATA section in the chapter's text made a space: as XHTML
 /// reads one, text, whatever `<meta>` it holds. libxml2's HTML parser reads
 /// one otherwise, and each release its own way, 2.9 taking the markup in it
 /// for markup, and 2.14 the markup after its first `>`. A `<![CDATA[` in a
-/// script, a stylesheet or a quoted attribute value is left as it is: both
-/// read it as text there, as browsers do, so it starts no section for a
-/// later `]]>` to end. Nor does one that never ends.
+/// quoted attribute value, or in a script, a title or another of the
+/// [`TEXT_ELEMENTS`] where its section would end past the element's end tag,
+/// is left as it is: both releases read it as text there, as browsers do, so
+/// it starts no section for a later `]]>` to end. Nor does one that never
+/// ends.
 fn without_cdata_in_text(text: &str) -> Cow<'_, str> {
     let mut sections = Vec::new();
     // No `]]>` after one place means none after any later one either.
@@ -1157,18 +1165,28 @@ fn without_cdata_in_text(text: &str) -> Cow<'_, str> {
         } else if opens_tag(rest) {
             let tag = &rest[..tag_length(rest)];
             at = from + tag.len();
-            // A script's or a stylesheet's text runs to its end tag, unless
-            // the tag closes where it opens.
             let name = &tag[1..];
             let name = &name[..name
                 .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
                 .unwrap_or(name.len())];
-            if ["script", "style"]
+            if TEXT_ELEMENTS
                 .iter()
-                .any(|raw| name.eq_ignore_ascii_case(raw))
+                .any(|element| name.eq_ignore_ascii_case(element))
                 && !tag.ends_with("/>")
             {
-                at = raw_text_end(text, at, name);
+                // Its text runs to its end tag. A section that ends before
+                // that is still one, whose markup libxml2 2.9 reads in a
+                // title; a `<![CDATA[` whose section would run past it is text.
+                let end = raw_text_end(text, at, name);
+                while let Some(offset) = text[at..end].find("<![CDATA[") {
+                    let open = at + offset;
+                    let Some(length) = text[open + 9..end].find("]]>") else {
+                        break;
+                    };
+                    at = open + 9 + length + 3;
+                    sections.push(open..at);
+                }
+                at = end;
             }
         }
     }

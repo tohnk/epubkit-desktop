@@ -284,8 +284,8 @@ encoding it can name, so its bytes read as windows-1252 give the parser the
 same markup, and only what the parser takes for a `<meta>` counts, whatever
 a script, a CDATA section, a comment or a DOCTYPE holds. Only a CDATA section
 in the chapter's text is kept from the HTML parser, which does not read it as
-the text XHTML takes it for; a `<![CDATA[` in a script or an attribute value
-is text to both. Only the `<meta>`'s own attributes count, not another
+the text XHTML takes it for; a `<![CDATA[` in a script, a title or an
+attribute value, whose section would end past it, is text to both. Only the `<meta>`'s own attributes count, not another
 vocabulary's with the same names, and a `content` names a charset only for an
 `http-equiv="Content-Type"`. A pattern over the text found `<meta>`s in
 comments and in other `<meta>`s' descriptions, and scanners after it took a
