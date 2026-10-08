@@ -1477,3 +1477,211 @@ fn an_image_converted_under_its_own_name_is_declared_a_jpeg() {
         "{opf}"
     );
 }
+
+// ------------------------------------------ Light Novel mode: shapes kept
+
+/// Optimize, in Light Novel mode, a book whose one chapter,
+/// `OEBPS/text/chapter1.xhtml`, has `head` and `body`, with `files` beside it,
+/// each a path in `OEBPS`, a media type and its bytes, and `metadata` in its
+/// package. Returns the unpacked output.
+fn light_novel_book(
+    files: &[(&str, &str, Vec<u8>)],
+    metadata: &str,
+    head: &str,
+    body: &str,
+) -> tempfile::TempDir {
+    let manifest: String = files
+        .iter()
+        .enumerate()
+        .map(|(index, (href, media_type, _))| {
+            format!(r#"<item id="file{index}" href="{href}" media-type="{media_type}"/>"#)
+        })
+        .collect();
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:shapes</dc:identifier>
+    <dc:title>Shapes</dc:title>
+    {metadata}
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    {manifest}
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink"><head><title>One</title>{head}</head><body>{body}</body></html>
+"#
+    );
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".into(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".into(),
+            common::CONTAINER_XML.to_vec(),
+        ),
+        ("OEBPS/content.opf".into(), opf.into_bytes()),
+        ("OEBPS/text/chapter1.xhtml".into(), chapter.into_bytes()),
+    ];
+    for (href, _, bytes) in files {
+        entries.push((format!("OEBPS/{href}"), bytes.clone()));
+    }
+    let entries: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(&input, &entries);
+    process_epub(&input, &output, &light_novel(), |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    work
+}
+
+/// The converted image at `path` in the unpacked book is one image, in the
+/// shape it came in: wider than tall, with no pages split off it.
+fn assert_shape_kept(work: &Path, path: &str) {
+    let parts: Vec<String> = image_files(work)
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .filter(|file| file.contains("_part"))
+        .collect();
+    assert!(parts.is_empty(), "split: {parts:?}");
+
+    let image = image::open(work.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert!(
+        image.width() > image.height() * 2,
+        "{path} was turned: {}x{}",
+        image.width(),
+        image.height()
+    );
+}
+
+/// An SVG document draws its image in a box the image's own shape, and is
+/// shown as it is: a split image's other page was declared but shown
+/// nowhere, so half the picture was lost.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_an_svg_document_draws() {
+    let map = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="map.png"/><text x="600" y="200">North</text></svg>
+"#;
+    let work = light_novel_book(
+        &[
+            ("images/map.png", "image/png", spread()),
+            ("images/map.svg", "image/svg+xml", map.to_vec()),
+        ],
+        "",
+        "",
+        r#"<p><img src="../images/map.svg" alt="A map"/></p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/map.jpg");
+    let svg = fs::read_to_string(work.path().join("OEBPS/images/map.svg")).unwrap();
+    assert!(svg.contains(r#"xlink:href="map.jpg""#), "{svg}");
+}
+
+/// A background fills its box however it is shaped, and only the first page
+/// of a split one was ever named.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_a_background() {
+    let css = b"body { background-image: url(../images/paper.png); }\n";
+    let work = light_novel_book(
+        &[
+            ("images/paper.png", "image/png", spread()),
+            ("styles/main.css", "text/css", css.to_vec()),
+        ],
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        "<p>Text.</p>",
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/paper.jpg");
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/main.css")).unwrap();
+    assert!(css.contains("url(../images/paper.jpg)"), "{css}");
+}
+
+/// An SVG that draws more than its image, a label here, places what it draws
+/// on the image as it is shaped. A reshaped image no longer lies under them.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_an_illustration_draws() {
+    let work = light_novel_book(
+        &[("images/plate.png", "image/png", spread())],
+        "",
+        "",
+        r#"<div><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/plate.png"/><text x="700" y="200">A label</text></svg></div>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+    let chapter = read_chapter(work.path());
+    assert!(chapter.contains("A label"), "{chapter}");
+    assert_eq!(chapter.matches("plate.jpg").count(), 1, "{chapter}");
+}
+
+/// An image in a line of text is part of the line. Split, its halves were
+/// shown one after the other in it; turned, it stood on end.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_in_text() {
+    let work = light_novel_book(
+        &[("images/mark.png", "image/png", spread())],
+        "",
+        "",
+        r#"<p>A word <img src="../images/mark.png" alt="mark"/> in a line.</p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/mark.jpg");
+    assert_eq!(chapter_sources(work.path()), ["../images/mark.jpg"]);
+}
+
+/// A heading's image is its title, not a page of art: split, "Chapter One"
+/// read "One Chapter", right half first.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_a_heading_image() {
+    let work = light_novel_book(
+        &[("images/title.png", "image/png", spread())],
+        "",
+        "",
+        r#"<h1><img src="../images/title.png" alt="Chapter One"/></h1><p>Text.</p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/title.jpg");
+    assert_eq!(chapter_sources(work.path()), ["../images/title.jpg"]);
+}
+
+/// The cover is what a reader shows for the book. Turned, it lay on its side
+/// there; split, it was half of itself.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_the_cover() {
+    let work = light_novel_book(
+        &[("images/cover.png", "image/png", spread())],
+        r#"<meta name="cover" content="file0"/>"#,
+        "",
+        r#"<div><img src="../images/cover.png" alt="Cover"/></div>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/cover.jpg");
+}
+
+/// A spread shown on its own as a page of art is still split.
+#[test]
+fn light_novel_mode_still_splits_a_spread_shown_on_its_own() {
+    let work = light_novel_book(
+        &[("images/spread.png", "image/png", spread())],
+        "",
+        "",
+        r#"<p>Text before.</p><div class="plate"><img src="../images/spread.png" alt="A spread"/></div><p>Text after.</p>"#,
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+}

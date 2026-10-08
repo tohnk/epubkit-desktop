@@ -294,27 +294,17 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
     let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;
 
-    // --- images (15-60%) -------------------------------------------------
-    progress(15, "Processing images...");
-    let converted = convert_images(
-        &content.images,
-        work_dir,
-        &opf_dir,
-        options,
-        &mut report,
-        &mut progress,
-    )?;
-
     // --- content documents ------------------------------------------------
     // Repair runs before anything else reads a chapter. The reference did this
     // *after* rewriting references, which meant the rewriting step silently
     // repaired the file first and the repair count came out as zero. Going
-    // first also means every later step sees a well-formed tree.
+    // first also means every later step sees a well-formed tree, the image
+    // step's look at how images are shown included.
     //
     // A chapter nothing can parse, an empty file say, is left exactly as it
     // was rather than sinking the book; every later step works only on the
     // chapters that did parse.
-    progress(62, "Repairing HTML...");
+    progress(12, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
     for path in &content.xhtml {
@@ -337,6 +327,25 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         fs::write(path, stripped).map_err(|e| Error::io(path, e))?;
         chapters.push(path);
     }
+
+    // --- images (15-60%) -------------------------------------------------
+    // Light Novel mode reshapes an image only where it is shown as a page of
+    // its own, so first it looks at how each is shown.
+    let keep_shape = if options.light_novel_mode {
+        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content)?
+    } else {
+        HashSet::new()
+    };
+    progress(15, "Processing images...");
+    let converted = convert_images(
+        &content.images,
+        work_dir,
+        &opf_dir,
+        options,
+        &keep_shape,
+        &mut report,
+        &mut progress,
+    )?;
 
     progress(66, "Fixing SVG covers...");
     report.svg_covers_fixed = structure::fix_svg_covers(work_dir, &opf_dir, &opf)?;
@@ -524,12 +533,15 @@ struct ConvertedImages {
     in_place: Vec<String>,
 }
 
-/// Convert every image in the manifest.
+/// Convert every image in the manifest. Those in `keep_shape`, by path, are
+/// converted as they are shaped, whatever Light Novel mode would make of
+/// them.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
     root: &Path,
     opf_dir: &Path,
     options: &ProcessingOptions,
+    keep_shape: &HashSet<PathBuf>,
     report: &mut ProcessingReport,
     progress: &mut P,
 ) -> Result<ConvertedImages> {
@@ -537,6 +549,10 @@ fn convert_images<P: FnMut(u8, &str)>(
     const SPAN: f64 = 45.0;
 
     let image_options = options.image_options();
+    let as_shaped = ImageOptions {
+        light_novel_mode: false,
+        ..image_options.clone()
+    };
     let mut renames = BTreeMap::new();
     let mut reshaped = BTreeMap::new();
     let mut in_place = Vec::new();
@@ -570,7 +586,12 @@ fn convert_images<P: FnMut(u8, &str)>(
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
 
         // A single unreadable image must not sink the whole book.
-        let Ok(outputs) = image::process_image(&bytes, &name, &image_options) else {
+        let options = if keep_shape.contains(path) {
+            &as_shaped
+        } else {
+            &image_options
+        };
+        let Ok(outputs) = image::process_image(&bytes, &name, options) else {
             report.images_unconverted += 1;
             report
                 .image_details

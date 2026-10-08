@@ -565,6 +565,26 @@ common around full-page illustrations and sized to the spread in its viewBox,
 gives way to a plain image per page. A rotated image sheds its old size and
 wrapper the same way. The report counts a split spread as one image.
 
+### Light Novel mode reshapes only pages of art
+
+The reference turned or split every image wider than tall, however the book
+showed it. Most ways of showing an image cannot take one of another shape:
+an SVG document or a CSS background showed the first half of a split image
+and nothing showed the second, an SVG illustration's labels no longer lay
+over what they labelled, a small image in a line of text was split in two in
+the line or stood on end, a heading's image read right half first, and the
+cover lay on its side in a reader's library.
+
+Before converting images in Light Novel mode, the port reads how the book
+shows each one, and reshapes only an image shown as a page of its own: an
+`<img>` outside a heading with nothing else in its line, or an SVG that shows
+nothing but its image, on its own the same way. Anything else that names
+the file keeps its shape: an SVG that draws more, an SVG document, a
+stylesheet or `style`, an image in text or a heading, a link to the file, a
+`srcset` other than the image's own, and the cover. For this the chapters are
+repaired before the image step rather than after it, which changes nothing
+else, since neither step reads what the other writes.
+
 ### One unreadable file does not sink the book
 
 A chapter nothing can parse, an empty or blank file say, is left exactly as
@@ -622,9 +642,8 @@ The reference took any SVG in the first three chapters holding exactly one
 `<image>` for a cover wrapper and replaced it with a plain `<img>`. One that
 also held text or shapes, a labelled map say, lost them. The port unwraps an
 SVG only when the image is all it draws, beside a title or a description, and
-leaves an illustration alone. Light Novel mode does the same for an SVG around
-an image it split: an illustration stays, followed by the image's further
-pages.
+leaves an illustration alone. Light Novel mode does the same: an illustration
+stays, and its image keeps its shape.
 
 ### The HTML repair pass runs earlier
 

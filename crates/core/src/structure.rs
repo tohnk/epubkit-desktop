@@ -9,7 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::ops::Range;
 
 use cssparser::{ParseError, Parser as CssParser, ParserInput, Token};
-use libxml::tree::{Document, Namespace, Node};
+use libxml::bindings::xmlNodePtr;
+use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::css::{self, Edit};
@@ -63,6 +64,22 @@ const HREF_ESCAPE: &AsciiSet = &CONTROLS
 
 /// How an image that replaces an SVG wrapper fills the page.
 const FULL_PAGE_STYLE: &str = "max-width:100%;max-height:100%;display:block;margin:auto";
+
+/// Elements that run in a line of text rather than making a block of their
+/// own, so that an image in one is in the line around it.
+const INLINE_ELEMENTS: &[&str] = &[
+    "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em",
+    "font", "i", "ins", "kbd", "label", "mark", "nobr", "picture", "q", "rb", "rp", "rt", "rtc",
+    "ruby", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "time", "tt", "u",
+    "var",
+];
+
+/// Elements that show something of their own in a line, as an image does.
+const SHOWN_ELEMENTS: &[&str] = &[
+    "audio", "canvas", "embed", "iframe", "img", "input", "math", "object", "svg", "video",
+];
+
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 
 /// One `<item>` from the OPF manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -746,6 +763,206 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
     Ok(changed)
 }
 
+/// The images Light Novel mode has to leave in the shape they have, by the
+/// file each is: those something in the book shows in a frame made for that
+/// shape, or in a line of text, which a turned or split image would not fill,
+/// or would break.
+///
+/// Only two ways of showing an image can take a reshaped one, because
+/// [`show_reshaped_pages`] can show its pages there in its place: an `<img>`
+/// on its own, outside a heading, and an SVG that shows nothing but its image,
+/// on its own the same way. Every other is a fixed shape: an SVG that draws
+/// more, an SVG document, CSS, an image in a line of text or a heading, a link
+/// to the file, a `srcset` other than the image's own, and the book's cover.
+/// One is enough, since a file has one shape.
+///
+/// `chapters` are read as the steps after the image step read them.
+pub fn fixed_shape_images(
+    root: &Path,
+    opf_dir: &Path,
+    opf: &Document,
+    chapters: &[&Path],
+    content: &ContentFiles,
+) -> Result<HashSet<PathBuf>> {
+    let mut fixed = HashSet::new();
+
+    for &path in chapters {
+        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+        let content = html::parse_content(&bytes)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        let free = free_images(&content.doc)?;
+        note_fixed_shapes(&content.doc, root, base, &free, &mut fixed)?;
+    }
+
+    // An SVG document is drawn in its own box. One that is not well-formed is
+    // left as it is, as its references are.
+    for path in content.svg.iter().filter(|path| path.is_file()) {
+        let Ok(doc) = xml::parse_file(path) else {
+            continue;
+        };
+        let base = path.parent().unwrap_or(opf_dir);
+        note_fixed_shapes(&doc, root, base, &HashSet::new(), &mut fixed)?;
+    }
+
+    for path in content.css.iter().filter(|path| path.is_file()) {
+        let css = crate::css::read_stylesheet(path)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        for url in css_urls(&css) {
+            fixed.extend(target_of(root, base, &url));
+        }
+    }
+
+    let cover = crate::metadata::extract_metadata(opf)?.cover_href;
+    if !cover.is_empty() {
+        fixed.extend(resolve_href(root, opf_dir, &decode(&cover)));
+    }
+
+    Ok(fixed)
+}
+
+/// Note in `fixed` every file `doc` names but for what shows one of its
+/// `free` images, an `<img>`'s `src` or an SVG `<image>`'s `href`.
+fn note_fixed_shapes(
+    doc: &Document,
+    root: &Path,
+    base: &Path,
+    free: &HashSet<xmlNodePtr>,
+    fixed: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for node in xml::find_nodes(doc, "//*")? {
+        let name = local_name(&node);
+        let is_free = free.contains(&node.node_ptr());
+        let shows = |attribute: &str| {
+            is_free
+                && matches!(
+                    (name.as_str(), attribute),
+                    ("img", "src") | ("image", "href")
+                )
+        };
+
+        let mut shown = None;
+        for &attribute in URL_ATTRIBUTES {
+            let Some(value) = node.get_attribute_no_ns(attribute) else {
+                continue;
+            };
+            if shows(attribute) {
+                shown = target_of(root, base, &value);
+            } else {
+                fixed.extend(target_of(root, base, &value));
+            }
+        }
+        if let Some(value) = node.get_attribute_ns("href", NS_XLINK) {
+            if shows("href") {
+                shown = shown.or_else(|| target_of(root, base, &value));
+            } else {
+                fixed.extend(target_of(root, base, &value));
+            }
+        }
+
+        // A candidate naming the image's own file goes as its `src` goes:
+        // the pages of a reshaped image are shown without a `srcset`.
+        if let Some(srcset) = node.get_attribute_no_ns("srcset") {
+            for url in srcset_urls(&srcset) {
+                let target = target_of(root, base, &srcset[url]);
+                if target.is_some() && target != shown {
+                    fixed.extend(target);
+                }
+            }
+        }
+
+        if let Some(style) = node.get_attribute_no_ns("style") {
+            for url in css_urls(&style) {
+                fixed.extend(target_of(root, base, &url));
+            }
+        }
+        if name == "style" {
+            for url in css_urls(&node.get_content()) {
+                fixed.extend(target_of(root, base, &url));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The file `reference`, written in a document in `base`, names in the book.
+fn target_of(root: &Path, base: &Path, reference: &str) -> Option<PathBuf> {
+    resolve_href(root, base, &Reference::parse(reference)?.path())
+}
+
+/// The images in a chapter that pages could take the place of, as
+/// [`show_reshaped_pages`] shows them: each `<img>` on its own, and the image
+/// of each SVG that shows nothing else, on its own the same way.
+fn free_images(doc: &Document) -> Result<HashSet<xmlNodePtr>> {
+    let mut free = HashSet::new();
+    for svg in xml::find_nodes(doc, &outermost_svgs())? {
+        if let Some(image) = wrapped_image(&svg) {
+            if on_its_own(&svg) {
+                free.insert(image.node_ptr());
+            }
+        }
+    }
+    for img in xml::find_nodes(doc, &format!("//{}", xml::local("img")))? {
+        if on_its_own(&img) {
+            free.insert(img.node_ptr());
+        }
+    }
+    Ok(free)
+}
+
+/// Is `image` shown on its own: outside a heading, and with nothing else in
+/// its line, no text, no other image? Its line is the nearest block around
+/// it. What runs in a line of text, a link or an emphasis say, is looked
+/// through, and a block inside starts lines of its own.
+fn on_its_own(image: &Node) -> bool {
+    let mut block = image.get_parent();
+    while let Some(parent) = &block {
+        if !INLINE_ELEMENTS.contains(&local_name(parent).as_str()) {
+            break;
+        }
+        block = parent.get_parent();
+    }
+    let Some(block) = block else {
+        return true;
+    };
+
+    let mut ancestor = Some(block.clone());
+    while let Some(node) = ancestor {
+        if HEADINGS.contains(&local_name(&node).as_str()) {
+            return false;
+        }
+        ancestor = node.get_parent();
+    }
+
+    !shares_a_line(&block, image)
+}
+
+/// Does anything but `image` show in `line`'s own line: text that is not
+/// blank, or another image or embedded thing?
+fn shares_a_line(line: &Node, image: &Node) -> bool {
+    let mut child = line.get_first_child();
+    while let Some(node) = child {
+        let shared = match node.get_type() {
+            Some(NodeType::TextNode) | Some(NodeType::CDataSectionNode) => {
+                !node.get_content().trim().is_empty()
+            }
+            // An entity left as written stands for text.
+            Some(NodeType::EntityRefNode) => true,
+            Some(NodeType::ElementNode) if node.node_ptr() != image.node_ptr() => {
+                let name = local_name(&node);
+                SHOWN_ELEMENTS.contains(&name.as_str())
+                    || (INLINE_ELEMENTS.contains(&name.as_str()) && shares_a_line(&node, image))
+            }
+            _ => false,
+        };
+        if shared {
+            return true;
+        }
+        child = node.get_next_sibling();
+    }
+    false
+}
+
 /// Replace SVG-wrapped cover images with a plain `<img>`.
 ///
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
@@ -1203,26 +1420,53 @@ fn css_url_edits(css: &str, base: &Path, renames: &Renames) -> Vec<Edit> {
     let mut parser = CssParser::new(&mut input);
     find_css_urls(
         &mut parser,
-        css,
-        base,
-        renames,
         MAX_CSS_NESTING,
         false,
-        &mut edits,
+        &mut |range, url, written| {
+            let Some(new_url) = rewrite_reference(url, base, renames) else {
+                return;
+            };
+            let new_text = match written {
+                CssUrl::Unquoted => {
+                    let token = &css[range.clone()];
+                    let opening = token.find('(').map_or(0, |at| at + 1);
+                    format!("{}{})", &token[..opening], unquoted_css_url(&new_url))
+                }
+                CssUrl::Quoted => quoted_css_string(&css[range.clone()], &new_url),
+            };
+            edits.push((range, new_text));
+        },
     );
     edits
 }
 
-/// Note, in order, what each url in `parser`'s input that names a renamed
-/// file becomes. Strings are urls when `in_image_set`.
+/// Every url in CSS text, found as [`css_url_edits`] finds them.
+fn css_urls(css: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut input = ParserInput::new(css);
+    let mut parser = CssParser::new(&mut input);
+    find_css_urls(&mut parser, MAX_CSS_NESTING, false, &mut |_, url, _| {
+        urls.push(url.to_string())
+    });
+    urls
+}
+
+/// How a url is written in CSS.
+#[derive(Clone, Copy)]
+enum CssUrl {
+    /// Inside an unquoted `url()`, whose whole token is where it is written.
+    Unquoted,
+    /// As a quoted string, in `url("…")` or `image-set()`.
+    Quoted,
+}
+
+/// Hand `found` each url in `parser`'s input, in order: where it is written,
+/// what it says, and how. Strings are urls when `in_image_set`.
 fn find_css_urls(
     parser: &mut CssParser<'_, '_>,
-    css: &str,
-    base: &Path,
-    renames: &Renames,
     depth: usize,
     in_image_set: bool,
-    edits: &mut Vec<Edit>,
+    found: &mut dyn FnMut(Range<usize>, &str, CssUrl),
 ) {
     loop {
         let start = parser.position().byte_index();
@@ -1232,19 +1476,8 @@ fn find_css_urls(
         let end = parser.position().byte_index();
 
         match token {
-            Token::UnquotedUrl(url) => {
-                if let Some(new_url) = rewrite_reference(&url, base, renames) {
-                    let written = &css[start..end];
-                    let opening = written.find('(').map_or(0, |at| at + 1);
-                    edits.push((
-                        start..end,
-                        format!("{}{})", &written[..opening], unquoted_css_url(&new_url)),
-                    ));
-                }
-            }
-            Token::QuotedString(url) if in_image_set => {
-                edit_css_string(css, start..end, &url, base, renames, edits);
-            }
+            Token::UnquotedUrl(url) => found(start..end, &url, CssUrl::Unquoted),
+            Token::QuotedString(url) if in_image_set => found(start..end, &url, CssUrl::Quoted),
             Token::Function(name) if depth > 0 => {
                 let name = name.to_ascii_lowercase();
                 parser
@@ -1255,12 +1488,12 @@ fn find_css_urls(
                             let start = inner.position().byte_index();
                             if let Ok(Token::QuotedString(url)) = inner.next().cloned() {
                                 let end = inner.position().byte_index();
-                                edit_css_string(css, start..end, &url, base, renames, edits);
+                                found(start..end, &url, CssUrl::Quoted);
                             }
                         } else {
                             let image_set =
                                 matches!(name.as_str(), "image-set" | "-webkit-image-set");
-                            find_css_urls(inner, css, base, renames, depth - 1, image_set, edits);
+                            find_css_urls(inner, depth - 1, image_set, found);
                         }
                         Ok::<_, ParseError<()>>(())
                     })
@@ -1271,7 +1504,7 @@ fn find_css_urls(
             {
                 parser
                     .parse_nested_block(|inner| {
-                        find_css_urls(inner, css, base, renames, depth - 1, false, edits);
+                        find_css_urls(inner, depth - 1, false, found);
                         Ok::<_, ParseError<()>>(())
                     })
                     .ok();
@@ -1281,20 +1514,10 @@ fn find_css_urls(
     }
 }
 
-/// Note what the quoted string at `range`, whose value is `url`, becomes if it
-/// names a renamed file: the same quotes around the new url.
-fn edit_css_string(
-    css: &str,
-    range: Range<usize>,
-    url: &str,
-    base: &Path,
-    renames: &Renames,
-    edits: &mut Vec<Edit>,
-) {
-    let Some(new_url) = rewrite_reference(url, base, renames) else {
-        return;
-    };
-    let quote = css[range.start..].chars().next().unwrap_or('"');
+/// `new_url` as a CSS string in the quotes `written`, the string it replaces,
+/// opens with.
+fn quoted_css_string(written: &str, new_url: &str) -> String {
+    let quote = written.chars().next().unwrap_or('"');
     let mut escaped = String::with_capacity(new_url.len() + 2);
     escaped.push(quote);
     for c in new_url.chars() {
@@ -1309,7 +1532,7 @@ fn edit_css_string(
         }
     }
     escaped.push(quote);
-    edits.push((range, escaped));
+    escaped
 }
 
 /// `url` as written inside an unquoted `url()`, or quoted if it has anything
