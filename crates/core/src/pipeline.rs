@@ -116,6 +116,8 @@ pub struct ProcessingReport {
     pub documents_recovered: usize,
     /// Content documents nothing could parse, left exactly as they were.
     pub documents_unreadable: usize,
+    /// Documents too large to read whole, left exactly as they were.
+    pub documents_too_large: usize,
     pub text: TextCleanReport,
     pub os_artifacts_removed: usize,
 }
@@ -192,6 +194,17 @@ impl ProcessingReport {
             };
             parts.push(format!(
                 "Left {n} unreadable document{plural} as {as_it_was}"
+            ));
+        }
+        if self.documents_too_large > 0 {
+            let n = self.documents_too_large;
+            let (plural, as_it_was) = if n == 1 {
+                ("", "it was")
+            } else {
+                ("s", "they were")
+            };
+            parts.push(format!(
+                "Left {n} document{plural} too large to process as {as_it_was}"
             ));
         }
         if self.documents_recovered > 0 {
@@ -321,6 +334,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(12, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
+    // What the run leaves exactly as it is: chapters nothing can parse, and
+    // documents too large to read whole.
+    let mut left_alone: Vec<PathBuf> = content.too_large.clone();
+    report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
         if !path.is_file() {
             continue;
@@ -329,6 +346,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         let Ok(repaired) = backend.repair(&bytes) else {
             report.documents_unreadable += 1;
+            left_alone.push(path.clone());
             continue;
         };
         if repaired.recovered {
@@ -355,13 +373,17 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // for SVG, which is drawn and stays as it is; then those the book shows
     // that the manifest leaves out.
     let undeclared = structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content)?;
-    let rasters: Vec<PathBuf> = content
+    let mut rasters: Vec<PathBuf> = content
         .images
         .iter()
         .filter(|path| !content.svg.contains(path))
         .chain(&undeclared)
         .cloned()
         .collect();
+    // An image a document left as it is may name keeps its name, so the
+    // reference there still leads to it, and stays as it is.
+    let named_where_left = structure::images_named_in(&left_alone, &rasters)?;
+    rasters.retain(|path| !named_where_left.contains(path));
     let converted = convert_images(
         &rasters,
         work_dir,
@@ -371,6 +393,16 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         &mut report,
         &mut progress,
     )?;
+    report.images_total += named_where_left.len();
+    report.images_unconverted += named_where_left.len();
+    let mut kept: Vec<&PathBuf> = named_where_left.iter().collect();
+    kept.sort();
+    for path in kept {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        report.image_details.push(format!(
+            "{name}: kept as it is (a document left as it is may name it)"
+        ));
+    }
 
     progress(66, "Fixing SVG covers...");
     report.svg_covers_fixed = structure::fix_svg_covers(work_dir, &opf_dir, &opf)?;
@@ -425,7 +457,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
     }
 
-    if options.remove_unused_css {
+    // What a document too large to read uses cannot be known, so no rule is
+    // known to be unused.
+    if options.remove_unused_css && content.too_large.is_empty() {
         progress(76, "Removing unused CSS...");
         let mut used = css::UsedSelectors::default();
         for &path in &chapters {

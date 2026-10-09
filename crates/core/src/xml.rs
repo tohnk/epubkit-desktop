@@ -55,8 +55,16 @@ pub fn parse_strict(bytes: &[u8]) -> Result<Document> {
         .map_err(|e| Error::Xml(e.to_string()))
 }
 
-/// Parse well-formed XML from a file.
+/// Parse well-formed XML from a file, if it is no larger than a document
+/// may be.
 pub fn parse_file(path: &Path) -> Result<Document> {
+    let size = fs::metadata(path).map_err(|e| Error::io(path, e))?.len();
+    if size > crate::MAX_DOCUMENT_BYTES {
+        return Err(Error::DocumentTooLarge {
+            path: path.to_path_buf(),
+            size,
+        });
+    }
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     parse_strict(&bytes).map_err(|e| Error::Xml(format!("{}: {e}", path.display())))
 }

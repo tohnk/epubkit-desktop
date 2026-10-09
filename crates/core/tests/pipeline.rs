@@ -1142,6 +1142,92 @@ fn a_spread_the_manifest_leaves_out_has_both_pages_declared() {
     assert_eq!((report.images_declared, report.spreads_split), (1, 1));
 }
 
+/// A document too large to read whole, a chapter of more than 32 MiB here,
+/// is left exactly as it is, and counted: parsing one takes some fifteen
+/// times its size. So is every image it might name, which would otherwise
+/// be converted and renamed out from under it, a name written with a
+/// percent-escape included; one only the rest of the book names is
+/// converted as usual.
+#[test]
+fn a_document_too_large_to_read_is_left_as_it_is_with_the_images_it_names() {
+    let filler =
+        "<p>The long afternoon light was failing, and she said it would be well enough.</p>\n";
+    let big = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Big</title></head><body>
+<p><img src="../images/my%20plate.png" alt=""/></p>
+{}</body></html>
+"#,
+        filler.repeat(32 * 1024 * 1024 / filler.len() + 1)
+    );
+    let png = solid(image::ImageFormat::Png, 0);
+    let files = [
+        ("images/my plate.png", "image/png", png.clone()),
+        ("images/other.png", "image/png", png),
+        (
+            "text/big.xhtml",
+            "application/xhtml+xml",
+            big.clone().into_bytes(),
+        ),
+    ];
+    let body = r#"<p><img src="../images/my%20plate.png" alt=""/></p><p><img src="../images/other.png" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert!(
+        fs::read(work.path().join("OEBPS/text/big.xhtml")).unwrap() == big.as_bytes(),
+        "the large chapter changed"
+    );
+    assert!(work.path().join("OEBPS/images/my plate.png").is_file());
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/my%20plate.png", "../images/other.jpg"]
+    );
+    assert_eq!(report.documents_too_large, 1);
+    assert_eq!((report.images_converted, report.images_unconverted), (1, 1));
+    let summary = report.summary();
+    assert!(
+        summary.contains("Left 1 document too large to process as it was"),
+        "{summary}"
+    );
+}
+
+/// A package document too large to read whole leaves nothing to go on, and
+/// the book is refused, saying why, rather than read into memory.
+#[test]
+fn a_package_document_too_large_to_read_refuses_the_book() {
+    let padding = "<!-- padding -->".repeat(32 * 1024 * 1024 / 16 + 1);
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:big</dc:identifier><dc:title>Big</dc:title></metadata>
+  <manifest><item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+{padding}
+</package>
+"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+
+    let error = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .expect_err("a package document of 32 MiB is read");
+    assert!(error.to_string().contains("too large"), "{error}");
+}
+
 /// An image no decoder reads, an icon here, is left as it was, and said to
 /// be: the image step skipped it by its name, and the summary was silent. An
 /// SVG is drawn, not converted, and counts as neither.

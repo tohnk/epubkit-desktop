@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use std::ops::Range;
@@ -112,6 +113,10 @@ pub struct ContentFiles {
     pub fonts: Vec<PathBuf>,
     pub ncx: Vec<PathBuf>,
     pub other: Vec<PathBuf>,
+    /// The chapters, SVG documents, stylesheets and tables of contents too
+    /// large to read whole, which are left exactly as they are. Each is in
+    /// no other list.
+    pub too_large: Vec<PathBuf>,
 }
 
 /// What `fix_toc` did.
@@ -235,12 +240,22 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             continue;
         }
         let media_type = item.media_type.to_ascii_lowercase();
-
-        if media_type == SVG_MEDIA_TYPE
+        let svg = media_type == SVG_MEDIA_TYPE
             || Path::new(&href)
                 .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-        {
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+
+        let document = svg
+            || matches!(
+                media_type.as_str(),
+                "application/xhtml+xml" | "text/html" | "text/css" | NCX_MEDIA_TYPE
+            );
+        if document && crate::too_large_to_read(&path) {
+            files.too_large.push(path);
+            continue;
+        }
+
+        if svg {
             files.svg.push(path.clone());
         }
 
@@ -499,6 +514,72 @@ fn named_files(
         }
     }
     Ok(())
+}
+
+/// Of `images`, those any of `documents` might name, for documents the run
+/// leaves as they are, too large to read whole or too broken to read at all:
+/// an image such a document names keeps its name, and stays as it is, as the
+/// references to it are not rewritten. Each document is read as bytes, a
+/// little at a time, for each image's file name as it is, percent-escaped
+/// as a reference writes it, and in UTF-16 either way round, in any case of
+/// its letters. A name found where it is no reference only leaves an image
+/// unconverted.
+pub fn images_named_in(documents: &[PathBuf], images: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    const CHUNK: u64 = 1 << 20;
+
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    let mut owners = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        let Some(name) = image
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let escaped = encode(&name);
+        for spelling in [name, escaped] {
+            let utf16 = || spelling.encode_utf16();
+            for pattern in [
+                spelling.as_bytes().to_vec(),
+                utf16().flat_map(u16::to_le_bytes).collect(),
+                utf16().flat_map(u16::to_be_bytes).collect(),
+            ] {
+                patterns.push(pattern);
+                owners.push(index);
+            }
+        }
+    }
+
+    let mut named = HashSet::new();
+    if patterns.is_empty() || documents.is_empty() {
+        return Ok(named);
+    }
+    let searcher = aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&patterns)
+        .map_err(|e| Error::InvalidEpub(format!("too many image names to look for: {e}")))?;
+    // A name across the end of what was read is found once the rest is.
+    let overlap = patterns.iter().map(Vec::len).max().unwrap_or(1) - 1;
+
+    for document in documents {
+        let mut reader = fs::File::open(document).map_err(|e| Error::io(document, e))?;
+        let mut buffer = Vec::new();
+        loop {
+            let keep = buffer.len().min(overlap);
+            buffer.drain(..buffer.len() - keep);
+            let read = (&mut reader)
+                .take(CHUNK)
+                .read_to_end(&mut buffer)
+                .map_err(|e| Error::io(document, e))?;
+            for found in searcher.find_overlapping_iter(&buffer) {
+                named.insert(images[owners[found.pattern().as_usize()]].clone());
+            }
+            if read == 0 {
+                break;
+            }
+        }
+    }
+    Ok(named)
 }
 
 /// Declare the images at `paths`, relative to the OPF's directory, which the
@@ -1156,7 +1237,8 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         let Some(path) = resolve_href(root, opf_dir, &decode(&href)) else {
             continue;
         };
-        if !path.is_file() {
+        // One too large to read is left as it is.
+        if !path.is_file() || crate::too_large_to_read(&path) {
             continue;
         }
 
@@ -1795,6 +1877,10 @@ fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
     if !ncx_path.is_file() {
         return Ok(false);
     }
+    // One too large to read is left as it is, as any other document is.
+    if crate::too_large_to_read(ncx_path) {
+        return Ok(true);
+    }
 
     let Ok(doc) = xml::parse_file(ncx_path) else {
         return Ok(false);
@@ -1895,6 +1981,9 @@ fn relative_parts(root: &Path, from: &Path, to: &Path) -> Option<Vec<String>> {
 }
 
 fn chapter_title(path: &Path) -> Option<String> {
+    if crate::too_large_to_read(path) {
+        return None;
+    }
     let bytes = fs::read(path).ok()?;
     let content = html::parse_content(&bytes).ok()?;
 

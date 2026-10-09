@@ -733,6 +733,24 @@ port replaces only an SVG whose box is its image's own: a viewBox from the
 origin the image's size, or none and an image filling the SVG, with nothing
 transforming, clipping or fading it.
 
+### A document too large to read whole is left as it is
+
+The reference read every chapter, stylesheet and table of contents whole and
+parsed it, whatever its size, and parsing takes some fifteen times a
+document's size: a 40 MB chapter took 598 MB and 25 seconds. The port reads
+none larger than 32 MiB. Such a chapter, SVG document, stylesheet or table of
+contents is left exactly as it is and counted in the summary; a package
+document that large leaves nothing to go on, and the book is refused, as it
+is if `encryption.xml` is that large, which could hide anything.
+
+Since no reference in such a document is rewritten, an image it might name
+keeps its name and stays as it is. The document is read as bytes, a megabyte
+at a time, for each image's file name, as it is, percent-escaped, and in
+UTF-16; a name found where it is no reference only leaves that image
+unconverted. A chapter nothing can parse is treated the same way. And as
+what such a document's markup uses cannot be known, no CSS rule is removed
+as unused in a book that has one.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But

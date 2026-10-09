@@ -40,6 +40,14 @@ pub enum Error {
 
     #[error("this EPUB is DRM-protected; remove the DRM first (e.g. with DeDRM and Calibre)")]
     DrmProtected,
+
+    #[error(
+        "{} is too large to read: {} MB, where a document may be {} MB",
+        path.display(),
+        size >> 20,
+        crate::MAX_DOCUMENT_BYTES >> 20
+    )]
+    DocumentTooLarge { path: PathBuf, size: u64 },
 }
 
 impl Error {
