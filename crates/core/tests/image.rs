@@ -764,3 +764,23 @@ fn fine_stripes_shrink_to_an_even_grey() {
         "{width}x{height}: columns from {darkest:.0} to {lightest:.0}"
     );
 }
+
+/// What converting an image will hold is reckoned before its file is read:
+/// the file itself, and the image decoded at its own depth, which for sixteen
+/// bits a channel with alpha is eight bytes a pixel, held twice.
+#[test]
+fn the_memory_an_image_needs_counts_its_file_and_its_depth() {
+    let deep = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
+        64,
+        48,
+        image::Rgba([1, 2, 3, 4]),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deep.png");
+    DynamicImage::ImageRgba16(deep).save(&path).unwrap();
+    let file = std::fs::metadata(&path).unwrap().len();
+
+    let needed = epubkit_core::image::memory_needed(&path);
+
+    assert!(needed >= file + 64 * 48 * 16, "{needed}");
+}

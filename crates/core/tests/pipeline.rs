@@ -1740,3 +1740,51 @@ fn images_take_their_names_in_manifest_order_whatever_finishes_first() {
         "converted differently"
     );
 }
+
+/// A TIFF header claiming 4294967295 x 4294967295 pixels of one grey sample.
+fn impossible_tiff() -> Vec<u8> {
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    let entries: &[(u16, u16, u32)] = &[
+        (256, 4, u32::MAX), // width
+        (257, 4, u32::MAX), // height
+        (258, 3, 8),        // bits per sample
+        (259, 3, 1),        // uncompressed
+        (262, 3, 1),        // black is zero
+        (273, 4, 0),        // strip offsets
+        (277, 3, 1),        // samples per pixel
+        (278, 4, u32::MAX), // rows per strip
+        (279, 4, 0),        // strip byte counts
+    ];
+    tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(tag, kind, value) in entries {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        if kind == 3 {
+            tiff.extend_from_slice(&(value as u16).to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+        } else {
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    tiff.extend_from_slice(&[0; 4]);
+    tiff
+}
+
+/// An image whose header claims more pixels than any could hold is one that
+/// cannot be converted, like any other. Reckoning the memory it would need
+/// overflowed, which in a debug build stopped the whole book.
+#[test]
+fn an_image_claiming_impossible_dimensions_is_skipped() {
+    let images = [
+        ("images/huge.tif", impossible_tiff()),
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+    ];
+    let body = r#"<p><img src="../images/huge.tif" alt=""/></p><p><img src="../images/plate.png" alt=""/></p>"#;
+
+    let (work, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    assert_eq!(report.images_converted, 1);
+    assert_eq!(report.images_unconverted, 1);
+    assert!(work.path().join("OEBPS/images/huge.tif").is_file());
+}

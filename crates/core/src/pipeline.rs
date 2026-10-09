@@ -601,8 +601,10 @@ fn convert_images<P: FnMut(u8, &str)>(
     in_order_in_parallel(
         &jobs,
         |job| -> Result<Option<Vec<image::ProcessedImage>>> {
+            // Set aside before the file is read, so a thread waiting its turn
+            // holds nothing.
+            let _held = budget.hold(image::memory_needed(job.path));
             let bytes = fs::read(job.path).map_err(|e| Error::io(job.path, e))?;
-            let _held = budget.hold(image::memory_needed(&bytes));
             // A single unreadable image must not sink the whole book.
             Ok(image::process_image(&bytes, &job.name, job.options).ok())
         },

@@ -169,17 +169,29 @@ pub fn thumbnail(bytes: &[u8], max_width: u32, max_height: u32) -> Result<Vec<u8
     encode_baseline_jpeg(&image.to_rgb8(), 80, true)
 }
 
-/// About as much memory as converting `bytes` will hold at once, reckoned
-/// from the size its header gives: the decoded image, and the copies made of
-/// it on the way. Nothing, for what has no header to read.
-pub fn memory_needed(bytes: &[u8]) -> u64 {
-    ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
+/// About as much memory as converting the image at `path` will hold at once,
+/// reckoned from its header, before the rest of the file is read: the file
+/// itself, the image decoded at its own depth, which a decoder or a turn can
+/// hold twice, and the copies at eight bits a channel that converting makes.
+/// Just the file, for an image whose header cannot be read or that is too
+/// large to convert at all.
+pub fn memory_needed(path: &Path) -> u64 {
+    let file = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+    let Some(decoder) = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
         .ok()
-        .and_then(|reader| reader.into_dimensions().ok())
-        .map_or(0, |(width, height)| {
-            u64::from(width) * u64::from(height) * 12
-        })
+        .and_then(|reader| reader.into_decoder().ok())
+    else {
+        return file;
+    };
+
+    let (width, height) = decoder.dimensions();
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        return file;
+    }
+    file.saturating_add(decoder.total_bytes().saturating_mul(2))
+        .saturating_add(pixels * 6)
 }
 
 /// Convert one image for the device.
