@@ -2150,6 +2150,35 @@ fn impossible_tiff() -> Vec<u8> {
     tiff
 }
 
+/// An image whose conversion would need more memory than the image step sets
+/// aside for every image together, a 12000 x 12000 PNG of sixteen bits a
+/// channel with alpha here, is left as it is, and said to be, before any of
+/// it is decoded. One the whole budget was too little for converted all the
+/// same, with nothing else beside it, to well past the budget: this one
+/// would take 1.7 GB.
+#[test]
+fn an_image_too_large_for_the_memory_set_aside_is_left_as_it_is() {
+    let images = [
+        ("images/vast.png", common::png_claiming(12000, 12000, 16, 6)),
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+    ];
+    let body = r#"<p><img src="../images/vast.png" alt=""/></p><p><img src="../images/plate.png" alt=""/></p>"#;
+
+    let (work, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    assert_eq!((report.images_converted, report.images_unconverted), (1, 1));
+    assert!(work.path().join("OEBPS/images/vast.png").is_file());
+    let detail = report
+        .image_details
+        .iter()
+        .find(|detail| detail.starts_with("vast.png"))
+        .expect("a word on vast.png");
+    assert!(
+        detail.contains("more than the 1024 MB set aside"),
+        "{detail}"
+    );
+}
+
 /// An image whose header claims more pixels than any could hold is one that
 /// cannot be converted, like any other. Reckoning the memory it would need
 /// overflowed, which in a debug build stopped the whole book.

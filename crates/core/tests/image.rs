@@ -790,23 +790,79 @@ fn fine_stripes_shrink_to_an_even_grey() {
 }
 
 /// What converting an image will hold is reckoned before its file is read:
-/// the file itself, and the image decoded at its own depth, which for sixteen
-/// bits a channel with alpha is eight bytes a pixel, held twice.
+/// the file itself, and the image decoded at its own depth, eight bytes a
+/// pixel for sixteen bits a channel with alpha, with its flat copy of three
+/// bytes a pixel made beside it, where one of eight bits, four bytes a
+/// pixel, is flattened where it lies.
 #[test]
 fn the_memory_an_image_needs_counts_its_file_and_its_depth() {
-    let deep = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
-        64,
-        48,
-        image::Rgba([1, 2, 3, 4]),
-    );
+    let (width, height) = (2000u32, 1500u32);
+    let pixels = u64::from(width) * u64::from(height);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("deep.png");
-    DynamicImage::ImageRgba16(deep).save(&path).unwrap();
-    let file = std::fs::metadata(&path).unwrap().len();
+    let deep = dir.path().join("deep.png");
+    let shallow = dir.path().join("shallow.png");
+    DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgba([1, 2, 3, 4]),
+    ))
+    .save(&deep)
+    .unwrap();
+    DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgba([1, 2, 3, 4]),
+    ))
+    .save(&shallow)
+    .unwrap();
+    let options = ImageOptions::default();
 
-    let needed = epubkit_core::image::memory_needed(&path);
+    let needed = epubkit_core::image::memory_needed(&deep, &options);
+    let file = std::fs::metadata(&deep).unwrap().len();
+    assert!(needed >= file + pixels * 11, "{needed}");
+    let shallow_needed = epubkit_core::image::memory_needed(&shallow, &options);
+    let shallow_file = std::fs::metadata(&shallow).unwrap().len();
+    assert!(
+        shallow_needed >= shallow_file + pixels * 4,
+        "{shallow_needed}"
+    );
+    assert!(needed > shallow_needed, "{needed} {shallow_needed}");
+}
 
-    assert!(needed >= file + 64 * 48 * 16, "{needed}");
+/// A progressive JPEG is decoded whole before any of it is drawn, every
+/// coefficient of every component kept until then, which a JPEG in one scan
+/// does not keep: a tall one, where decoding it is the most converting it
+/// holds, is reckoned to need more.
+#[test]
+fn the_memory_a_progressive_jpeg_needs_counts_its_coefficients() {
+    let (width, height) = (600u16, 12000u16);
+    let pixels = u64::from(width) * u64::from(height);
+    let rgb: Vec<u8> = (0..pixels * 3).map(|i| (i % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut needed = Vec::new();
+    for progressive in [false, true] {
+        let path = dir.path().join(format!("{progressive}.jpg"));
+        let mut encoder = jpeg_encoder::Encoder::new_file(&path, 80).unwrap();
+        encoder.set_progressive(progressive);
+        encoder
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        let file = std::fs::metadata(&path).unwrap().len();
+        let reckoned = epubkit_core::image::memory_needed(&path, &ImageOptions::default());
+        needed.push(reckoned - file);
+    }
+    assert!(needed[1] >= needed[0] + pixels, "{needed:?}");
+}
+
+/// A thumbnail that would need more memory than its budget has is not made,
+/// rather than made with the whole budget and more besides.
+#[test]
+fn a_thumbnail_too_large_for_its_budget_is_not_made() {
+    let source = photo(1000, 1000);
+    let small = epubkit_core::memory::MemoryBudget::new(1 << 20);
+    assert!(epubkit_core::image::thumbnail(&source, 480, 720, &small).is_err());
+    let ample = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    assert!(epubkit_core::image::thumbnail(&source, 480, 720, &ample).is_ok());
 }
 
 /// A thumbnail averages blocks of pixels, and the block sum of a 16-bit image

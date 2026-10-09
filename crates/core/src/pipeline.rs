@@ -632,17 +632,24 @@ fn convert_images<P: FnMut(u8, &str)>(
 
     let mut converted = ConvertedImages::default();
     let mut taken = TakenNames::default();
-    let budget = MemoryBudget::new(IMAGE_MEMORY_BUDGET);
 
     in_order_in_parallel(
         &jobs,
-        |job| -> Result<Option<Vec<image::ProcessedImage>>> {
+        |job| -> Result<Converted> {
             // Set aside before the file is read, so a thread waiting its turn
-            // holds nothing.
-            let _held = budget.hold(image::memory_needed(job.path));
+            // holds nothing; and an image that would need more than all
+            // there is to set aside is left as it is.
+            let needed = image::memory_needed(job.path, job.options);
+            if needed > IMAGE_MEMORY.total() {
+                return Ok(Converted::TooLarge(needed));
+            }
+            let _held = IMAGE_MEMORY.hold(needed);
             let bytes = fs::read(job.path).map_err(|e| Error::io(job.path, e))?;
             // A single unreadable image must not sink the whole book.
-            Ok(image::process_image(&bytes, &job.name, job.options).ok())
+            Ok(match image::process_image(&bytes, &job.name, job.options) {
+                Ok(outputs) => Converted::Done(outputs),
+                Err(_) => Converted::Undecodable,
+            })
         },
         |finished| {
             let percent = START + SPAN * (finished as f64 / jobs.len() as f64);
@@ -651,19 +658,39 @@ fn convert_images<P: FnMut(u8, &str)>(
                 &format!("Processing image {finished}/{}...", jobs.len()),
             );
         },
-        |job, outputs| {
-            let Some(outputs) = outputs? else {
-                report.images_unconverted += 1;
-                report
-                    .image_details
-                    .push(format!("{}: skipped (could not be decoded)", job.name));
-                return Ok(());
+        |job, outcome| {
+            let skipped = match outcome? {
+                Converted::Done(outputs) => {
+                    return converted.take(job, outputs, &mut taken, opf_dir, report)
+                }
+                Converted::Undecodable => "could not be decoded".to_string(),
+                Converted::TooLarge(needed) => format!(
+                    "converting it would take {} MB, more than the {} MB set aside",
+                    needed >> 20,
+                    IMAGE_MEMORY.total() >> 20
+                ),
             };
-            converted.take(job, outputs, &mut taken, opf_dir, report)
+            report.images_unconverted += 1;
+            report
+                .image_details
+                .push(format!("{}: skipped ({skipped})", job.name));
+            Ok(())
         },
     )?;
 
     Ok(converted)
+}
+
+/// What became of one image the image step tried.
+enum Converted {
+    /// Converted to these, a page or two.
+    Done(Vec<image::ProcessedImage>),
+    /// Not decoded: not an image after all, or one in a form the decoders do
+    /// not read.
+    Undecodable,
+    /// Not tried: converting it would need this much memory, more than there
+    /// is to set aside.
+    TooLarge(u64),
 }
 
 /// One image the image step tries to convert.
@@ -748,10 +775,11 @@ impl ConvertedImages {
 }
 
 /// Memory the image step's threads may hold at once for the images they are
-/// converting, as [`image::memory_needed`] reckons it. Enough for the four or
-/// so a machine converts at once, unless they are very large, when they wait
-/// their turn.
-const IMAGE_MEMORY_BUDGET: u64 = 1 << 30;
+/// converting, as [`image::memory_needed`] reckons it, in every run in the
+/// process together. Enough for the four or so a machine converts at once,
+/// unless they are very large, when they wait their turn; an image that
+/// would need more than all of it is not converted.
+static IMAGE_MEMORY: MemoryBudget = MemoryBudget::new(1 << 30);
 
 /// Run `work` on each of `jobs` on as many threads as the machine runs at
 /// once, telling `finished` how many are done each time one is, and hand

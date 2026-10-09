@@ -26,7 +26,7 @@
 //! in RGB). Both land within a level or so per pixel, inside noise the dither
 //! introduces by design.
 
-use std::io::Cursor;
+use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use image::error::{ImageError, LimitError, LimitErrorKind};
@@ -157,17 +157,26 @@ pub fn thumbnail(
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
     let failed = |e: ImageError| Error::Image(e.to_string());
-    let decoder = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| Error::Image(e.to_string()))?
-        .into_decoder()
-        .map_err(failed)?;
-    let _held = budget.hold(memory_for(&decoder));
-    drop(decoder);
+    let needed = Footprint::of(
+        ImageReader::new(Cursor::new(bytes)),
+        &mut Cursor::new(bytes),
+    )
+    .map_or(0, |footprint| footprint.thumbnail());
+    if needed > budget.total() {
+        return Err(Error::Image(format!(
+            "making a thumbnail would take {} MB, more than the {} MB set aside",
+            needed >> 20,
+            budget.total() >> 20
+        )));
+    }
+    let _held = budget.hold(needed);
 
     // At eight bits a channel, which is all a thumbnail has: the block sums
     // of a deeper image overflow.
-    let mut rgb = flatten_onto_white(decode(bytes).map_err(failed)?).into_rgb8();
+    let (decoded, orientation) = decode(bytes).map_err(failed)?;
+    let mut flat = flatten_onto_white(decoded);
+    flat.apply_orientation(orientation);
+    let mut rgb = flat.into_rgb8();
     let (width, height) = fit_within(rgb.width(), rgb.height(), max_width, max_height);
     // Each sum is of 32 bits, so a reduction of more than a few thousand
     // times over goes in steps of sixteen.
@@ -194,34 +203,307 @@ pub fn is_raster_image(path: &Path) -> bool {
         .is_some()
 }
 
-/// About as much memory as converting the image at `path` will hold at once,
-/// reckoned from its header, before the rest of the file is read: the file
-/// itself and [what decoding and converting it hold](memory_for). Just the
-/// file, for an image whose header cannot be read.
-pub fn memory_needed(path: &Path) -> u64 {
+/// About as much memory as converting the image at `path` for `options`
+/// holds at once, reckoned from its header, before the rest of the file is
+/// read: the file itself, and [what decoding and converting it
+/// hold](Footprint::converting). Just the file for an image whose header
+/// cannot be read, which fails as it is decoded, and for one past
+/// [`MAX_PIXELS`], refused before anything is allocated for it.
+pub fn memory_needed(path: &Path, options: &ImageOptions) -> u64 {
     let file = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
+    let footprint = ImageReader::open(path)
         .ok()
-        .and_then(|reader| reader.into_decoder().ok())
-        .map_or(file, |decoder| file.saturating_add(memory_for(&decoder)))
+        .zip(std::fs::File::open(path).ok())
+        .and_then(|(reader, mut header)| Footprint::of(reader, &mut header));
+    file.saturating_add(footprint.map_or(0, |footprint| footprint.converting(options)))
 }
 
-/// What decoding and converting the image `decoder` has read the header of
-/// holds at once: the image decoded at its own depth, which a decoder or a
-/// turn can hold twice, and the copies at eight bits a channel that
-/// converting makes. Nothing for an image too large to convert at all, which
-/// is refused before any of that.
-fn memory_for(decoder: &impl ImageDecoder) -> u64 {
-    let (width, height) = decoder.dimensions();
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS {
-        return 0;
+/// What an image takes in memory as it is decoded and converted, reckoned
+/// from its header. Measured for each format at 64 megapixels; what is
+/// reckoned here is never less.
+struct Footprint {
+    /// Its size as stored, before its EXIF orientation turns it.
+    width: u32,
+    height: u32,
+    /// The image decoded, at its own depth.
+    decoded: u64,
+    /// What its decoder holds beside the decoded image.
+    decoding: u64,
+    /// The image once flat: at eight bits a channel if it had alpha, at its
+    /// own depth if not. A copy of it, turned say, is this big.
+    flat: u64,
+    /// What the flat image holds, which is more where it was flattened in
+    /// the memory the decoded image took.
+    flat_held: u64,
+    /// Whether it is eight-bit RGB, which a thumbnail needs no copy of.
+    flat_rgb8: bool,
+    /// What flattening holds beside the decoded image: nothing where the
+    /// flat image takes the decoded one's place, the flat image where it is
+    /// made anew from a deeper one.
+    flattening: u64,
+    /// Whether its EXIF orientation turns it a quarter, which takes a turned
+    /// copy.
+    quarter_turn: bool,
+}
+
+/// What a page holds once resampled, as it is made grey, dithered and coded:
+/// at most 1024 x 1024 at sixteen bits a channel, its grey and RGB copies,
+/// and the JPEG rewritten, which held 17 MB for a page that size.
+const PAGE_MEMORY: u64 = 32 << 20;
+
+impl Footprint {
+    /// Read from an image's header by `reader`, and from `header`, the same
+    /// image, where its format keeps what its decoder holds further in.
+    /// `None` for one that cannot be decoded, or is past [`MAX_PIXELS`].
+    fn of<R: BufRead + Seek>(
+        reader: ImageReader<R>,
+        header: &mut (impl Read + Seek),
+    ) -> Option<Self> {
+        let reader = reader.with_guessed_format().ok()?;
+        let format = reader.format()?;
+        let mut decoder = reader.into_decoder().ok()?;
+        let (width, height) = decoder.dimensions();
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > MAX_PIXELS {
+            return None;
+        }
+
+        let color = decoder.color_type();
+        let decoded = decoder.total_bytes();
+        let gray = matches!(
+            color,
+            image::ColorType::L8
+                | image::ColorType::La8
+                | image::ColorType::L16
+                | image::ColorType::La16
+        );
+        let flat_alpha = pixels * if gray { 1 } else { 3 };
+        let (flat, flat_held, flattening) = if !color.has_alpha() {
+            (decoded, decoded, 0)
+        } else {
+            match color.bytes_per_pixel() / color.channel_count() {
+                // In the decoded image's memory.
+                1 => (flat_alpha, decoded, 0),
+                // Made anew from a deeper one.
+                2 => (flat_alpha, flat_alpha, flat_alpha),
+                // By way of RGBA at eight bits.
+                _ => (flat_alpha, pixels * 4, pixels * 4),
+            }
+        };
+        let quarter_turn = matches!(
+            decoder.orientation().unwrap_or(Orientation::NoTransforms),
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        );
+
+        let decoding = match format {
+            ImageFormat::Png | ImageFormat::Bmp => 0,
+            // The indices of a frame, beside its colours.
+            ImageFormat::Gif => pixels,
+            // Every coefficient of a progressive scan is kept to its end.
+            ImageFormat::Jpeg => jpeg_coefficients(header, width, height).unwrap_or(decoded),
+            ImageFormat::WebP => match webp_kind(header) {
+                // Luma and quarter-size chroma.
+                Some(WebpKind::Lossy) => pixels * 3 / 2,
+                // Decoded where it lies; a byte a pixel to spare.
+                Some(WebpKind::Lossless) => pixels,
+                _ => decoded,
+            },
+            // The TIFF decoder's own buffer, copied into the image.
+            _ => decoded,
+        };
+
+        Some(Footprint {
+            width,
+            height,
+            decoded,
+            decoding,
+            flat,
+            flat_held,
+            flat_rgb8: color == image::ColorType::Rgb8 || (color.has_alpha() && !gray),
+            flattening,
+            quarter_turn,
+        })
     }
-    decoder
-        .total_bytes()
-        .saturating_mul(2)
-        .saturating_add(pixels * 6)
+
+    /// Its width and height as shown, turned as its EXIF data says.
+    fn shown(&self) -> (u32, u32) {
+        if self.quarter_turn {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    /// The most it holds at once as far as it is flat and turned as shown.
+    fn made_flat(&self) -> u64 {
+        let decoding = self.decoded + self.decoding;
+        let flattening = self.decoded + self.flattening;
+        decoding
+            .max(flattening)
+            .max(self.turning(self.quarter_turn))
+    }
+
+    /// What turning the flat image a quarter holds: it, and the turned copy.
+    fn turning(&self, turns: bool) -> u64 {
+        if turns {
+            self.flat_held + self.flat
+        } else {
+            0
+        }
+    }
+
+    /// The most converting it for `options` holds at once, beside its file:
+    /// decoding it, flattening it, turning it as shown or as Light Novel
+    /// mode might, or resampling it, a page at a time, with the page made
+    /// after.
+    fn converting(&self, options: &ImageOptions) -> u64 {
+        let (width, height) = self.shown();
+        let may_turn = options.light_novel_mode && width > height;
+        let resampling = resample_buffer(width, height, options).max(if may_turn {
+            resample_buffer(height, width, options)
+        } else {
+            0
+        });
+        self.made_flat()
+            .max(self.turning(may_turn))
+            .max(self.flat_held + resampling)
+            + PAGE_MEMORY
+    }
+
+    /// The most making a thumbnail of it holds at once: as far as it is
+    /// flat and turned, then its eight-bit RGB copy.
+    fn thumbnail(&self) -> u64 {
+        let (width, height) = self.shown();
+        let rgb8 = if self.flat_rgb8 {
+            0
+        } else {
+            u64::from(width) * u64::from(height) * 3
+        };
+        self.made_flat().max(self.flat_held + rgb8) + PAGE_MEMORY
+    }
+}
+
+/// The buffer resampling an image `width` x `height` to the size it is
+/// shown at holds: four `f32` for every column of the source at each row of
+/// the result. Nothing for one that is not resampled.
+fn resample_buffer(width: u32, height: u32, options: &ImageOptions) -> u64 {
+    let (clamped_w, clamped_h) =
+        fit_within(width, height, MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION);
+    let (target_w, target_h) =
+        fit_within(clamped_w, clamped_h, options.max_width, options.max_height);
+    if (target_w, target_h) == (width, height) {
+        0
+    } else {
+        u64::from(width) * u64::from(target_h) * 16
+    }
+}
+
+/// What the decoder of the JPEG `header` reads keeps beside the image: for a
+/// progressive one, every coefficient, two bytes each, of each component at
+/// the size its sampling makes it; for one in one scan, nothing.
+fn jpeg_coefficients(header: &mut (impl Read + Seek), width: u32, height: u32) -> Option<u64> {
+    let frame = jpeg_frame(header)?;
+    if !frame.progressive {
+        return Some(0);
+    }
+    let most =
+        |pick: fn(&(u8, u8)) -> u8| frame.sampling.iter().map(pick).max().unwrap_or(1).max(1);
+    let (most_h, most_v) = (u64::from(most(|s| s.0)), u64::from(most(|s| s.1)));
+    let mcus_x = u64::from(width).div_ceil(8 * most_h);
+    let mcus_y = u64::from(height).div_ceil(8 * most_v);
+    Some(
+        frame
+            .sampling
+            .iter()
+            .map(|&(h, v)| mcus_x * u64::from(h) * mcus_y * u64::from(v) * 64 * 2)
+            .sum(),
+    )
+}
+
+/// A JPEG's frame, as its start-of-frame marker says.
+struct JpegFrame {
+    progressive: bool,
+    /// How each component is sampled, across and down.
+    sampling: Vec<(u8, u8)>,
+}
+
+/// The frame of the JPEG `reader` holds, found by stepping over the markers
+/// before it.
+fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
+    let mut two = [0u8; 2];
+    reader.read_exact(&mut two).ok()?;
+    if two != [0xFF, 0xD8] {
+        return None;
+    }
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).ok()?;
+        if byte[0] != 0xFF {
+            return None;
+        }
+        // Fill bytes before the marker.
+        while byte[0] == 0xFF {
+            reader.read_exact(&mut byte).ok()?;
+        }
+        let marker = byte[0];
+        match marker {
+            0x01 | 0xD0..=0xD8 => continue,
+            0xD9 | 0xDA => return None,
+            _ => {}
+        }
+        reader.read_exact(&mut two).ok()?;
+        let length = u16::from_be_bytes(two);
+        let body = usize::from(length.checked_sub(2)?);
+        // Every start of frame but those of a table or reserved marker.
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            let mut frame = vec![0; body];
+            reader.read_exact(&mut frame).ok()?;
+            let count = usize::from(*frame.get(5)?);
+            let sampling = (0..count)
+                .map(|component| frame.get(7 + 3 * component).map(|hv| (hv >> 4, hv & 15)))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(JpegFrame {
+                progressive: matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE),
+                sampling,
+            });
+        }
+        reader.seek(SeekFrom::Current(body as i64)).ok()?;
+    }
+}
+
+/// How a WebP is coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebpKind {
+    Lossy,
+    Lossless,
+    Animated,
+}
+
+/// How the WebP `reader` holds is coded, from its chunks up to the first
+/// image.
+fn webp_kind(reader: &mut (impl Read + Seek)) -> Option<WebpKind> {
+    let mut riff = [0u8; 12];
+    reader.read_exact(&mut riff).ok()?;
+    if &riff[..4] != b"RIFF" || &riff[8..] != b"WEBP" {
+        return None;
+    }
+    loop {
+        let mut chunk = [0u8; 8];
+        reader.read_exact(&mut chunk).ok()?;
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        match &chunk[..4] {
+            b"VP8 " => return Some(WebpKind::Lossy),
+            b"VP8L" => return Some(WebpKind::Lossless),
+            b"ANIM" | b"ANMF" => return Some(WebpKind::Animated),
+            // Chunks are padded to an even size.
+            _ => reader
+                .seek(SeekFrom::Current(i64::from(size) + i64::from(size & 1)))
+                .ok()?,
+        };
+    }
 }
 
 /// Convert one image for the device.
@@ -242,32 +524,46 @@ pub fn process_image(
         Err(_) => "image→JPEG".to_string(),
     };
 
-    let decoded = decode(bytes).map_err(|e| Error::Image(format!("{filename}: {e}")))?;
+    let (decoded, orientation) =
+        decode(bytes).map_err(|e| Error::Image(format!("{filename}: {e}")))?;
 
     // Alpha has to go before anything else; a transparent region would
     // otherwise quantize to whatever the undefined colour channel held.
-    let flattened = flatten_onto_white(decoded);
+    let mut image = flatten_onto_white(decoded);
+    image.apply_orientation(orientation);
 
-    // Light Novel mode turns landscape art: rotated, or split in two.
-    let shape = (flattened.width(), flattened.height());
-    let pages = if options.light_novel_mode {
-        split_for_vertical_reading(flattened, options)
+    // Light Novel mode turns landscape art: rotated, or split in two. Each
+    // page is read from the image where it lies.
+    let reshape = if options.light_novel_mode {
+        reshape_for_vertical_reading(image.width(), image.height(), options)
     } else {
-        vec![flattened]
+        Reshape::Whole
     };
-    let reshaped = pages.len() > 1 || (pages[0].width(), pages[0].height()) != shape;
+    if reshape == Reshape::Turn {
+        // Pillow's `rotate(90)` turns counter-clockwise, which is this crate's
+        // `rotate270`.
+        image = if options.light_novel_rotate_left {
+            image.rotate270()
+        } else {
+            image.rotate90()
+        };
+    }
+    let (width, height) = (image.width(), image.height());
+    let pages = match reshape {
+        Reshape::Split { mid } => vec![(mid, 0, width - mid, height), (0, 0, mid, height)],
+        _ => vec![(0, 0, width, height)],
+    };
+    let reshaped = reshape != Reshape::Whole;
 
     let page_count = pages.len();
     let mut results = Vec::with_capacity(page_count);
 
-    for (index, page) in pages.into_iter().enumerate() {
+    for (index, (x, y, before_w, before_h)) in pages.into_iter().enumerate() {
         let mut details = Vec::new();
 
         if conversion != "baseline JPEG" {
             details.push(conversion.clone());
         }
-
-        let (before_w, before_h) = (page.width(), page.height());
 
         // The spec ceiling first, then the device's own box.
         let (clamped_w, clamped_h) =
@@ -279,9 +575,9 @@ pub fn process_image(
             details.push(format!(
                 "resized {before_w}x{before_h}→{target_w}x{target_h}"
             ));
-            page.resize_exact(target_w, target_h, FilterType::Lanczos3)
+            resize_region(&image, (x, y, before_w, before_h), target_w, target_h)
         } else {
-            page
+            image.crop_imm(x, y, before_w, before_h)
         };
 
         let rgb = if options.grayscale {
@@ -538,9 +834,11 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 
 // ---------------------------------------------------------------- internals
 
-/// Decode an image as a reader shows it: turned the way its EXIF orientation
-/// says. The tag does not survive conversion, so the pixels have to.
-fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+/// Decode an image as it is stored, and the way its EXIF orientation says to
+/// turn it to show it as a reader does. The tag does not survive conversion,
+/// so the pixels have to, but they are turned once flat, when they are no
+/// deeper than they have to be.
+fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
     let mut decoder = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .into_decoder()?;
@@ -561,9 +859,7 @@ fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
 
-    let mut image = DynamicImage::from_decoder(decoder)?;
-    image.apply_orientation(orientation);
-    Ok(image)
+    Ok((DynamicImage::from_decoder(decoder)?, orientation))
 }
 
 /// What the report calls a format: by its usual extension, `PNG`, `GIF`,
@@ -605,22 +901,77 @@ fn nearest_level(value: f32, levels: &[u8]) -> u8 {
 /// Composite any transparency onto white. E-ink has no alpha, and an
 /// unflattened image would quantize its transparent regions to noise.
 fn flatten_onto_white(img: DynamicImage) -> DynamicImage {
-    if !img.color().has_alpha() {
-        return img;
+    match img {
+        DynamicImage::ImageRgba8(rgba) => DynamicImage::ImageRgb8(rgb_over_white(rgba)),
+        DynamicImage::ImageLumaA8(gray) => DynamicImage::ImageLuma8(gray_over_white(gray)),
+        // Eight bits a channel, as any other conversion of a deep image here
+        // makes them, before the alpha goes.
+        DynamicImage::ImageRgba16(rgba) => {
+            let (width, height) = rgba.dimensions();
+            let raw = rgba
+                .pixels()
+                .flat_map(|pixel| {
+                    let alpha = eight_bits(pixel[3]);
+                    [0, 1, 2].map(|channel| over_white(eight_bits(pixel[channel]), alpha))
+                })
+                .collect();
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, raw).expect("3 bytes a pixel"),
+            )
+        }
+        DynamicImage::ImageLumaA16(gray) => {
+            let (width, height) = gray.dimensions();
+            let raw = gray
+                .pixels()
+                .map(|pixel| over_white(eight_bits(pixel[0]), eight_bits(pixel[1])))
+                .collect();
+            DynamicImage::ImageLuma8(
+                GrayImage::from_raw(width, height, raw).expect("a byte a pixel"),
+            )
+        }
+        img if !img.color().has_alpha() => img,
+        img => DynamicImage::ImageRgb8(rgb_over_white(img.into_rgba8())),
     }
+}
 
-    let rgba = img.into_rgba8();
-    let mut out = RgbImage::new(rgba.width(), rgba.height());
-
-    for (target, source) in out.pixels_mut().zip(rgba.pixels()) {
-        let alpha = source[3] as u32;
-        let over = |channel: u8| {
-            (((channel as u32 * alpha) + 255 * (255 - alpha) + 127) / 255).min(255) as u8
-        };
-        *target = Rgb([over(source[0]), over(source[1]), over(source[2])]);
+/// `rgba` laid over white, in the memory it is in: each pixel's three bytes
+/// go where the four of it and those before it were.
+fn rgb_over_white(rgba: image::RgbaImage) -> RgbImage {
+    let (width, height) = rgba.dimensions();
+    let pixels = width as usize * height as usize;
+    let mut raw = rgba.into_raw();
+    for pixel in 0..pixels {
+        let [red, green, blue, alpha] = [0, 1, 2, 3].map(|channel| raw[4 * pixel + channel]);
+        raw[3 * pixel] = over_white(red, alpha);
+        raw[3 * pixel + 1] = over_white(green, alpha);
+        raw[3 * pixel + 2] = over_white(blue, alpha);
     }
+    raw.truncate(3 * pixels);
+    RgbImage::from_raw(width, height, raw).expect("3 bytes a pixel")
+}
 
-    DynamicImage::ImageRgb8(out)
+/// [`rgb_over_white`] for a grey image, a byte a pixel.
+fn gray_over_white(gray: image::GrayAlphaImage) -> GrayImage {
+    let (width, height) = gray.dimensions();
+    let pixels = width as usize * height as usize;
+    let mut raw = gray.into_raw();
+    for pixel in 0..pixels {
+        raw[pixel] = over_white(raw[2 * pixel], raw[2 * pixel + 1]);
+    }
+    raw.truncate(pixels);
+    GrayImage::from_raw(width, height, raw).expect("a byte a pixel")
+}
+
+/// A channel of `alpha` laid over white, as Pillow rounds it.
+fn over_white(channel: u8, alpha: u8) -> u8 {
+    let (channel, alpha) = (u32::from(channel), u32::from(alpha));
+    ((channel * alpha + 255 * (255 - alpha) + 127) / 255).min(255) as u8
+}
+
+/// A sixteen-bit sample at eight bits, rounded as this crate's conversions
+/// round it.
+fn eight_bits(sample: u16) -> u8 {
+    ((u32::from(sample) + 128) / 257) as u8
 }
 
 /// Light Novel mode: make landscape artwork readable on a portrait panel.
@@ -633,15 +984,14 @@ fn flatten_onto_white(img: DynamicImage) -> DynamicImage {
 /// ornament or a small figure, gains nothing, nor does one nearly square. And
 /// an image more than [`MAX_SPREAD_ASPECT`] times as wide as it is tall is a
 /// rule or a banner rather than a page or a spread of two, and stays whole.
-fn split_for_vertical_reading(img: DynamicImage, options: &ImageOptions) -> Vec<DynamicImage> {
-    let (width, height) = (img.width(), img.height());
+fn reshape_for_vertical_reading(width: u32, height: u32, options: &ImageOptions) -> Reshape {
     if width <= height {
-        return vec![img];
+        return Reshape::Whole;
     }
 
     let aspect = width as f64 / height as f64;
     if aspect > MAX_SPREAD_ASPECT {
-        return vec![img];
+        return Reshape::Whole;
     }
     let shown = shown_scale(width, height, options);
 
@@ -649,24 +999,69 @@ fn split_for_vertical_reading(img: DynamicImage, options: &ImageOptions) -> Vec<
     if aspect > SPREAD_ASPECT {
         let mid = width / 2;
         if shown_scale(width - mid, height, options) < shown * RESHAPE_GAIN {
-            return vec![img];
+            return Reshape::Whole;
         }
-        return vec![
-            img.crop_imm(mid, 0, width - mid, height),
-            img.crop_imm(0, 0, mid, height),
-        ];
+        return Reshape::Split { mid };
     }
 
     if shown_scale(height, width, options) < shown * RESHAPE_GAIN {
-        return vec![img];
+        return Reshape::Whole;
     }
-    // Pillow's `rotate(90)` turns counter-clockwise, which is this crate's
-    // `rotate270`.
-    vec![if options.light_novel_rotate_left {
-        img.rotate270()
-    } else {
-        img.rotate90()
-    }]
+    Reshape::Turn
+}
+
+/// How Light Novel mode reshapes an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reshape {
+    /// Not at all.
+    Whole,
+    /// Into two pages, either side of the column `mid`, the right half first.
+    Split { mid: u32 },
+    /// Turned a quarter, to stand on the panel.
+    Turn,
+}
+
+/// The part of `image` at `x`, `y`, `region_width` wide and `region_height`
+/// high, resized to `width` x `height` as `resize_exact` resizes a copy of
+/// it, but read where it lies.
+fn resize_region(
+    image: &DynamicImage,
+    (x, y, region_width, region_height): (u32, u32, u32, u32),
+    width: u32,
+    height: u32,
+) -> DynamicImage {
+    use image::imageops::{crop_imm, resize};
+    let filter = FilterType::Lanczos3;
+    let (w, h) = (region_width, region_height);
+    match image {
+        DynamicImage::ImageLuma8(buffer) => DynamicImage::ImageLuma8(resize(
+            &*crop_imm(buffer, x, y, w, h),
+            width,
+            height,
+            filter,
+        )),
+        DynamicImage::ImageRgb8(buffer) => DynamicImage::ImageRgb8(resize(
+            &*crop_imm(buffer, x, y, w, h),
+            width,
+            height,
+            filter,
+        )),
+        DynamicImage::ImageLuma16(buffer) => DynamicImage::ImageLuma16(resize(
+            &*crop_imm(buffer, x, y, w, h),
+            width,
+            height,
+            filter,
+        )),
+        DynamicImage::ImageRgb16(buffer) => DynamicImage::ImageRgb16(resize(
+            &*crop_imm(buffer, x, y, w, h),
+            width,
+            height,
+            filter,
+        )),
+        other => other
+            .crop_imm(x, y, w, h)
+            .resize_exact(width, height, filter),
+    }
 }
 
 /// How much bigger Light Novel mode has to show art to reshape it.
@@ -744,4 +1139,74 @@ fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, halve_chroma: bool) -> Resu
         .map_err(|e| Error::Image(format!("JPEG encoding failed: {e}")))?;
 
     Ok(crate::jpeg::optimize_huffman(&out).unwrap_or(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A progressive JPEG's coefficients are two bytes each, for each
+    /// component at the size its sampling makes it, whole MCUs of it: at
+    /// 4:2:0, luma at full size and two chromas at a quarter, three bytes a
+    /// pixel. One in a single scan keeps none.
+    #[test]
+    fn a_progressive_jpeg_keeps_two_bytes_a_coefficient() {
+        let (width, height) = (160u16, 96u16);
+        let rgb = vec![128u8; usize::from(width) * usize::from(height) * 3];
+        for (progressive, sampling, expected) in [
+            (false, jpeg_encoder::SamplingFactor::F_2_2, 0),
+            (true, jpeg_encoder::SamplingFactor::F_2_2, 160 * 96 * 3),
+            (true, jpeg_encoder::SamplingFactor::F_1_1, 160 * 96 * 6),
+        ] {
+            let mut jpeg = Vec::new();
+            let mut encoder = JpegEncoder::new(&mut jpeg, 80);
+            encoder.set_progressive(progressive);
+            encoder.set_sampling_factor(sampling);
+            encoder.encode(&rgb, width, height, ColorType::Rgb).unwrap();
+            let coefficients =
+                jpeg_coefficients(&mut Cursor::new(&jpeg), u32::from(width), u32::from(height));
+            assert_eq!(coefficients, Some(expected), "{progressive} {sampling:?}");
+        }
+    }
+
+    /// The kind of a WebP is read from its chunks, an extended one's too.
+    #[test]
+    fn a_webp_is_known_by_its_chunks() {
+        let chunk = |fourcc: &[u8; 4], body: &[u8]| {
+            let mut chunk = fourcc.to_vec();
+            chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            chunk.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                chunk.push(0);
+            }
+            chunk
+        };
+        let riff = |chunks: Vec<Vec<u8>>| {
+            let body: Vec<u8> = chunks.concat();
+            let mut riff = b"RIFF".to_vec();
+            riff.extend_from_slice(&(body.len() as u32 + 4).to_le_bytes());
+            riff.extend_from_slice(b"WEBP");
+            riff.extend_from_slice(&body);
+            riff
+        };
+        let cases = [
+            (riff(vec![chunk(b"VP8 ", &[0; 10])]), WebpKind::Lossy),
+            (riff(vec![chunk(b"VP8L", &[0; 5])]), WebpKind::Lossless),
+            (
+                riff(vec![
+                    chunk(b"VP8X", &[0; 10]),
+                    chunk(b"ALPH", &[0; 3]),
+                    chunk(b"VP8 ", &[0; 4]),
+                ]),
+                WebpKind::Lossy,
+            ),
+            (
+                riff(vec![chunk(b"VP8X", &[0; 10]), chunk(b"ANIM", &[0; 6])]),
+                WebpKind::Animated,
+            ),
+        ];
+        for (webp, kind) in cases {
+            assert_eq!(webp_kind(&mut Cursor::new(&webp)), Some(kind));
+        }
+    }
 }

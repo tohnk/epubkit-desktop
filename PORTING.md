@@ -587,6 +587,30 @@ images wait their turn. Each image is then named, written and reported in the
 manifest's order, so the book that comes out is the same whatever order they
 finished in.
 
+What an image needs is reckoned from its header before its file is read, by
+what each step of converting it holds at once, measured for each format: the
+file; the image decoded at its own depth, with what its decoder keeps beside
+it, every coefficient of a progressive JPEG say, or a TIFF decoder's own
+copy; a copy made to flatten a deeper image's alpha; a copy turned as the
+EXIF data says, or as Light Novel mode might; and the buffer resampling it
+holds, four `f32` for every source column at each row of the result. Never
+less than the conversion takes, and some 32 MB more. The 1 GiB is shared by
+every book converted in the process, and an image that would need more than
+all of it is left as it is and counted with those that could not be
+converted, before any of it is decoded: a 16-bit RGBA PNG at Pillow's limit
+of 179 megapixels needs about 2 GB, and took 2.7 GB. In practice that is
+only an image of 90 megapixels or more, with alpha or progressive or turned.
+
+To need less, an image of eight bits a channel is flattened where it lies,
+not copied, and turned only once flat; and a split spread's pages are read
+from the image where they lie, not cut out of it first. The same image comes
+out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
+794 MB.
+
+A thumbnail for the desktop's book list is reckoned the same way, out of
+512 MiB for all of them, and one that would need more is not made: the book
+is shown without its cover.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book

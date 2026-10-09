@@ -20,6 +20,11 @@ impl MemoryBudget {
         }
     }
 
+    /// All there is to hold. Work that would need more is not to be started.
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
     /// Hold `amount`, or the whole budget if it is more, waiting until that
     /// much is left. It is given back when what this returns is dropped.
     pub fn hold(&self, amount: u64) -> HeldMemory<'_> {
