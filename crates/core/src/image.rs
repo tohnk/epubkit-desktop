@@ -183,6 +183,17 @@ pub fn thumbnail(
     encode_baseline_jpeg(&rgb, 80, true)
 }
 
+/// Is the file at `path` an image the image step reads: in a format it
+/// decodes, with a header that reads? A file that only begins like one, text
+/// starting "BM" as a BMP does, is not.
+pub fn is_raster_image(path: &Path) -> bool {
+    ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()
+        .and_then(|reader| reader.into_decoder().ok())
+        .is_some()
+}
+
 /// About as much memory as converting the image at `path` will hold at once,
 /// reckoned from its header, before the rest of the file is read: the file
 /// itself and [what decoding and converting it hold](memory_for). Just the

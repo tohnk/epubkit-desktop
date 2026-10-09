@@ -2,7 +2,7 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -253,6 +253,8 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             // Some books mislabel or omit the media type; fall back to the
             // extension before giving up on a file.
             _ if has_font_extension(&href) => files.fonts.push(path),
+            // An image is one whatever the manifest calls it.
+            _ if crate::image::is_raster_image(&path) => files.images.push(path),
             _ => files.other.push(path),
         }
     }
@@ -401,6 +403,115 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
     item.set_attribute("media-type", "image/jpeg").ok();
 
     Ok(())
+}
+
+/// The raster images the book's chapters, SVG documents and stylesheets name
+/// that its manifest leaves out, in the order of their paths. They are part
+/// of the book as it is read all the same. A file under `META-INF` is the
+/// container's, not the book's, and one named in two spellings of a letter's
+/// case is taken once, as a filesystem that ignores case holds it once.
+///
+/// `chapters` are those the steps after the image step rewrite references
+/// in, and so are the SVG documents and stylesheets read here.
+pub fn undeclared_images(
+    root: &Path,
+    opf_dir: &Path,
+    opf: &Document,
+    chapters: &[&Path],
+    content: &ContentFiles,
+) -> Result<Vec<PathBuf>> {
+    let fold = |path: &Path| path.to_string_lossy().to_lowercase();
+    let mut taken: HashSet<String> = manifest_items(opf)?
+        .iter()
+        .filter_map(|item| resolve_href(root, opf_dir, &item.decoded_href()))
+        .map(|path| fold(&path))
+        .collect();
+
+    let mut named = BTreeSet::new();
+    for &path in chapters {
+        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+        let content = html::parse_content(&bytes)?;
+        named_files(
+            &content.doc,
+            root,
+            path.parent().unwrap_or(opf_dir),
+            &mut named,
+        )?;
+    }
+    // One that is not well-formed is left as it is, its references too.
+    for path in content.svg.iter().filter(|path| path.is_file()) {
+        if let Ok(doc) = xml::parse_file(path) {
+            named_files(&doc, root, path.parent().unwrap_or(opf_dir), &mut named)?;
+        }
+    }
+    for path in content.css.iter().filter(|path| path.is_file()) {
+        let css = crate::css::read_stylesheet(path)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        named.extend(
+            css_urls(&css)
+                .iter()
+                .filter_map(|url| target_of(root, base, url)),
+        );
+    }
+
+    let container = root.join("META-INF");
+    Ok(named
+        .into_iter()
+        .filter(|path| {
+            !path.starts_with(&container)
+                && path.is_file()
+                && crate::image::is_raster_image(path)
+                && taken.insert(fold(path))
+        })
+        .collect())
+}
+
+/// Note in `named` every file `doc`, a document in `base`, names where
+/// [`rewrite_references`] would rewrite a reference to it.
+fn named_files(
+    doc: &Document,
+    root: &Path,
+    base: &Path,
+    named: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut note = |reference: &str| named.extend(target_of(root, base, reference));
+    for node in xml::find_nodes(doc, "//*")? {
+        for &attribute in URL_ATTRIBUTES {
+            if let Some(value) = node.get_attribute_no_ns(attribute) {
+                note(&value);
+            }
+        }
+        if let Some(value) = node.get_attribute_ns("href", NS_XLINK) {
+            note(&value);
+        }
+        if let Some(srcset) = node.get_attribute_no_ns("srcset") {
+            for url in srcset_urls(&srcset) {
+                note(&srcset[url]);
+            }
+        }
+        if let Some(style) = node.get_attribute_no_ns("style") {
+            css_urls(&style).iter().for_each(|url| note(url));
+        }
+        if local_name(&node) == "style" {
+            css_urls(&node.get_content())
+                .iter()
+                .for_each(|url| note(url));
+        }
+    }
+    Ok(())
+}
+
+/// Declare the images at `paths`, relative to the OPF's directory, which the
+/// image step converted from files the manifest left out: each a JPEG, under
+/// an id of its own. Returns how many were declared.
+pub fn declare_images(doc: &Document, paths: &[String]) -> Result<usize> {
+    let mut ids = ids_in(doc)?;
+    for path in paths {
+        let id = unused_id(&ids, "image");
+        add_image_to_opf(doc, &encode(path), &id)?;
+        ids.insert(id);
+    }
+    Ok(paths.len())
 }
 
 /// Rewrite image references inside one XHTML file: every attribute that names

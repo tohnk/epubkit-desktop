@@ -564,6 +564,16 @@ type or its name, and reads each one's format from its bytes. The converted
 file takes the name with `.jpg` for whatever extension it had, references
 follow it, and the summary counts it by what it was: a PNG named `plate.jpg`
 is a `PNG→JPEG`. One no decoder reads is left as it was and counted as such.
+
+Nor does the port go by the media type alone. An item the manifest calls
+something else, `application/octet-stream` say, or nothing, is an image if
+it reads as one: in a format the image step decodes, with a header that
+reads, so that text which merely starts "BM", as a BMP does, is not one. And
+an image a chapter, an SVG document or a stylesheet shows, which the manifest
+leaves out, is part of the book as it is read: it is converted like the
+rest, its references follow it, and it is declared, as the JPEG it became.
+An image nothing names, or a file under `META-INF`, is left alone. The
+reference left both kinds as they were.
 The summary's total is these images, the ones in the book that are not SVG,
 so it no longer counts SVG images, which are drawn and never converted, or
 images the manifest declares and the book lacks.

@@ -1025,6 +1025,123 @@ fn an_image_is_converted_whatever_its_name() {
     );
 }
 
+/// An image is an image whatever media type the manifest gives it. One
+/// declared `application/octet-stream`, or with no media type at all, was
+/// left as it was. A file that only begins like one, text that starts "BM"
+/// as a BMP does, is not one, and is left alone without a word.
+#[test]
+fn an_image_declared_as_something_else_is_converted() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let notes = b"BMW notes, not a bitmap at all".to_vec();
+    let files = [
+        ("images/plate.png", "application/octet-stream", png.clone()),
+        ("images/scan.png", "", png),
+        ("images/notes.txt", "text/plain", notes.clone()),
+    ];
+    let body = r#"<p><img src="../images/plate.png" alt=""/></p><p><img src="../images/scan.png" alt=""/></p><p><a href="../images/notes.txt">Notes</a></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/plate.jpg", "../images/scan.jpg"]
+    );
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in ["images/plate.jpg", "images/scan.jpg"] {
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+    }
+    assert!(
+        opf.contains(r#"href="images/notes.txt" media-type="text/plain""#),
+        "{opf}"
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/notes.txt")).unwrap(),
+        notes
+    );
+    assert_manifest_matches_archive(work.path());
+    assert_eq!(
+        (
+            report.images_converted,
+            report.images_unconverted,
+            report.images_total
+        ),
+        (2, 0, 2)
+    );
+}
+
+/// An image a chapter or a stylesheet shows is part of the book as it is
+/// read, though the manifest leaves it out. It was left as it was. Now it is
+/// converted, its references follow, and it is declared. An image nothing
+/// names, and a file named that is not an image, are left alone.
+#[test]
+fn an_image_the_manifest_leaves_out_is_converted_and_declared() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let css = b"body { background-image: url(../images/paper.png); }\n".to_vec();
+    let files = [
+        ("styles/main.css", "text/css", css),
+        ("images/missing.png", UNDECLARED, png.clone()),
+        ("images/paper.png", UNDECLARED, png.clone()),
+        ("images/stray.png", UNDECLARED, png.clone()),
+        ("images/notes.txt", UNDECLARED, b"notes".to_vec()),
+    ];
+    let body = r#"<p><img src="../images/missing.png" alt=""/></p><p><a href="../images/notes.txt">Notes</a></p>"#;
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        body,
+        &ProcessingOptions::default(),
+    );
+
+    assert_eq!(chapter_sources(work.path()), ["../images/missing.jpg"]);
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/main.css")).unwrap();
+    assert!(css.contains("url(../images/paper.jpg)"), "{css}");
+
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in ["images/missing.jpg", "images/paper.jpg"] {
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+        assert!(work.path().join("OEBPS").join(href).is_file(), "{href}");
+    }
+    for left in ["images/stray.png", "images/notes.txt"] {
+        assert!(work.path().join("OEBPS").join(left).is_file(), "{left}");
+        assert!(!opf.contains(left), "{left}: {opf}");
+    }
+    assert!(!work.path().join("OEBPS/images/missing.png").exists());
+
+    assert_eq!(report.images_converted, 2);
+    let summary = report.summary();
+    assert!(
+        summary.contains("Declared 2 images the manifest left out"),
+        "{summary}"
+    );
+}
+
+/// Split in Light Novel mode, a spread the manifest left out has both its
+/// pages declared, the first as the image it was, the second beside it.
+#[test]
+fn a_spread_the_manifest_leaves_out_has_both_pages_declared() {
+    let files = [("images/spread.png", UNDECLARED, spread())];
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        "",
+        r#"<div><img src="../images/spread.png" alt=""/></div>"#,
+        &light_novel(),
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_manifest_matches_archive(work.path());
+    assert_eq!((report.images_declared, report.spreads_split), (1, 1));
+}
+
 /// An image no decoder reads, an icon here, is left as it was, and said to
 /// be: the image step skipped it by its name, and the summary was silent. An
 /// SVG is drawn, not converted, and counts as neither.
@@ -1609,7 +1726,12 @@ fn light_novel_book(
     optimize_files(files, metadata, head, body, &light_novel()).0
 }
 
-/// [`light_novel_book`] with `options`, and what the run reported.
+/// What [`optimize_files`] takes for the media type of a file it is to leave
+/// out of the manifest, though the book holds it.
+const UNDECLARED: &str = "(not in the manifest)";
+
+/// [`light_novel_book`] with `options`, and what the run reported. A file of
+/// media type [`UNDECLARED`] is in the book but not in its manifest.
 fn optimize_files(
     files: &[(&str, &str, Vec<u8>)],
     metadata: &str,
@@ -1620,6 +1742,7 @@ fn optimize_files(
     let manifest: String = files
         .iter()
         .enumerate()
+        .filter(|(_, (_, media_type, _))| *media_type != UNDECLARED)
         .map(|(index, (href, media_type, _))| {
             format!(r#"<item id="file{index}" href="{href}" media-type="{media_type}"/>"#)
         })

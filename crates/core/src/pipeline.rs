@@ -92,11 +92,14 @@ pub struct ProcessingReport {
 
     /// Source images converted. A split spread counts once.
     pub images_converted: usize,
-    /// The images the image step tried: every one the manifest declares and
-    /// the book holds, but for SVG.
+    /// The images the image step tried: every one the book holds that its
+    /// manifest declares or a document shows, but for SVG.
     pub images_total: usize,
     /// Images the image step could not convert, left as they were.
     pub images_unconverted: usize,
+    /// Images the book shows that its manifest left out, declared once
+    /// converted.
+    pub images_declared: usize,
     /// Double-page spreads Light Novel mode split into pages.
     pub spreads_split: usize,
     /// e.g. `{"PNG→JPEG": 5}` — how the images were transformed.
@@ -152,6 +155,11 @@ impl ProcessingReport {
             parts.push(format!(
                 "Left {n} image{plural} that could not be converted as {as_it_was}"
             ));
+        }
+        if self.images_declared > 0 {
+            let n = self.images_declared;
+            let plural = if n == 1 { "" } else { "s" };
+            parts.push(format!("Declared {n} image{plural} the manifest left out"));
         }
         if self.spreads_split > 0 {
             let plural = if self.spreads_split == 1 { "" } else { "s" };
@@ -343,12 +351,15 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         HashSet::new()
     };
     progress(15, "Processing images...");
-    // Every image the manifest declares, whatever its name, but for SVG,
-    // which is drawn and stays as it is.
+    // Every image the manifest declares, whatever its name or media type, but
+    // for SVG, which is drawn and stays as it is; then those the book shows
+    // that the manifest leaves out.
+    let undeclared = structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content)?;
     let rasters: Vec<PathBuf> = content
         .images
         .iter()
         .filter(|path| !content.svg.contains(path))
+        .chain(&undeclared)
         .cloned()
         .collect();
     let converted = convert_images(
@@ -387,6 +398,21 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // A renamed image's entry is declared a JPEG as it is pointed at its new
     // file. One that kept its name is a JPEG now all the same.
     structure::declare_jpegs(&opf, work_dir, &opf_dir, &converted.in_place)?;
+    // One the manifest left out is declared, as the JPEG it became.
+    let declared: Vec<String> = undeclared
+        .iter()
+        .filter_map(|path| {
+            let relative = structure::relative_path(work_dir, &opf_dir, path)?;
+            let name = converted.renames.get(&relative)?;
+            Some(
+                Path::new(&relative)
+                    .with_file_name(name)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        })
+        .collect();
+    report.images_declared = structure::declare_images(&opf, &declared)?;
 
     // A rotated image or a split spread no longer has the shape its pages
     // describe, and a split one has pages no page shows yet.
