@@ -1687,6 +1687,136 @@ fn light_novel_mode_still_splits_a_spread_shown_on_its_own() {
     );
 }
 
+/// Optimize, in Light Novel mode, a book showing `images/plate.png` by
+/// `body`, with `css` in a stylesheet the chapter links and `style` in a
+/// `<style>` element of its own. Returns the unpacked output.
+fn styled_plate(css: &str, style: &str, body: &str) -> tempfile::TempDir {
+    light_novel_book(
+        &[
+            ("images/plate.png", "image/png", spread()),
+            ("styles/main.css", "text/css", css.as_bytes().to_vec()),
+        ],
+        "",
+        &format!(
+            r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/><style type="text/css">{style}</style>"#
+        ),
+        body,
+    )
+}
+
+/// An image in a box the book sizes for it would not fit it reshaped: a
+/// split image's second page was cut off below the frame, or ran over what
+/// came after it, and a turned one stood on end in a box made for it lying
+/// down. Nor would an image the book turns itself, or lays over another
+/// thing: its pages were turned again, or laid over each other.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_in_a_frame() {
+    let cases = [
+        // A frame by style attributes, and the same by a stylesheet.
+        (
+            "",
+            "",
+            r#"<p>Text.</p><div style="width:500px;height:200px;overflow:hidden"><img src="../images/plate.png" alt="" style="width:100%;height:100%"/></div><p>After.</p>"#,
+        ),
+        (
+            ".frame { width: 500px; height: 200px; overflow: hidden; } .frame img { width: 100%; height: 100%; }",
+            "",
+            r#"<p>Text.</p><div class="frame"><img src="../images/plate.png" alt=""/></div><p>After.</p>"#,
+        ),
+        // A height capped in another unit, by an id, in a media query of
+        // the chapter's own style.
+        (
+            "",
+            "@media screen { #box { max-height: 12em } }",
+            r#"<div id="box"><p><img src="../images/plate.png" alt=""/></p></div>"#,
+        ),
+        // A box a screen high holds one page, and a box of a set shape one
+        // shape.
+        (
+            "div.page { height: 100vh }",
+            "",
+            r#"<div class="page"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "figure { aspect-ratio: 5 / 2 }",
+            "",
+            r#"<figure><img src="../images/plate.png" alt=""/></figure>"#,
+        ),
+        // A frame around an SVG that shows the image.
+        (
+            "",
+            "",
+            r#"<div style="height: 200px"><svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/plate.png"/></svg></div>"#,
+        ),
+        // The image's own height, which each page would take.
+        (
+            "img.plate { height: 200px }",
+            "",
+            r#"<div><img class="plate" src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // An image the book turns, and one it lays over the page.
+        (
+            "",
+            "",
+            r#"<div><img src="../images/plate.png" alt="" style="transform: rotate(90deg)"/></div>"#,
+        ),
+        (
+            ".over { position: absolute; top: 0; left: 0 }",
+            "",
+            r#"<div><img class="over" src="../images/plate.png" alt=""/></div>"#,
+        ),
+    ];
+
+    for (css, style, body) in cases {
+        let work = styled_plate(css, style, body);
+        assert_eq!(
+            chapter_sources(work.path()),
+            ["../images/plate.jpg"],
+            "css: {css:?}, style: {style:?}, body: {body}"
+        );
+        assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+    }
+}
+
+/// Only what a reshaped image would not fit keeps it whole: a box fitted to
+/// the page, one that grows to hold both pages, and rules for other things
+/// leave a spread to be split.
+#[test]
+fn light_novel_mode_still_splits_a_spread_in_a_box_that_grows() {
+    let cases = [
+        // Fitted to the page, as light novels' plates are.
+        (
+            ".plate { height: 100%; text-align: center } .plate img { max-width: 100%; max-height: 100% }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A screen high itself, which each page then is.
+        (
+            "img { height: 95vh }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A set width, or a least height, which a box grows past.
+        (
+            "div.wide { width: 500px; min-height: 10em }",
+            r#"<div class="wide"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // Rules for something else: another class, a box drawn before the
+        // image's, and a box of the right class but another element.
+        (
+            ".other { height: 200px } div.plate:before { content: ''; height: 2em } p.plate { height: 200px }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+    ];
+
+    for (css, body) in cases {
+        let work = styled_plate(css, "", body);
+        assert_eq!(
+            chapter_sources(work.path()),
+            ["../images/plate_part1.jpg", "../images/plate_part2.jpg"],
+            "css: {css:?}, body: {body}"
+        );
+    }
+}
+
 // --------------------------------------------- images converted in parallel
 
 /// Images are converted on several threads, and finish in whatever order

@@ -15,7 +15,7 @@ use std::path::Path;
 
 use std::sync::LazyLock;
 
-use cssparser::{ParseError, Parser, ParserInput, Token};
+use cssparser::{Delimiter, ParseError, Parser, ParserInput, Token};
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use libxml::bindings::xmlNodePtr;
 use libxml::tree::{Document, Node, NodeType};
@@ -181,7 +181,7 @@ pub fn remove_unused_css(css_text: &str, used: &UsedSelectors) -> (String, usize
     let unused: Vec<Range<usize>> = rules(css_text, 0)
         .into_iter()
         .filter_map(|rule| match rule.kind {
-            RuleKind::Style { selectors } => {
+            RuleKind::Style { selectors, .. } => {
                 (!selector_matches_used(&css_text[selectors], used)).then_some(rule.span)
             }
             RuleKind::At { .. } => None,
@@ -513,7 +513,7 @@ fn embedded_font_cuts(css: &str) -> Vec<Edit> {
 /// Where the `@font-face` rules among `rules`, and inside them, are.
 fn font_faces(rules: Vec<Rule>, found: &mut Vec<Range<usize>>) {
     for rule in rules {
-        if let RuleKind::At { name, children } = rule.kind {
+        if let RuleKind::At { name, children, .. } = rule.kind {
             if name == "font-face" {
                 found.push(rule.span);
             } else {
@@ -551,11 +551,20 @@ struct Rule {
 }
 
 enum RuleKind {
-    /// A style rule, and where its selectors are written.
-    Style { selectors: Range<usize> },
-    /// An at-rule, its name lowercased, and the rules inside it, if it is a
-    /// grouping rule read into.
-    At { name: String, children: Vec<Rule> },
+    /// A style rule, where its selectors are written, and where its
+    /// declarations are, inside its braces.
+    Style {
+        selectors: Range<usize>,
+        declarations: Range<usize>,
+    },
+    /// An at-rule, its name lowercased, where what follows the name is
+    /// written, up to its block or its end, and the rules inside it, if it
+    /// is a grouping rule read into.
+    At {
+        name: String,
+        prelude: Range<usize>,
+        children: Vec<Rule>,
+    },
 }
 
 /// The rules of `css`, reading into grouping rules `depth` levels deep.
@@ -585,8 +594,11 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
             Token::CDO | Token::CDC => continue,
             Token::AtKeyword(name) => {
                 let name = name.to_ascii_lowercase();
+                let prelude_start = parser.position().byte_index();
+                let mut prelude = prelude_start..prelude_start;
                 let mut children = Vec::new();
                 loop {
+                    prelude.end = parser.position().byte_index();
                     match parser.next() {
                         Ok(Token::CurlyBracketBlock) => {
                             if depth > 0 && GROUPING_RULES.contains(&name.as_str()) {
@@ -600,17 +612,28 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
                         Ok(_) => {}
                     }
                 }
-                RuleKind::At { name, children }
+                RuleKind::At {
+                    name,
+                    prelude,
+                    children,
+                }
             }
             first => {
                 // A style rule's selectors run up to its block. Skipping the
                 // blanks before each token also gets past the inside of a
                 // bracket the last one opened, so the selectors end after it.
                 let mut selectors_end = start;
+                let mut declarations = start..start;
                 let mut token = first;
                 loop {
                     if matches!(token, Token::CurlyBracketBlock) {
+                        let open = parser.position();
                         skip_block(parser);
+                        // Less the closing brace, which a block left open at
+                        // the end does not have.
+                        let block = parser.slice_from(open);
+                        let length = block.strip_suffix('}').unwrap_or(block).len();
+                        declarations = open.byte_index()..open.byte_index() + length;
                         break;
                     }
                     parser.skip_whitespace();
@@ -622,6 +645,7 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
                 }
                 RuleKind::Style {
                     selectors: start..selectors_end,
+                    declarations,
                 }
             }
         };
@@ -646,6 +670,350 @@ fn read_block<T: Default>(parser: &mut Parser<'_, '_>, read: impl FnOnce(&mut Pa
 /// Skip the block `parser` has just opened.
 fn skip_block(parser: &mut Parser<'_, '_>) {
     read_block(parser, |_| ());
+}
+
+// ------------------------------------------------------- how boxes are sized
+
+/// What the CSS styling an element says of the size of its box, as far as
+/// Light Novel mode needs to know: whether an image shown in it, or as it,
+/// would fit there turned, or as the pages of a split one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BoxSizing {
+    /// A `height` or `max-height` that is a length of its own, in pixels,
+    /// ems and the like, which the box cannot grow past.
+    pub fixed_height: bool,
+    /// A `height` or `max-height` that is a share of the screen, in `vh` and
+    /// the like.
+    pub screen_height: bool,
+    /// A `width` other than `auto`.
+    pub width: bool,
+    /// An `aspect-ratio`, which keeps the box one shape.
+    pub aspect_ratio: bool,
+    /// `position: absolute` or `fixed`, which lays the box over whatever else
+    /// is there.
+    pub positioned: bool,
+    /// A `transform` or `rotate`, which turns, slants or moves what the box
+    /// shows.
+    pub transformed: bool,
+}
+
+impl BoxSizing {
+    /// Add what `other` says to what this says.
+    pub(crate) fn add(&mut self, other: BoxSizing) {
+        self.fixed_height |= other.fixed_height;
+        self.screen_height |= other.screen_height;
+        self.width |= other.width;
+        self.aspect_ratio |= other.aspect_ratio;
+        self.positioned |= other.positioned;
+        self.transformed |= other.transformed;
+    }
+}
+
+/// A book's rules that size boxes: what each says, and what its selectors
+/// ask of the elements it styles.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BoxRules {
+    rules: Vec<(Vec<Subject>, BoxSizing)>,
+}
+
+impl BoxRules {
+    /// Add the rules of `css` that size boxes. Those in `@media` and other
+    /// grouping rules count, as they hold on some screen, but for those only
+    /// for print.
+    pub(crate) fn read(&mut self, css: &str) {
+        self.add(css, rules(css, MAX_NESTING));
+    }
+
+    fn add(&mut self, css: &str, rules: Vec<Rule>) {
+        for rule in rules {
+            match rule.kind {
+                RuleKind::Style {
+                    selectors,
+                    declarations,
+                } => {
+                    let sizing = declared_sizing(&css[declarations]);
+                    if sizing != BoxSizing::default() {
+                        self.rules.push((subjects(&css[selectors]), sizing));
+                    }
+                }
+                RuleKind::At {
+                    name,
+                    prelude,
+                    children,
+                } => {
+                    if !(name == "media" && only_for_print(&css[prelude])) {
+                        self.add(css, children);
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the rules say of `element`'s box: everything any rule that could
+    /// style it says, whether or not another says otherwise.
+    pub(crate) fn sizing(&self, element: &Node) -> BoxSizing {
+        let mut sizing = BoxSizing::default();
+        if self.rules.is_empty() {
+            return sizing;
+        }
+
+        let name = element
+            .get_name()
+            .rsplit(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let class = element.get_attribute_no_ns("class").unwrap_or_default();
+        let classes: Vec<&str> = class.split_ascii_whitespace().collect();
+        let id = element.get_attribute_no_ns("id");
+        for (subjects, said) in &self.rules {
+            if subjects
+                .iter()
+                .any(|subject| subject.could_be(&name, &classes, id.as_deref()))
+            {
+                sizing.add(*said);
+            }
+        }
+        sizing
+    }
+}
+
+/// What a list of declarations, a rule's or a `style` attribute's, says of
+/// the size of the box it styles.
+pub(crate) fn declared_sizing(declarations: &str) -> BoxSizing {
+    let mut sizing = BoxSizing::default();
+    let mut input = ParserInput::new(declarations);
+    let mut parser = Parser::new(&mut input);
+
+    while !parser.is_exhausted() {
+        // A declaration that cannot be read is passed over, as CSS passes
+        // over it.
+        let _ = parser.parse_until_after(Delimiter::Semicolon, |declaration| {
+            let property = declaration.expect_ident()?.to_ascii_lowercase();
+            declaration.expect_colon()?;
+            match property.as_str() {
+                "height" | "max-height" | "block-size" | "max-block-size" => {
+                    match height(declaration, true) {
+                        Height::Fixed => sizing.fixed_height = true,
+                        Height::Screen => sizing.screen_height = true,
+                        Height::Open => {}
+                    }
+                }
+                "width" | "inline-size" => sizing.width |= is_set(declaration),
+                "aspect-ratio" => sizing.aspect_ratio |= is_set(declaration),
+                "position" => sizing.positioned |= lays_over(declaration),
+                "transform" | "-webkit-transform" | "-moz-transform" | "-ms-transform"
+                | "-o-transform" | "rotate" => sizing.transformed |= is_set(declaration),
+                _ => while declaration.next().is_ok() {},
+            }
+            Ok::<_, ParseError<()>>(())
+        });
+    }
+
+    sizing
+}
+
+/// How a `height` or `max-height` sizes a box.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Height {
+    /// As what is in the box, or what the box is in, has it: `auto`, `none`,
+    /// a percentage.
+    #[default]
+    Open,
+    /// A share of the screen.
+    Screen,
+    /// A length of its own.
+    Fixed,
+}
+
+/// The units that are shares of the screen, the viewport.
+const SCREEN_UNITS: &[&str] = &[
+    "vw", "vh", "vi", "vb", "vmin", "vmax", "svw", "svh", "svi", "svb", "svmin", "svmax", "lvw",
+    "lvh", "lvi", "lvb", "lvmin", "lvmax", "dvw", "dvh", "dvi", "dvb", "dvmin", "dvmax",
+];
+
+/// How the value `parser` holds sizes a box's height: as its most fixed
+/// length does, in `calc()` and the like too. A bare number `outside` them is
+/// a length, `0` or pixels to an engine that takes it so.
+fn height(parser: &mut Parser<'_, '_>, outside: bool) -> Height {
+    let mut most = Height::Open;
+    loop {
+        let this = match parser.next() {
+            Err(_) => break,
+            Ok(Token::Dimension { unit, .. })
+                if SCREEN_UNITS
+                    .iter()
+                    .any(|screen| unit.eq_ignore_ascii_case(screen)) =>
+            {
+                Height::Screen
+            }
+            Ok(Token::Dimension { .. }) => Height::Fixed,
+            Ok(Token::Number { .. }) if outside => Height::Fixed,
+            Ok(Token::Function(_) | Token::ParenthesisBlock) => {
+                read_block(parser, |inner| height(inner, false))
+            }
+            Ok(_) => Height::Open,
+        };
+        most = most.max(this);
+    }
+    most
+}
+
+/// Words that leave a box as it would be: `auto`, `none`, the keywords every
+/// property takes, and the `important` of `!important`.
+const LEFT_AS_IS: &[&str] = &[
+    "auto",
+    "none",
+    "initial",
+    "inherit",
+    "unset",
+    "revert",
+    "revert-layer",
+    "important",
+];
+
+/// Does the value `parser` holds set something, rather than leave the box
+/// as it would be?
+fn is_set(parser: &mut Parser<'_, '_>) -> bool {
+    let mut set = false;
+    while let Ok(token) = parser.next() {
+        set |= !matches!(token, Token::Delim('!'))
+            && !matches!(token, Token::Ident(word)
+                if LEFT_AS_IS.iter().any(|left| word.eq_ignore_ascii_case(left)));
+    }
+    set
+}
+
+/// Does the `position` `parser` holds lay the box over the page, out of the
+/// run of what else is there?
+fn lays_over(parser: &mut Parser<'_, '_>) -> bool {
+    let mut over = false;
+    while let Ok(token) = parser.next() {
+        over |= matches!(token, Token::Ident(word)
+            if word.eq_ignore_ascii_case("absolute") || word.eq_ignore_ascii_case("fixed"));
+    }
+    over
+}
+
+/// Is a media query list, what follows `@media`, only for print? Each of its
+/// queries has to be.
+fn only_for_print(queries: &str) -> bool {
+    queries.split(',').all(|query| {
+        let query = query.trim().to_ascii_lowercase();
+        let query = query.strip_prefix("only ").unwrap_or(&query).trim_start();
+        query == "print" || query.starts_with("print ")
+    })
+}
+
+/// What the last compound of a selector, the one naming the element it
+/// styles, asks of it: its name, its classes and its id. Whatever else it
+/// asks, an attribute or a place among its siblings, and whatever the rest of
+/// the selector asks of the elements around it, are taken to hold.
+#[derive(Debug, Clone, Default)]
+struct Subject {
+    name: Option<String>,
+    classes: Vec<String>,
+    ids: Vec<String>,
+}
+
+impl Subject {
+    /// Could an element of this `name`, `classes` and `id` be the subject?
+    fn could_be(&self, name: &str, classes: &[&str], id: Option<&str>) -> bool {
+        self.name.as_deref().is_none_or(|wanted| wanted == name)
+            && self
+                .classes
+                .iter()
+                .all(|class| classes.contains(&class.as_str()))
+            && self.ids.iter().all(|wanted| id == Some(wanted.as_str()))
+    }
+}
+
+/// The pseudo-elements CSS 2 wrote with one colon.
+const LEGACY_PSEUDO_ELEMENTS: &[&str] = &["before", "after", "first-line", "first-letter"];
+
+/// The pseudo-classes of something a reader does, which a page as it is shown
+/// is not: hovered over, focused, followed.
+const ACTION_PSEUDO_CLASSES: &[&str] = &[
+    "hover",
+    "active",
+    "focus",
+    "focus-visible",
+    "focus-within",
+    "target",
+    "visited",
+];
+
+/// The subjects of a selector list's selectors, but for those that style no
+/// element as it is shown: a pseudo-element's box, `::before` say, or one
+/// while it is hovered over. A list with a selector CSS cannot read, a hash
+/// that is no id, has none, as CSS then drops the rule.
+fn subjects(selectors: &str) -> Vec<Subject> {
+    let mut input = ParserInput::new(selectors);
+    let mut parser = Parser::new(&mut input);
+    let mut subjects = Vec::new();
+    let mut subject = Subject::default();
+    // Whether the selector read so far styles no element as it is shown.
+    let mut styles_none = false;
+    // Whether a combinator follows the compound read so far, which is then
+    // not the subject.
+    let mut combined = false;
+    let mut after_dot = false;
+    let mut colons = 0;
+
+    loop {
+        let token = match parser.next_including_whitespace() {
+            Ok(token) => token.clone(),
+            Err(_) => break,
+        };
+        match token {
+            Token::Comma => {
+                let read = std::mem::take(&mut subject);
+                if !std::mem::take(&mut styles_none) {
+                    subjects.push(read);
+                }
+                (combined, after_dot, colons) = (false, false, 0);
+                continue;
+            }
+            Token::WhiteSpace(_) | Token::Delim('>' | '+' | '~') => {
+                combined = true;
+                continue;
+            }
+            _ => {}
+        }
+        if std::mem::take(&mut combined) {
+            subject = Subject::default();
+        }
+
+        let class = std::mem::take(&mut after_dot);
+        let pseudo = std::mem::take(&mut colons);
+        match token {
+            Token::Ident(name) if class => subject.classes.push(name.to_string()),
+            Token::Ident(name) if pseudo > 0 => {
+                let is =
+                    |names: &[&str]| names.iter().any(|known| name.eq_ignore_ascii_case(known));
+                if pseudo > 1 || is(LEGACY_PSEUDO_ELEMENTS) || is(ACTION_PSEUDO_CLASSES) {
+                    styles_none = true;
+                } else if name.eq_ignore_ascii_case("root") {
+                    subject.name = Some("html".to_string());
+                }
+            }
+            // `:not()`, `:is()` and the like are taken to hold; a function
+            // after two colons is a pseudo-element.
+            Token::Function(_) => styles_none |= pseudo > 1,
+            Token::Ident(name) => subject.name = Some(name.to_ascii_lowercase()),
+            // `*`, or `|` after a namespace, which the name follows.
+            Token::Delim('*' | '|') => subject.name = None,
+            Token::Delim('.') => after_dot = true,
+            Token::IDHash(id) => subject.ids.push(id.to_string()),
+            Token::Hash(_) => return Vec::new(),
+            Token::Colon => colons = pseudo + 1,
+            _ => {}
+        }
+    }
+    if !styles_none {
+        subjects.push(subject);
+    }
+    subjects
 }
 
 // ---------------------------------------------------------------- internals
@@ -754,4 +1122,111 @@ fn is_plain_selector_char(c: char) -> bool {
 /// keeps such a character whole and the slices on character boundaries.
 fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || !byte.is_ascii()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What each way of writing a size says of a box.
+    #[test]
+    fn declarations_size_boxes_by_what_they_set() {
+        let fixed = BoxSizing {
+            fixed_height: true,
+            ..BoxSizing::default()
+        };
+        let screen = BoxSizing {
+            screen_height: true,
+            ..BoxSizing::default()
+        };
+        let open = BoxSizing::default();
+        let cases = [
+            ("height: 200px", fixed),
+            ("max-height:12em", fixed),
+            ("block-size: 3in", fixed),
+            ("height: 0", fixed),
+            ("height: calc(100% - 2em)", fixed),
+            ("height: 100vh", screen),
+            ("max-height: 95dvh !important", screen),
+            ("height: 100%", open),
+            ("height: auto !important", open),
+            ("max-height: none", open),
+            ("height: calc(100% * 0.5)", open),
+            ("height: var(--page)", open),
+            ("min-height: 10em", open),
+            (
+                "width: auto; position: relative; transform: none; aspect-ratio: auto",
+                open,
+            ),
+            // One that cannot be read is passed over, and the next read.
+            ("height 200px; HEIGHT: 4EM", fixed),
+        ];
+        for (declarations, expected) in cases {
+            assert_eq!(declared_sizing(declarations), expected, "{declarations}");
+        }
+
+        let set = declared_sizing(
+            "width: 100%; aspect-ratio: 5 / 2; position: absolute; -webkit-transform: rotate(90deg)",
+        );
+        assert!(set.width && set.aspect_ratio && set.positioned && set.transformed);
+        assert!(declared_sizing("rotate: 90deg").transformed);
+        assert!(declared_sizing("position: fixed").positioned);
+    }
+
+    /// Which elements a rule is taken to style: those its selector's last
+    /// compound could name, whatever is around them, but no pseudo-element,
+    /// no state a page as shown is not in, and nothing for print only.
+    #[test]
+    fn rules_size_the_elements_their_selectors_could_name() {
+        let content = html::parse_content(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<div id="frame" class="frame wide"><p id="text" class="frame">Text</p><img id="image" src="a.png" alt=""/></div>
+</body></html>"#,
+        )
+        .unwrap();
+        let element = |id: &str| {
+            xml::find_nodes(&content.doc, &format!("//*[@id='{id}']"))
+                .unwrap()
+                .remove(0)
+        };
+        let html = xml::find_nodes(&content.doc, "/*").unwrap().remove(0);
+        let framed = |css: &str, node: &Node| {
+            let mut rules = BoxRules::default();
+            rules.read(css);
+            rules.sizing(node).fixed_height
+        };
+
+        let (div, p, img) = (element("frame"), element("text"), element("image"));
+        assert!(framed(".frame { height: 2em }", &div));
+        assert!(framed(".frame.wide { height: 2em }", &div));
+        assert!(!framed(".frame.narrow { height: 2em }", &div));
+        assert!(framed("div.frame { height: 2em }", &div));
+        assert!(!framed("div.frame { height: 2em }", &p));
+        assert!(framed("#frame { height: 2em }", &div));
+        assert!(!framed("#frame { height: 2em }", &p));
+        assert!(framed("body section > .frame + img { height: 2em }", &img));
+        assert!(framed("p, IMG { height: 2em }", &img));
+        assert!(framed("*|img { height: 2em }", &img));
+        assert!(framed(
+            "@media screen, print { @supports (display: grid) { img { height: 2em } } }",
+            &img
+        ));
+
+        assert!(!framed("div::before, div:after { height: 2em }", &div));
+        assert!(framed("div::before, div { height: 2em }", &div));
+        assert!(!framed("img:hover, a:focus img { height: 2em }", &img));
+        assert!(framed(
+            "img:first-child, img:not(.wide) { height: 2em }",
+            &img
+        ));
+        assert!(!framed("@media print { img { height: 2em } } @media only print and (color) { img { height: 2em } }", &img));
+        assert!(!framed("#1a, img { height: 2em }", &img));
+        assert!(!framed(":root { height: 2em }", &div));
+        assert!(framed(":root { height: 2em }", &html));
+        assert!(!framed(
+            "@page { height: 2em } @font-face { height: 2em }",
+            &img
+        ));
+    }
 }

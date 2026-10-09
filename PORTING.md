@@ -595,6 +595,21 @@ stylesheet or `style`, an image in text or a heading, a link to the file, a
 repaired before the image step rather than after it, which changes nothing
 else, since neither step reads what the other writes.
 
+Nor is an image reshaped in a box the book's CSS sizes for it, as a split
+image's pages take more room down the page than it did and a turned one is
+another shape. A box around it of a set height or `max-height`, in pixels,
+ems or the like or a screen high in `vh`, or of a set `aspect-ratio`, cut the
+second page off or let it run over what came after. A `transform`, or
+`position: absolute` or `fixed`, on the box or the image turned the pages
+again or laid them over each other. And the image's own height, which each
+page keeps, gave every page its size. The CSS is read from `style`
+attributes, `<style>` elements and every stylesheet in the book, and a rule
+counts if the last part of its selector could name the element, whatever
+else it asks, as long as it is not for a pseudo-element, a hover or focus, or
+print only. A height that is a percentage is of the page, as when a plate is
+fitted to it, or of a box this finds, and does not count. Reading the cascade
+no further keeps an image whole wherever a rule might frame it.
+
 Even shown as a page, an image is reshaped only if that shows it at least
 15% bigger: the panel never enlarges an image, so one it already shows whole,
 a small figure or an ornament on a line of its own, gains nothing from being

@@ -13,7 +13,7 @@ use libxml::bindings::xmlNodePtr;
 use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
-use crate::css::{self, Edit};
+use crate::css::{self, BoxRules, BoxSizing, Edit};
 use crate::html;
 use crate::xml::{self, NS_XML};
 use crate::{Error, Result};
@@ -774,7 +774,9 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 /// on its own the same way. Every other is a fixed shape: an SVG that draws
 /// more, an SVG document, CSS, an image in a line of text or a heading, a link
 /// to the file, a `srcset` other than the image's own, and the book's cover.
-/// One is enough, since a file has one shape.
+/// One is enough, since a file has one shape. So is an `<img>` or SVG on its
+/// own in a box the book's CSS sizes, which a reshaped image would not fit:
+/// see [`framed`].
 ///
 /// `chapters` are read as the steps after the image step read them.
 pub fn fixed_shape_images(
@@ -786,11 +788,26 @@ pub fn fixed_shape_images(
 ) -> Result<HashSet<PathBuf>> {
     let mut fixed = HashSet::new();
 
+    // Any of the book's stylesheets is taken to style any chapter.
+    let mut rules = BoxRules::default();
+    for path in content.css.iter().filter(|path| path.is_file()) {
+        let css = crate::css::read_stylesheet(path)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        for url in css_urls(&css) {
+            fixed.extend(target_of(root, base, &url));
+        }
+        rules.read(&css);
+    }
+
     for &path in chapters {
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         let base = path.parent().unwrap_or(opf_dir);
-        let free = free_images(&content.doc)?;
+        let mut own = BoxRules::default();
+        for style in xml::find_nodes(&content.doc, &format!("//{}", xml::local("style")))? {
+            own.read(&style.get_content());
+        }
+        let free = free_images(&content.doc, &[&rules, &own])?;
         note_fixed_shapes(&content.doc, root, base, &free, &mut fixed)?;
     }
 
@@ -802,14 +819,6 @@ pub fn fixed_shape_images(
         };
         let base = path.parent().unwrap_or(opf_dir);
         note_fixed_shapes(&doc, root, base, &HashSet::new(), &mut fixed)?;
-    }
-
-    for path in content.css.iter().filter(|path| path.is_file()) {
-        let css = crate::css::read_stylesheet(path)?;
-        let base = path.parent().unwrap_or(opf_dir);
-        for url in css_urls(&css) {
-            fixed.extend(target_of(root, base, &url));
-        }
     }
 
     let cover = crate::metadata::extract_metadata(opf)?.cover_href;
@@ -892,22 +901,80 @@ fn target_of(root: &Path, base: &Path, reference: &str) -> Option<PathBuf> {
 
 /// The images in a chapter that pages could take the place of, as
 /// [`show_reshaped_pages`] shows them: each `<img>` on its own, and the image
-/// of each SVG that shows nothing else, on its own the same way.
-fn free_images(doc: &Document) -> Result<HashSet<xmlNodePtr>> {
+/// of each SVG that shows nothing else, on its own the same way, but for
+/// those `rules` and their own styles have [`framed`].
+fn free_images(doc: &Document, rules: &[&BoxRules]) -> Result<HashSet<xmlNodePtr>> {
     let mut free = HashSet::new();
     for svg in xml::find_nodes(doc, &outermost_svgs())? {
         if let Some(image) = wrapped_image(&svg) {
-            if on_its_own(&svg) {
+            if on_its_own(&svg) && !framed(&svg, false, rules) {
                 free.insert(image.node_ptr());
             }
         }
     }
     for img in xml::find_nodes(doc, &format!("//{}", xml::local("img")))? {
-        if on_its_own(&img) {
+        if on_its_own(&img) && !framed(&img, true, rules) {
             free.insert(img.node_ptr());
         }
     }
     Ok(free)
+}
+
+/// Is `shown`, an `<img>` or an SVG showing an image, in a box the book
+/// sizes, which the image reshaped would not fit? Its pages take more room
+/// down the page than it did, and turned, it is another shape. A box of a
+/// set height or shape, or a screen high, has no room for them: the second
+/// page was cut off below it, or ran over what came after. A box the book
+/// turns or lays over the page turned the pages again, or laid them over
+/// each other.
+///
+/// Each page of an `<img>` keeps its style, so the image's own box counts
+/// too: a set height, or a screen high and a set width, gave each page the
+/// image's size or proportions. A height of a percentage is of the page,
+/// or of a box this finds, and does not count. An SVG gives way to images
+/// of its own, and only what is around it counts.
+fn framed(shown: &Node, own_box: bool, rules: &[&BoxRules]) -> bool {
+    if own_box {
+        let own = box_sizing(shown, rules);
+        if own.fixed_height
+            || (own.screen_height && own.width)
+            || own.aspect_ratio
+            || own.positioned
+            || own.transformed
+        {
+            return true;
+        }
+    }
+
+    let mut ancestor = shown.get_parent();
+    while let Some(node) = ancestor {
+        if node.get_type() == Some(NodeType::ElementNode) {
+            let around = box_sizing(&node, rules);
+            if around.fixed_height
+                || around.screen_height
+                || around.aspect_ratio
+                || around.positioned
+                || around.transformed
+            {
+                return true;
+            }
+        }
+        ancestor = node.get_parent();
+    }
+    false
+}
+
+/// What the book's CSS says of `element`'s box: its own `style`, and every
+/// rule of `rules` that could style it.
+fn box_sizing(element: &Node, rules: &[&BoxRules]) -> BoxSizing {
+    let mut sizing = element
+        .get_attribute_no_ns("style")
+        .map(|style| css::declared_sizing(&style))
+        .unwrap_or_default();
+    for rules in rules {
+        sizing.add(rules.sizing(element));
+    }
+    sizing
 }
 
 /// Is `image` shown on its own: outside a heading, and with nothing else in
