@@ -553,6 +553,21 @@ converted under its own name, a PNG named `plate.jpg` say, is declared
 `image/jpeg` in the manifest as a renamed one is; the reference changed the
 media type only of an image it renamed.
 
+### Images are known by what they are, not by their names
+
+The reference tried only images named `.png`, `.gif`, `.webp`, `.bmp`,
+`.jpg`, `.jpeg`, `.tif` or `.tiff`, and passed over the rest in silence: a PNG
+the manifest declared with no extension, or as `spread.bin`, or a JPEG named
+`.jpe` or `.jfif`, stayed as it was, and the summary did not mention it. The
+port tries every image the manifest declares but an SVG, known by its media
+type or its name, and reads each one's format from its bytes. The converted
+file takes the name with `.jpg` for whatever extension it had, references
+follow it, and the summary counts it by what it was: a PNG named `plate.jpg`
+is a `PNG→JPEG`. One no decoder reads is left as it was and counted as such.
+The summary's total is these images, the ones in the book that are not SVG,
+so it no longer counts SVG images, which are drawn and never converted, or
+images the manifest declares and the book lacks.
+
 ### Images are converted on every core
 
 The reference converted one image after another. The port converts as many

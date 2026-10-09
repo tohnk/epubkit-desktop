@@ -967,6 +967,121 @@ fn rules_only_an_svg_document_uses_are_kept() {
     }
 }
 
+/// An image is known by its media type and its bytes, not its name. A PNG
+/// the manifest declares with no extension, or with one the image step did
+/// not know, was left as it was, and nothing said so; so were JPEGs named
+/// `.jpe` and `.jfif`. A PNG named as a JPEG is counted as the PNG it is.
+#[test]
+fn an_image_is_converted_whatever_its_name() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let jpeg = solid(image::ImageFormat::Jpeg, 255);
+    let files = [
+        ("images/spread", "image/png", png.clone()),
+        ("images/plate.bin", "image/png", png.clone()),
+        ("images/photo.jpe", "image/jpeg", jpeg.clone()),
+        ("images/scan.jfif", "image/jpeg", jpeg),
+        ("images/misnamed.jpg", "image/jpeg", png),
+    ];
+    let body: String = files
+        .iter()
+        .map(|(href, ..)| format!(r#"<p><img src="../{href}" alt=""/></p>"#))
+        .collect();
+    let (work, report) = optimize_files(&files, "", "", &body, &ProcessingOptions::default());
+
+    let converted =
+        ["spread", "plate", "photo", "scan", "misnamed"].map(|stem| format!("images/{stem}.jpg"));
+    assert_eq!(
+        chapter_sources(work.path()),
+        converted
+            .iter()
+            .map(|href| format!("../{href}"))
+            .collect::<Vec<_>>()
+    );
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in &converted {
+        let bytes = fs::read(work.path().join("OEBPS").join(href)).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg,
+            "{href}"
+        );
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+    }
+    for (href, ..) in &files[..4] {
+        assert!(
+            !work.path().join("OEBPS").join(href).exists(),
+            "{href} stayed"
+        );
+    }
+    assert_manifest_matches_archive(work.path());
+
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 5/5 images (3 PNG→JPEG, 2 baseline JPEG)"),
+        "{summary}"
+    );
+}
+
+/// An image no decoder reads, an icon here, is left as it was, and said to
+/// be: the image step skipped it by its name, and the summary was silent. An
+/// SVG is drawn, not converted, and counts as neither.
+#[test]
+fn an_image_no_decoder_reads_is_counted_and_an_svg_is_not() {
+    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>
+"#;
+    let icon = b"\x00\x00\x01\x00 not really an icon".to_vec();
+    let files = [
+        (
+            "images/plate.png",
+            "image/png",
+            solid(image::ImageFormat::Png, 0),
+        ),
+        ("images/mark.ico", "image/x-icon", icon.clone()),
+        ("images/map.svg", "image/svg+xml", svg.to_vec()),
+    ];
+    let body = r#"<p><img src="../images/plate.png" alt=""/><img src="../images/mark.ico" alt=""/><img src="../images/map.svg" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        [
+            "../images/plate.jpg",
+            "../images/mark.ico",
+            "../images/map.svg"
+        ]
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/mark.ico")).unwrap(),
+        icon
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/map.svg")).unwrap(),
+        svg
+    );
+
+    assert_eq!(
+        (
+            report.images_converted,
+            report.images_unconverted,
+            report.images_total
+        ),
+        (1, 1, 2)
+    );
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 1/2 images (1 PNG→JPEG)"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("Left 1 image that could not be converted as it was"),
+        "{summary}"
+    );
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.
@@ -1346,7 +1461,7 @@ fn the_container_cannot_point_at_a_package_outside_the_book() {
 
 /// An image that cannot be converted stays as it was, and the summary says
 /// so, rather than leaving it to be worked out from the count of converted
-/// images, which counts SVG images too.
+/// images.
 #[test]
 fn an_image_that_cannot_be_converted_is_counted_in_the_summary() {
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1491,6 +1606,17 @@ fn light_novel_book(
     head: &str,
     body: &str,
 ) -> tempfile::TempDir {
+    optimize_files(files, metadata, head, body, &light_novel()).0
+}
+
+/// [`light_novel_book`] with `options`, and what the run reported.
+fn optimize_files(
+    files: &[(&str, &str, Vec<u8>)],
+    metadata: &str,
+    head: &str,
+    body: &str,
+    options: &ProcessingOptions,
+) -> (tempfile::TempDir, ProcessingReport) {
     let manifest: String = files
         .iter()
         .enumerate()
@@ -1541,11 +1667,11 @@ fn light_novel_book(
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
     common::write_epub(&input, &entries);
-    process_epub(&input, &output, &light_novel(), |_, _| {}).unwrap();
+    let report = process_epub(&input, &output, options, |_, _| {}).unwrap();
 
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
-    work
+    (work, report)
 }
 
 /// The converted image at `path` in the unpacked book is one image, in the

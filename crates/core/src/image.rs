@@ -32,7 +32,9 @@ use std::path::Path;
 use image::error::{ImageError, LimitError, LimitErrorKind};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
-use image::{DynamicImage, GrayImage, ImageDecoder, ImageReader, Limits, Luma, Rgb, RgbImage};
+use image::{
+    DynamicImage, GrayImage, ImageDecoder, ImageFormat, ImageReader, Limits, Luma, Rgb, RgbImage,
+};
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
 
 use crate::memory::MemoryBudget;
@@ -53,9 +55,6 @@ pub const MAX_PIXELS: u64 = 178_956_970;
 const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 8 + 128 * 1024 * 1024;
 
 pub const DEFAULT_DEVICE: &str = "x4";
-
-/// Extensions the image step will attempt.
-const SUPPORTED_EXTENSIONS: &[&str] = &["png", "gif", "webp", "bmp", "jpeg", "jpg", "tif", "tiff"];
 
 /// A reader's panel, in display orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,14 +143,6 @@ pub struct ProcessedImage {
     pub reshaped: bool,
 }
 
-/// Is this a file the image step should try to open?
-pub fn should_process(filename: &str) -> bool {
-    Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-}
-
 /// `bytes`, an image, as a JPEG to show it small: in colour, turned as its
 /// EXIF data says, and shrunk to fit within `max_width` x `max_height`. What
 /// decoding it takes is held from `budget` until the thumbnail is made.
@@ -233,14 +224,11 @@ pub fn process_image(
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "image".to_string());
-    let extension = Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("image")
-        .to_ascii_uppercase();
-    let conversion = match extension.as_str() {
-        "JPG" | "JPEG" => "baseline JPEG".to_string(),
-        from => format!("{from}→JPEG"),
+    // Named for what the image is, whatever its file is called.
+    let conversion = match image::guess_format(bytes) {
+        Ok(ImageFormat::Jpeg) => "baseline JPEG".to_string(),
+        Ok(format) => format!("{}→JPEG", format_name(format)),
+        Err(_) => "image→JPEG".to_string(),
     };
 
     let decoded = decode(bytes).map_err(|e| Error::Image(format!("{filename}: {e}")))?;
@@ -565,6 +553,16 @@ fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
     Ok(image)
+}
+
+/// What the report calls a format: by its usual extension, `PNG`, `GIF`,
+/// `WEBP`, `BMP` or `TIFF`.
+fn format_name(format: ImageFormat) -> String {
+    format
+        .extensions_str()
+        .first()
+        .map_or_else(|| format!("{format:?}"), |extension| extension.to_string())
+        .to_ascii_uppercase()
 }
 
 fn mean_level(total: u64, count: f64) -> u8 {

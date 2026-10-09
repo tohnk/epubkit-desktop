@@ -8,10 +8,10 @@
 use std::collections::BTreeSet;
 
 use epubkit_core::image::{
-    adjust_contrast, autocontrast, device, floyd_steinberg, luma_601, process_image,
-    should_process, to_gray_601, ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS, X3, X4,
+    adjust_contrast, autocontrast, device, floyd_steinberg, luma_601, process_image, to_gray_601,
+    ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS, X3, X4,
 };
-use image::{DynamicImage, GrayImage, Luma, Rgb, RgbImage};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!(
@@ -419,16 +419,40 @@ fn every_output_is_renamed_to_jpg() {
     }
 }
 
+/// An image is named and counted by what it is, whatever its file is
+/// called: one with no extension, or another than its format's, comes out a
+/// `.jpg` of its name, its format read from its bytes.
 #[test]
-fn supported_extensions_are_recognized_case_insensitively() {
-    for name in [
-        "a.png", "b.JPG", "c.Jpeg", "d.webp", "e.TIFF", "f.bmp", "g.gif",
+fn an_image_is_converted_by_what_it_is_not_its_name() {
+    let png = photo(60, 80);
+    let mut jpeg = Vec::new();
+    image::load_from_memory(&png)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+        .unwrap();
+
+    for (name, bytes, filename, conversion) in [
+        ("spread", &png, "spread.jpg", "PNG→JPEG"),
+        ("plate.bin", &png, "plate.jpg", "PNG→JPEG"),
+        ("misnamed.JPG", &png, "misnamed.jpg", "PNG→JPEG"),
+        ("photo.jpe", &jpeg, "photo.jpg", "baseline JPEG"),
+        ("scan.jfif", &jpeg, "scan.jpg", "baseline JPEG"),
+        ("e.TIF", &tiff(&png), "e.jpg", "TIFF→JPEG"),
     ] {
-        assert!(should_process(name), "{name} should be processable");
+        let results = process_image(bytes, name, &ImageOptions::default()).unwrap();
+        assert_eq!(results[0].filename, filename, "{name}");
+        assert_eq!(results[0].conversion, conversion, "{name}");
     }
-    for name in ["a.svg", "b.xhtml", "c.css", "d.otf", "e"] {
-        assert!(!should_process(name), "{name} should be skipped");
-    }
+}
+
+/// `png` written again as a TIFF.
+fn tiff(png: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::load_from_memory(png)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Tiff)
+        .unwrap();
+    out
 }
 
 #[test]

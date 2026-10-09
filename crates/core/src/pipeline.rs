@@ -92,6 +92,8 @@ pub struct ProcessingReport {
 
     /// Source images converted. A split spread counts once.
     pub images_converted: usize,
+    /// The images the image step tried: every one the manifest declares and
+    /// the book holds, but for SVG.
     pub images_total: usize,
     /// Images the image step could not convert, left as they were.
     pub images_unconverted: usize,
@@ -341,8 +343,16 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         HashSet::new()
     };
     progress(15, "Processing images...");
+    // Every image the manifest declares, whatever its name, but for SVG,
+    // which is drawn and stays as it is.
+    let rasters: Vec<PathBuf> = content
+        .images
+        .iter()
+        .filter(|path| !content.svg.contains(path))
+        .cloned()
+        .collect();
     let converted = convert_images(
-        &content.images,
+        &rasters,
         work_dir,
         &opf_dir,
         options,
@@ -538,9 +548,10 @@ struct ConvertedImages {
     in_place: Vec<String>,
 }
 
-/// Convert every image in the manifest. Those in `keep_shape`, by path, are
-/// converted as they are shaped, whatever Light Novel mode would make of
-/// them.
+/// Convert `images`, whatever they are named: what each is, is read from its
+/// bytes. Those in `keep_shape`, by path, are converted as they are shaped,
+/// whatever Light Novel mode would make of them. One that cannot be is left
+/// as it is, and counted.
 ///
 /// Images are converted on as many threads as the machine runs at once. What
 /// is then done with each, naming, writing, deleting its source, reporting,
@@ -563,7 +574,6 @@ fn convert_images<P: FnMut(u8, &str)>(
         light_novel_mode: false,
         ..image_options.clone()
     };
-    report.images_total = images.len();
 
     let jobs: Vec<ImageJob> = images
         .iter()
@@ -575,9 +585,6 @@ fn convert_images<P: FnMut(u8, &str)>(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if !image::should_process(&name) {
-                return None;
-            }
             // What the rename map calls the image: its path from the OPF's
             // directory, which may climb out of it. An image the map could
             // not name would lose its references, so it is left as it is.
@@ -595,6 +602,7 @@ fn convert_images<P: FnMut(u8, &str)>(
             })
         })
         .collect();
+    report.images_total = jobs.len();
 
     let mut converted = ConvertedImages::default();
     let mut taken = TakenNames::default();
