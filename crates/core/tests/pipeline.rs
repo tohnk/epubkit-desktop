@@ -2100,6 +2100,42 @@ fn light_novel_mode_keeps_the_shape_of_an_image_in_a_frame() {
             "",
             r#"<div><img class="over" src="../images/plate.png" alt=""/></div>"#,
         ),
+        // A height that is a share of the page's, through every box from the
+        // page down.
+        (
+            "html, body { height: 100% } .frame { height: 100% }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "html, body, .plates { height: 100% } .frame { max-height: 50% }",
+            "",
+            r#"<div class="plates"><div class="frame"><p><img src="../images/plate.png" alt=""/></p></div></div>"#,
+        ),
+        // The page's own box, a screen high, hiding what overflows it.
+        (
+            "body { height: 100vh; overflow: hidden }",
+            "",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A height the image's pages after the first take, which lose the
+        // id that undoes it for the first.
+        (
+            "img.plate { height: 200px } #plate { height: auto }",
+            "",
+            r#"<div><img id="plate" class="plate" src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A frame on some screens, and one only some screens undo.
+        (
+            "@media (orientation: landscape) { .frame { height: 200px } }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            ".frame { height: 200px } @media (min-width: 2000px) { .frame { height: auto } }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
     ];
 
     for (css, style, body) in cases {
@@ -2140,6 +2176,44 @@ fn light_novel_mode_still_splits_a_spread_in_a_box_that_grows() {
             ".other { height: 200px } div.plate:before { content: ''; height: 2em } p.plate { height: 200px }",
             r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
         ),
+        // A box of the right class elsewhere: inside another, after another.
+        (
+            ".gallery .plate { height: 200px } h1 + .plate { height: 200px }",
+            r#"<p>Text.</p><div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A frame the cascade undoes: by a later rule, a more specific one,
+        // and the box's own style.
+        (
+            ".plate { height: 200px } .plate { height: auto }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "div#plates { height: auto } .plate { height: 200px }",
+            r#"<div id="plates" class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            ".plate { height: 200px }",
+            r#"<div class="plate" style="height: auto"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A share of a page whose boxes grow: the page's own run on onto the
+        // pages after, and a box between them and the frame grows.
+        (
+            "html, body { height: 100% }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "body { height: 100vh }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "html, body { height: 100% } .plate { height: 100% }",
+            r#"<div><div class="plate"><img src="../images/plate.png" alt=""/></div></div>"#,
+        ),
+        // A frame for print only.
+        (
+            "@media print { .plate { height: 200px } }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
     ];
 
     for (css, body) in cases {
@@ -2150,6 +2224,88 @@ fn light_novel_mode_still_splits_a_spread_in_a_box_that_grows() {
             "css: {css:?}, body: {body}"
         );
     }
+}
+
+/// What styles a chapter is what it links, and what that imports, as a
+/// reader reads them: a frame in a stylesheet it does not link, or links or
+/// imports for print, frames nothing there, and one it imports does.
+#[test]
+fn light_novel_mode_reads_the_stylesheets_a_chapter_links() {
+    let frame = ".plate { height: 200px }";
+    let body = r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#;
+    let link = r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#;
+    let sources = |stylesheets: &[(&str, &str)], head: &str| {
+        let mut files = vec![("images/plate.png", "image/png", spread())];
+        for (href, css) in stylesheets {
+            files.push((href, "text/css", css.as_bytes().to_vec()));
+        }
+        chapter_sources(light_novel_book(&files, "", head, body).path())
+    };
+    let split = ["../images/plate_part1.jpg", "../images/plate_part2.jpg"];
+    let whole = ["../images/plate.jpg"];
+
+    assert_eq!(sources(&[("styles/frames.css", frame)], ""), split);
+    assert_eq!(
+        sources(
+            &[("styles/main.css", ""), ("styles/frames.css", frame)],
+            link
+        ),
+        split
+    );
+    assert_eq!(
+        sources(
+            &[("styles/main.css", frame)],
+            r#"<link rel="stylesheet" type="text/css" media="print" href="../styles/main.css"/>"#
+        ),
+        split
+    );
+    assert_eq!(
+        sources(
+            &[
+                ("styles/main.css", "@import url(\"frames.css\") print;"),
+                ("styles/frames.css", frame)
+            ],
+            link
+        ),
+        split
+    );
+
+    assert_eq!(
+        sources(
+            &[
+                ("styles/main.css", "@import url(\"frames.css\");"),
+                ("styles/frames.css", frame)
+            ],
+            link
+        ),
+        whole
+    );
+    assert_eq!(
+        sources(
+            &[("styles/frames.css", frame)],
+            r#"<style type="text/css">@import "../styles/frames.css";</style>"#
+        ),
+        whole
+    );
+}
+
+/// A stylesheet too large to read could frame anything, and the images of a
+/// chapter it styles keep their shape.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_a_stylesheet_too_large_to_read_styles() {
+    let rule = ".other { color: black }\n";
+    let large = rule.repeat(32 * 1024 * 1024 / rule.len() + 1);
+    let work = light_novel_book(
+        &[
+            ("images/plate.png", "image/png", spread()),
+            ("styles/main.css", "text/css", large.into_bytes()),
+        ],
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+    );
+    assert_eq!(chapter_sources(work.path()), ["../images/plate.jpg"]);
+    assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
 }
 
 // --------------------------------------------- images converted in parallel

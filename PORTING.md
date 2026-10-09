@@ -647,17 +647,46 @@ else, since neither step reads what the other writes.
 Nor is an image reshaped in a box the book's CSS sizes for it, as a split
 image's pages take more room down the page than it did and a turned one is
 another shape. A box around it of a set height or `max-height`, in pixels,
-ems or the like or a screen high in `vh`, or of a set `aspect-ratio`, cut the
-second page off or let it run over what came after. A `transform`, or
-`position: absolute` or `fixed`, on the box or the image turned the pages
-again or laid them over each other. And the image's own height, which each
-page keeps, gave every page its size. The CSS is read from `style`
-attributes, `<style>` elements and every stylesheet in the book, and a rule
-counts if the last part of its selector could name the element, whatever
-else it asks, as long as it is not for a pseudo-element, a hover or focus, or
-print only. A height that is a percentage is of the page, as when a plate is
-fitted to it, or of a box this finds, and does not count. Reading the cascade
-no further keeps an image whole wherever a rule might frame it.
+ems or the like or a screen high in `vh`, of a set `aspect-ratio`, or sized
+by `contain: size`, cut the second page off or let it run over what came
+after. A height that is a percentage is one where it holds: where the box it
+is a share of has a height set, or is the page, through every box between.
+A `transform`, or `position: absolute` or `fixed`, on the box or the image
+turned the pages again or laid them over each other. And the image's own
+height, which each page keeps, gave every page its size, as a screen high
+with a set width gave them its proportions. The page's own boxes, `<html>`
+and `<body>`, frame nothing by their height alone, as what they hold runs on
+onto the pages after: as common as `html, body { height: 100% }` is, every
+image would otherwise stay whole. They frame an image only if they hide what
+overflows them.
+
+The CSS is read as a reader reads it, through the cascade of the few
+properties that matter: the stylesheets each chapter links, by `<link>` or an
+`xml-stylesheet` instruction, and what they `@import`, its `<style>` elements
+and `style` attributes, and the `height` attributes of tables and the like,
+with each selector matched against the chapter and the winner settled by
+`!important`, specificity and order. What it cannot know, it takes to hold or
+not as either would keep the image whole: a media query of the screen's size
+or shape, an alternate stylesheet, an instruction not every reader follows, a
+pseudo-class it does not read, a selector it cannot read, a rule nested in
+another, a logical size, which is a height or a width as the page is written
+across or down. Such a rule can frame an image, but never undoes another's
+frame. The image's pages are matched as they will be: all of them without its
+`width`, `height`, `srcset` and `sizes`, all but the first without its id,
+each naming a file of its own, and where they are added, which siblings an
+element has is not known. An SVG wrapper's pages are plain images styled to
+fit the page, and one stands in for them while the chapter is matched.
+
+A stylesheet too large to read, too deeply imported or held in a `data:` URL
+could say anything, and the images of a chapter it styles keep their shape.
+So do those of a chapter matched once the book's CSS has asked for 2^27
+steps of matching, some eight seconds' worth, and of one a stylesheet styles
+that would come to more than 2^18 pieces, compounds of selectors and
+declarations, some tens of megabytes. Real books ask for thousands of steps
+in a chapter, and come to a few thousand pieces. Matching a selector tells how far a failure
+goes, as browsers' engines do, so that no element is tried again where it
+failed before; a selector that fails only at its far end once took a step for
+every way through the boxes, which a deep chapter made billions.
 
 Even shown as a page, an image is reshaped only if that shows it at least
 15% bigger: the panel never enlarges an image, so one it already shows whole,

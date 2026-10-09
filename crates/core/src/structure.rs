@@ -2,10 +2,12 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use std::ops::Range;
 
@@ -14,8 +16,9 @@ use libxml::bindings::xmlNodePtr;
 use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
-use crate::css::{self, BoxRules, BoxSizing, Edit};
+use crate::css::{self, Edit};
 use crate::html;
+use crate::layout::{media_applies, Layout, Reshaping, Sheet, Tri, MAX_PIECES};
 use crate::xml::{self, NS_XML};
 use crate::{Error, Result};
 
@@ -967,8 +970,9 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 /// more, an SVG document, CSS, an image in a line of text or a heading, a link
 /// to the file, a `srcset` other than the image's own, and the book's cover.
 /// One is enough, since a file has one shape. So is an `<img>` or SVG on its
-/// own in a box the book's CSS sizes, which a reshaped image would not fit:
-/// see [`framed`].
+/// own in a box the chapter's CSS sizes, which a reshaped image would not
+/// fit, and one in a chapter styled by a stylesheet too large to read: see
+/// [`free_images`].
 ///
 /// `chapters` are read as the steps after the image step read them.
 pub fn fixed_shape_images(
@@ -979,29 +983,25 @@ pub fn fixed_shape_images(
     content: &ContentFiles,
 ) -> Result<HashSet<PathBuf>> {
     let mut fixed = HashSet::new();
+    let mut stylesheets = Stylesheets::new(root);
+    let budget = Cell::new(MATCHING_BUDGET);
 
-    // Any of the book's stylesheets is taken to style any chapter.
-    let mut rules = BoxRules::default();
+    // What a stylesheet shows, it shows in a box it sizes.
     for path in content.css.iter().filter(|path| path.is_file()) {
-        let css = crate::css::read_stylesheet(path)?;
-        let base = path.parent().unwrap_or(opf_dir);
-        for url in css_urls(&css) {
-            fixed.extend(target_of(root, base, &url));
-        }
-        rules.read(&css);
+        stylesheets.at(path)?;
     }
 
     for &path in chapters {
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         let base = path.parent().unwrap_or(opf_dir);
-        let mut own = BoxRules::default();
-        for style in xml::find_nodes(&content.doc, &format!("//{}", xml::local("style")))? {
-            own.read(&style.get_content());
-        }
-        let free = free_images(&content.doc, &[&rules, &own])?;
+        let free = match stylesheets.of_chapter(&content.doc, base)? {
+            Some(styles) => free_images(&content.doc, &styles, &budget)?,
+            None => HashSet::new(),
+        };
         note_fixed_shapes(&content.doc, root, base, &free, &mut fixed)?;
     }
+    fixed.extend(stylesheets.shown);
 
     // An SVG document is drawn in its own box. One that is not well-formed is
     // left as it is, as its references are.
@@ -1019,6 +1019,285 @@ pub fn fixed_shape_images(
     }
 
     Ok(fixed)
+}
+
+/// How many steps of matching selectors Light Novel mode takes in a book at
+/// most, some eight seconds' worth. A book's CSS can ask for no end of them,
+/// where a real one asks for thousands in a chapter. Past this, a selector
+/// may or may not match, and every image left is taken to be framed.
+const MATCHING_BUDGET: u64 = 1 << 27;
+
+/// How deep `@import`s are followed. A stylesheet imported deeper could say
+/// anything.
+const MAX_IMPORT_DEPTH: usize = 16;
+
+/// The stylesheets that style a chapter, in the order the cascade takes them,
+/// each with whether it applies.
+type ChapterStyles = Vec<(Rc<Sheet>, Tri)>;
+
+/// A book's stylesheets, as Light Novel mode reads them: each one read
+/// once, and the images they show.
+struct Stylesheets<'a> {
+    root: &'a Path,
+    /// Each read so far, by file: `None` for one too large to read whole,
+    /// or that comes to more than they may, which could say anything.
+    read: HashMap<PathBuf, Option<Rc<Sheet>>>,
+    /// How many more pieces those may come to: see [`MAX_PIECES`].
+    left: usize,
+    shown: HashSet<PathBuf>,
+}
+
+impl<'a> Stylesheets<'a> {
+    fn new(root: &'a Path) -> Self {
+        Stylesheets {
+            root,
+            read: HashMap::new(),
+            left: MAX_PIECES,
+            shown: HashSet::new(),
+        }
+    }
+
+    /// The stylesheet at `path`, read once: `None` if it is too large to
+    /// read whole, or comes to more than the book's stylesheets may.
+    fn at(&mut self, path: &Path) -> Result<Option<Rc<Sheet>>> {
+        if let Some(sheet) = self.read.get(path) {
+            return Ok(sheet.clone());
+        }
+        let sheet = if crate::too_large_to_read(path) {
+            None
+        } else {
+            let css = crate::css::read_stylesheet(path)?;
+            let base = path.parent().unwrap_or(self.root);
+            for url in css_urls(&css) {
+                self.shown.extend(target_of(self.root, base, &url));
+            }
+            Sheet::parse(&css, &mut self.left).map(Rc::new)
+        };
+        self.read.insert(path.to_path_buf(), sheet.clone());
+        Ok(sheet)
+    }
+
+    /// The stylesheets that style the chapter `doc`, in `base`: those
+    /// `<?xml-stylesheet?>` instructions and `<link>`s name, and its
+    /// `<style>` elements, each after what it imports. `None` if one of them
+    /// cannot be read, which could say anything.
+    fn of_chapter(&mut self, doc: &Document, base: &Path) -> Result<Option<ChapterStyles>> {
+        let mut styles = Vec::new();
+        let mut preferred = None;
+        // What the chapter's own `<style>` elements may come to, which is
+        // let go of with the chapter.
+        let mut left = MAX_PIECES;
+
+        for instruction in stylesheet_instructions(doc) {
+            let attributes = pseudo_attributes(&instruction.get_content());
+            let get = |name: &str| attributes.get(name).map(String::as_str);
+            let alternate = get("alternate") == Some("yes");
+            // Not every reader follows them.
+            let applies = sheet_applies(
+                get("type"),
+                get("media"),
+                alternate,
+                get("title"),
+                &mut preferred,
+            )
+            .and(Tri::Maybe);
+            let href = get("href").unwrap_or_default();
+            if !self.add_linked(base, href, applies, &mut Vec::new(), &mut styles)? {
+                return Ok(None);
+            }
+        }
+
+        let elements = "//*[local-name()='link' or local-name()='style']";
+        for element in xml::find_nodes(doc, elements)? {
+            let attribute = |name: &str| element.get_attribute_no_ns(name);
+            let kind = attribute("type");
+            let media = attribute("media");
+            let title = attribute("title");
+            if local_name(&element) == "style" {
+                let applies = sheet_applies(
+                    kind.as_deref(),
+                    media.as_deref(),
+                    false,
+                    title.as_deref(),
+                    &mut preferred,
+                );
+                if applies == Tri::No {
+                    continue;
+                }
+                let Some(sheet) = Sheet::parse(&element.get_content(), &mut left) else {
+                    return Ok(None);
+                };
+                if !self.add_with_imports(
+                    base,
+                    Rc::new(sheet),
+                    applies,
+                    &mut Vec::new(),
+                    &mut styles,
+                )? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let rel = attribute("rel").unwrap_or_default().to_ascii_lowercase();
+            let rel: Vec<&str> = rel.split_ascii_whitespace().collect();
+            if !rel.contains(&"stylesheet") {
+                continue;
+            }
+            let mut applies = sheet_applies(
+                kind.as_deref(),
+                media.as_deref(),
+                rel.contains(&"alternate"),
+                title.as_deref(),
+                &mut preferred,
+            );
+            if attribute("disabled").is_some() {
+                applies = applies.and(Tri::Maybe);
+            }
+            let href = attribute("href").unwrap_or_default();
+            if !self.add_linked(base, &href, applies, &mut Vec::new(), &mut styles)? {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(styles))
+    }
+
+    /// Add to `styles` the stylesheet `href` names from `base`, after what
+    /// it imports, as `applies` says: `false` if it, or one it imports, cannot
+    /// be read whole. One that is not in the book, or one `importing` is
+    /// importing already, adds nothing.
+    fn add_linked(
+        &mut self,
+        base: &Path,
+        href: &str,
+        applies: Tri,
+        importing: &mut Vec<PathBuf>,
+        styles: &mut ChapterStyles,
+    ) -> Result<bool> {
+        if applies == Tri::No {
+            return Ok(true);
+        }
+        // A `data:` URL holds a stylesheet this does not read.
+        if href
+            .trim_start()
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        {
+            return Ok(false);
+        }
+        let Some(path) = target_of(self.root, base, href) else {
+            return Ok(true);
+        };
+        if !path.is_file() || importing.contains(&path) {
+            return Ok(true);
+        }
+        if importing.len() >= MAX_IMPORT_DEPTH {
+            return Ok(false);
+        }
+        let Some(sheet) = self.at(&path)? else {
+            return Ok(false);
+        };
+        let base = path.parent().unwrap_or(self.root).to_path_buf();
+        importing.push(path);
+        let read = self.add_with_imports(&base, sheet, applies, importing, styles)?;
+        importing.pop();
+        Ok(read)
+    }
+
+    /// Add `sheet`, whose urls lead from `base`, to `styles`, after what it
+    /// imports: `false` if one of those cannot be read whole.
+    fn add_with_imports(
+        &mut self,
+        base: &Path,
+        sheet: Rc<Sheet>,
+        applies: Tri,
+        importing: &mut Vec<PathBuf>,
+        styles: &mut ChapterStyles,
+    ) -> Result<bool> {
+        for (url, imported) in &sheet.imports {
+            if !self.add_linked(base, url, applies.and(*imported), importing, styles)? {
+                return Ok(false);
+            }
+        }
+        styles.push((sheet, applies));
+        Ok(true)
+    }
+}
+
+/// The `<?xml-stylesheet?>` instructions before `doc`'s root element, in
+/// order.
+fn stylesheet_instructions(doc: &Document) -> Vec<Node> {
+    let mut found = Vec::new();
+    let mut node = doc
+        .get_root_element()
+        .and_then(|root| root.get_prev_sibling());
+    while let Some(current) = node {
+        if current.get_type() == Some(NodeType::PiNode) && current.get_name() == "xml-stylesheet" {
+            found.push(current.clone());
+        }
+        node = current.get_prev_sibling();
+    }
+    found.reverse();
+    found
+}
+
+/// The pseudo-attributes of a processing instruction, `name="value"` or
+/// `name='value'`, as far as they can be read.
+fn pseudo_attributes(data: &str) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    let mut rest = data;
+    while let Some(equals) = rest.find('=') {
+        let name = rest[..equals].trim().to_string();
+        let value = rest[equals + 1..].trim_start();
+        let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            break;
+        };
+        let Some(end) = value[1..].find(quote) else {
+            break;
+        };
+        let text = value[1..1 + end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
+        found.insert(name, text);
+        rest = &value[1 + end + 1..];
+    }
+    found
+}
+
+/// Whether a stylesheet a chapter names applies where the book is read, by
+/// its `type`, its `media`, and the set it is in. One named as an alternate,
+/// or titled other than the first titled one, the `preferred` set, applies
+/// only if a reader is asked for it.
+fn sheet_applies(
+    kind: Option<&str>,
+    media: Option<&str>,
+    alternate: bool,
+    title: Option<&str>,
+    preferred: &mut Option<String>,
+) -> Tri {
+    let css = kind.is_none_or(|kind| {
+        let kind = kind.split(';').next().unwrap_or_default().trim();
+        kind.is_empty() || kind.eq_ignore_ascii_case("text/css")
+    });
+    if !css {
+        return Tri::No;
+    }
+    let mut applies = media_applies(media.unwrap_or_default());
+    let title = title.map(str::trim).filter(|title| !title.is_empty());
+    if alternate {
+        applies = applies.and(Tri::Maybe);
+    } else if let Some(title) = title {
+        match preferred {
+            None => *preferred = Some(title.to_string()),
+            Some(preferred) if preferred == title => {}
+            Some(_) => applies = applies.and(Tri::Maybe),
+        }
+    }
+    applies
 }
 
 /// Note in `fixed` every file `doc` names but for what shows one of its
@@ -1094,79 +1373,101 @@ fn target_of(root: &Path, base: &Path, reference: &str) -> Option<PathBuf> {
 /// The images in a chapter that pages could take the place of, as
 /// [`show_reshaped_pages`] shows them: each `<img>` on its own, and the image
 /// of each SVG that shows nothing else, on its own the same way, but for
-/// those `rules` and their own styles have [`framed`].
-fn free_images(doc: &Document, rules: &[&BoxRules]) -> Result<HashSet<xmlNodePtr>> {
+/// those `styles` frame.
+///
+/// An image is framed by a box around it of a set height or shape, or a
+/// screen high, which has no room for its pages: they take more room down
+/// the page than it did, and turned, it is another shape. The second page
+/// was cut off below it, or ran over what came after. A box the book turns
+/// or lays over the page turned the pages again, or laid them over each
+/// other. A height that is a percentage is one only where the box it is of
+/// has a height set, or is the screen. The page's own boxes, `<html>` and
+/// `<body>`, frame only what they hide, as what they hold runs on onto the
+/// pages after.
+///
+/// Each page is styled too, as it will be, and is framed by a height of its
+/// own, or by being a screen high with a width, which gave it the image's
+/// size or proportions. An `<img>`'s pages keep its style. An SVG gives way
+/// to an `<img>` for each, styled to fit the page, and one stands in for
+/// them here while the chapter is matched; see [`Reshaping`] for what of the
+/// pages cannot be known.
+fn free_images(
+    doc: &Document,
+    styles: &ChapterStyles,
+    budget: &Cell<u64>,
+) -> Result<HashSet<xmlNodePtr>> {
     let mut free = HashSet::new();
+    let mut wrappers = Vec::new();
     for svg in xml::find_nodes(doc, &outermost_svgs())? {
-        if let Some(image) = wrapped_image(&svg) {
-            if on_its_own(&svg) && !framed(&svg, false, rules) {
+        if let Some(image) = wrapped_image(&svg).filter(|_| on_its_own(&svg)) {
+            wrappers.push((svg, image));
+        }
+    }
+    let images: Vec<Node> = xml::find_nodes(doc, &format!("//{}", xml::local("img")))?
+        .into_iter()
+        .filter(on_its_own)
+        .collect();
+    if wrappers.is_empty() && images.is_empty() {
+        return Ok(free);
+    }
+
+    let mut reshaping = Reshaping::default();
+    let mut stand_ins = Vec::new();
+    for (svg, image) in &wrappers {
+        let Some(mut parent) = svg.get_parent() else {
+            continue;
+        };
+        let Ok(mut page) = parent.new_child(parent.get_namespace(), "img") else {
+            continue;
+        };
+        page.set_attribute("src", "").ok();
+        page.set_attribute("alt", "").ok();
+        page.set_attribute("style", FULL_PAGE_STYLE).ok();
+        let mut svg = svg.clone();
+        svg.add_prev_sibling(&mut page).ok();
+        reshaping.changing.insert(parent.node_ptr());
+        reshaping.pages.insert(page.node_ptr());
+        stand_ins.push((svg, image.clone(), page));
+    }
+    for image in &images {
+        reshaping.pages.insert(image.node_ptr());
+        if let Some(parent) = image.get_parent() {
+            reshaping.changing.insert(parent.node_ptr());
+        }
+    }
+
+    {
+        let sheets: Vec<(&Sheet, Tri)> = styles
+            .iter()
+            .map(|(sheet, applies)| (&**sheet, *applies))
+            .collect();
+        let layout = Layout::new(&sheets, &reshaping, budget);
+        let framed_around = |shown: &Node| {
+            let mut ancestor = shown.get_parent();
+            while let Some(node) = ancestor {
+                if node.get_type() == Some(NodeType::ElementNode) && layout.frames(&node) {
+                    return true;
+                }
+                ancestor = node.get_parent();
+            }
+            false
+        };
+        for (svg, image, page) in &stand_ins {
+            if !layout.frames_itself(page) && !framed_around(svg) {
+                free.insert(image.node_ptr());
+            }
+        }
+        for image in &images {
+            if !layout.frames_itself(image) && !framed_around(image) {
                 free.insert(image.node_ptr());
             }
         }
     }
-    for img in xml::find_nodes(doc, &format!("//{}", xml::local("img")))? {
-        if on_its_own(&img) && !framed(&img, true, rules) {
-            free.insert(img.node_ptr());
-        }
+
+    for (_, _, page) in stand_ins {
+        page.free_subtree();
     }
     Ok(free)
-}
-
-/// Is `shown`, an `<img>` or an SVG showing an image, in a box the book
-/// sizes, which the image reshaped would not fit? Its pages take more room
-/// down the page than it did, and turned, it is another shape. A box of a
-/// set height or shape, or a screen high, has no room for them: the second
-/// page was cut off below it, or ran over what came after. A box the book
-/// turns or lays over the page turned the pages again, or laid them over
-/// each other.
-///
-/// Each page of an `<img>` keeps its style, so the image's own box counts
-/// too: a set height, or a screen high and a set width, gave each page the
-/// image's size or proportions. A height of a percentage is of the page,
-/// or of a box this finds, and does not count. An SVG gives way to images
-/// of its own, and only what is around it counts.
-fn framed(shown: &Node, own_box: bool, rules: &[&BoxRules]) -> bool {
-    if own_box {
-        let own = box_sizing(shown, rules);
-        if own.fixed_height
-            || (own.screen_height && own.width)
-            || own.aspect_ratio
-            || own.positioned
-            || own.transformed
-        {
-            return true;
-        }
-    }
-
-    let mut ancestor = shown.get_parent();
-    while let Some(node) = ancestor {
-        if node.get_type() == Some(NodeType::ElementNode) {
-            let around = box_sizing(&node, rules);
-            if around.fixed_height
-                || around.screen_height
-                || around.aspect_ratio
-                || around.positioned
-                || around.transformed
-            {
-                return true;
-            }
-        }
-        ancestor = node.get_parent();
-    }
-    false
-}
-
-/// What the book's CSS says of `element`'s box: its own `style`, and every
-/// rule of `rules` that could style it.
-fn box_sizing(element: &Node, rules: &[&BoxRules]) -> BoxSizing {
-    let mut sizing = element
-        .get_attribute_no_ns("style")
-        .map(|style| css::declared_sizing(&style))
-        .unwrap_or_default();
-    for rules in rules {
-        sizing.add(rules.sizing(element));
-    }
-    sizing
 }
 
 /// Is `image` shown on its own: outside a heading, and with nothing else in
@@ -2086,4 +2387,147 @@ fn escape_xml_text(text: &str) -> String {
 
 fn escape_xml_attribute(text: &str) -> String {
     escape_xml_text(text).replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A book in a temporary directory, holding `files`, each a path and
+    /// its contents, and a chapter, `text/chapter.xhtml`, with `prolog`
+    /// before its root element and `head` in its head.
+    fn book(files: &[(&str, &str)], prolog: &str, head: &str) -> (tempfile::TempDir, Document) {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>{prolog}<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>{head}</head><body><p>Text.</p></body></html>"#
+        );
+        let doc = html::parse_content(chapter.as_bytes()).unwrap().doc;
+        (dir, doc)
+    }
+
+    /// The stylesheets that style the chapter, by file or `<style>`, and
+    /// whether each applies; `None` if one cannot be read whole.
+    fn styles_of(files: &[(&str, &str)], prolog: &str, head: &str) -> Option<Vec<(String, Tri)>> {
+        let (dir, doc) = book(files, prolog, head);
+        let mut stylesheets = Stylesheets::new(dir.path());
+        let styles = stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()?;
+        let named = |sheet: &Rc<Sheet>| {
+            stylesheets
+                .read
+                .iter()
+                .find(|(_, read)| read.as_ref().is_some_and(|read| Rc::ptr_eq(read, sheet)))
+                .map(|(path, _)| path.strip_prefix(dir.path()).unwrap().display().to_string())
+                .unwrap_or_else(|| "<style>".to_string())
+        };
+        Some(
+            styles
+                .iter()
+                .map(|(sheet, applies)| (named(sheet), *applies))
+                .collect(),
+        )
+    }
+
+    fn named(styles: &[(&str, Tri)]) -> Option<Vec<(String, Tri)>> {
+        Some(
+            styles
+                .iter()
+                .map(|(name, applies)| (name.to_string(), *applies))
+                .collect(),
+        )
+    }
+
+    /// A chapter is styled by what its `xml-stylesheet` instructions, which
+    /// not every reader follows, and its `<link>`s name, and its `<style>`
+    /// elements, in that order, each after what it imports.
+    #[test]
+    fn a_chapter_is_styled_by_what_it_names_in_order() {
+        let files = [
+            ("styles/a.css", "@import 'b.css';"),
+            ("styles/b.css", "@import url(a.css);"),
+            ("styles/c.css", ""),
+            ("styles/pi.css", ""),
+            ("styles/xsl.css", ""),
+        ];
+        let prolog = r#"<?xml-stylesheet href="../styles/pi.css" type="text/css"?><?xml-stylesheet href="../styles/xsl.css" type="text/xsl"?>"#;
+        let head = r#"<link rel="stylesheet" href="../styles/a.css"/><style>@import "../styles/c.css";</style><link rel="stylesheet" media="print" href="../styles/c.css"/><link rel="icon" href="../styles/c.css"/>"#;
+        assert_eq!(
+            styles_of(&files, prolog, head),
+            named(&[
+                ("styles/pi.css", Tri::Maybe),
+                ("styles/b.css", Tri::Yes),
+                ("styles/a.css", Tri::Yes),
+                ("styles/c.css", Tri::Yes),
+                ("<style>", Tri::Yes),
+            ])
+        );
+    }
+
+    /// Of the sets of stylesheets a chapter offers, one applies unless a
+    /// reader is asked for another: those named alternates, and those titled
+    /// other than the first that is titled.
+    #[test]
+    fn a_stylesheet_of_another_set_may_apply() {
+        let files = [("a.css", ""), ("b.css", ""), ("c.css", ""), ("d.css", "")];
+        let head = r#"<link rel="stylesheet" title="Day" href="../a.css"/><link rel="stylesheet" title="Night" href="../b.css"/><link rel="alternate stylesheet" title="Sepia" href="../c.css"/><link rel="stylesheet" title="Day" href="../d.css"/>"#;
+        assert_eq!(
+            styles_of(&files, "", head),
+            named(&[
+                ("a.css", Tri::Yes),
+                ("b.css", Tri::Maybe),
+                ("c.css", Tri::Maybe),
+                ("d.css", Tri::Yes),
+            ])
+        );
+    }
+
+    /// A stylesheet this cannot read could frame anything: one too large to
+    /// read whole, one that comes to more than the book's may, one imported
+    /// too deep, one a `data:` URL holds. One not in the book is read by no
+    /// reader either.
+    #[test]
+    fn a_stylesheet_that_cannot_be_read_leaves_nothing_known() {
+        let link = |href: &str| format!(r#"<link rel="stylesheet" href="{href}"/>"#);
+        assert_eq!(
+            styles_of(&[], "", &link("../missing.css")),
+            Some(Vec::new())
+        );
+        assert_eq!(styles_of(&[], "", &link("data:text/css,p{}")), None);
+
+        let (dir, doc) = book(&[], "", &link("../large.css"));
+        let large = fs::File::create(dir.path().join("large.css")).unwrap();
+        large.set_len(crate::MAX_DOCUMENT_BYTES + 1).unwrap();
+        let mut stylesheets = Stylesheets::new(dir.path());
+        assert!(stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()
+            .is_none());
+
+        let (dir, doc) = book(
+            &[("many.css", ".a { height: 0 } .b { height: 0 }")],
+            "",
+            &link("../many.css"),
+        );
+        let mut stylesheets = Stylesheets::new(dir.path());
+        stylesheets.left = 3;
+        assert!(stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()
+            .is_none());
+
+        let chain: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("s{i}.css"), format!("@import 's{}.css';", i + 1)))
+            .collect();
+        let files: Vec<(&str, &str)> = chain
+            .iter()
+            .map(|(path, css)| (path.as_str(), css.as_str()))
+            .collect();
+        assert_eq!(styles_of(&files, "", &link("../s0.css")), None);
+    }
 }
