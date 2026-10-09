@@ -88,11 +88,15 @@ pub fn optimize_huffman(jpeg: &[u8]) -> Option<Vec<u8>> {
     }
 
     let parsed = stage!(parse(jpeg), "parse");
-    let symbols = stage!(decode_symbols(&parsed), "decode");
+    // The scan as read goes as soon as its padding is coded afresh: holding
+    // it through table building and the check below was a third more memory.
+    let symbols = {
+        let read = stage!(decode_symbols(&parsed), "decode");
+        stage!(without_padding(&parsed, &read), "padding")
+    };
     if symbols.is_empty() {
         return None;
     }
-    let symbols = stage!(without_padding(&parsed, &symbols), "padding");
 
     let tables = stage!(build_tables(&parsed, &symbols), "table building");
     let entropy = encode_symbols(&symbols, &tables);
