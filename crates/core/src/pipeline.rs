@@ -722,6 +722,11 @@ const IMAGE_MEMORY_BUDGET: u64 = 1 << 30;
 /// each result to `take` in the order of `jobs`, as soon as it and every one
 /// before it are done. Stops at the first error `take` returns; threads
 /// finish only the jobs they have begun.
+///
+/// A result waits in memory until every one before it is taken, so the
+/// threads run at most twice their number of jobs ahead of what has been
+/// taken: one slow job early on does not leave the rest of the book
+/// converted and waiting behind it.
 fn in_order_in_parallel<J: Sync, T: Send>(
     jobs: &[J],
     work: impl Fn(&J) -> T + Sync,
@@ -740,24 +745,36 @@ fn in_order_in_parallel<J: Sync, T: Send>(
         return Ok(());
     }
 
+    let ahead = threads * 2;
     let next = AtomicUsize::new(0);
+    let order = Order::default();
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel();
         for _ in 0..threads {
             let sender = sender.clone();
-            let (next, work) = (&next, &work);
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(job) = jobs.get(index) else {
-                    break;
-                };
-                if sender.send((index, work(job))).is_err() {
-                    break;
+            let (next, work, order) = (&next, &work, &order);
+            scope.spawn(move || {
+                // One thread's panic must not leave the others waiting.
+                let _stop = order.stop_on_drop(true);
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else {
+                        break;
+                    };
+                    if !order.wait_until_taken(index.saturating_sub(ahead - 1)) {
+                        break;
+                    }
+                    if sender.send((index, work(job))).is_err() {
+                        break;
+                    }
                 }
             });
         }
         drop(sender);
 
+        // However this ends, no thread is left waiting on what will now never
+        // be taken.
+        let _stop = order.stop_on_drop(false);
         let mut ready = BTreeMap::new();
         let mut taken = 0;
         for (count, (index, result)) in receiver.iter().enumerate() {
@@ -766,10 +783,76 @@ fn in_order_in_parallel<J: Sync, T: Send>(
             while let Some(result) = ready.remove(&taken) {
                 take(&jobs[taken], result)?;
                 taken += 1;
+                order.taken(taken);
             }
         }
         Ok(())
     })
+}
+
+/// How many results have been taken in order, for threads waiting to run no
+/// further ahead.
+#[derive(Default)]
+struct Order {
+    state: Mutex<OrderState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct OrderState {
+    taken: usize,
+    stopped: bool,
+}
+
+impl Order {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OrderState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait until `count` results have been taken. False if the work stopped
+    /// first.
+    fn wait_until_taken(&self, count: usize) -> bool {
+        let mut state = self.lock();
+        while state.taken < count && !state.stopped {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        !state.stopped
+    }
+
+    fn taken(&self, count: usize) {
+        self.lock().taken = count;
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.changed.notify_all();
+    }
+
+    /// Something that stops the work when it is dropped: while unwinding
+    /// only, if `only_on_panic`.
+    fn stop_on_drop(&self, only_on_panic: bool) -> StopOnDrop<'_> {
+        StopOnDrop {
+            order: self,
+            only_on_panic,
+        }
+    }
+}
+
+struct StopOnDrop<'a> {
+    order: &'a Order,
+    only_on_panic: bool,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.only_on_panic || std::thread::panicking() {
+            self.order.stop();
+        }
+    }
 }
 
 /// Memory to be shared out among threads, each holding some for as long as
@@ -883,4 +966,43 @@ fn format_size(bytes: u64) -> String {
         size /= 1024.0;
     }
     format!("{size:.1} TB")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Results are taken in order, so a slow job holds up every one after it,
+    /// and those wait in memory. With nothing to stop them, the other threads
+    /// went on to convert the whole rest of a book behind it.
+    #[test]
+    fn work_runs_only_so_far_ahead_of_what_is_taken() {
+        let jobs: Vec<usize> = (0..64).collect();
+        let done = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        let most_waiting = AtomicUsize::new(0);
+
+        in_order_in_parallel(
+            &jobs,
+            |&job| {
+                if job == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                let waiting =
+                    done.fetch_add(1, Ordering::SeqCst) + 1 - taken.load(Ordering::SeqCst);
+                most_waiting.fetch_max(waiting, Ordering::SeqCst);
+            },
+            |_| {},
+            |_, ()| {
+                taken.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let most_waiting = most_waiting.load(Ordering::SeqCst);
+        assert!(most_waiting <= 2 * threads, "{most_waiting} results waited");
+        assert_eq!(taken.load(Ordering::SeqCst), 64);
+    }
 }
