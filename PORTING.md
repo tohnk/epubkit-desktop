@@ -662,6 +662,13 @@ SVG only when the image is all it draws, beside a title or a description, and
 leaves an illustration alone. Light Novel mode does the same: an illustration
 stays, and its image keeps its shape.
 
+Nor does it unwrap one that shows only part of its image: a viewBox over the
+right half of a spread, an image slid out of its box, or one sliced to fill a
+box of another shape. An `<img>` in its place showed the whole picture. The
+port replaces only an SVG whose box is its image's own: a viewBox from the
+origin the image's size, or none and an image filling the SVG, with nothing
+transforming, clipping or fading it.
+
 ### The HTML repair pass runs earlier
 
 The reference repaired chapters *after* rewriting image references. But

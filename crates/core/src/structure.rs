@@ -1120,7 +1120,61 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
     let drawn_as_is = ["transform", "clip-path", "mask", "filter"]
         .into_iter()
         .all(|attribute| image.get_attribute(attribute).is_none());
-    drawn_as_is.then_some(image)
+    (drawn_as_is && shows_whole(svg, &image)).then_some(image)
+}
+
+/// Does `svg` show the whole of `image`, as an `<img>` would: in a box that is
+/// the image's own, so that nothing of it is cropped, slid aside or sliced
+/// off? The box is the viewBox, which has to start at the origin and be the
+/// image's size, or without one the SVG itself, which the image has to fill.
+fn shows_whole(svg: &Node, image: &Node) -> bool {
+    let at_origin = ["x", "y"].into_iter().all(|attribute| {
+        image
+            .get_attribute(attribute)
+            .is_none_or(|value| svg_length(&value) == Some(0.0))
+    });
+    let sliced = [svg, image].into_iter().any(|node| {
+        node.get_attribute("preserveAspectRatio")
+            .is_some_and(|value| value.contains("slice"))
+    });
+    let styled = [svg, image].into_iter().any(|node| {
+        node.get_attribute("style").is_some_and(|style| {
+            let style = style.to_ascii_lowercase();
+            ["transform", "clip", "mask", "filter", "opacity"]
+                .into_iter()
+                .any(|property| style.contains(property))
+        })
+    });
+    if !at_origin || sliced || styled || svg.get_attribute("transform").is_some() {
+        return false;
+    }
+
+    // The image's width or height fills `size`: is all of it, or is the
+    // same length.
+    let fills = |attribute: &str, size: Option<f64>| match image.get_attribute(attribute) {
+        Some(value) if value.trim() == "100%" => true,
+        Some(value) => size
+            .zip(svg_length(&value))
+            .is_some_and(|(size, length)| (size - length).abs() < 0.5),
+        None => false,
+    };
+    let Some(view_box) = svg.get_attribute("viewBox") else {
+        return fills("width", None) && fills("height", None);
+    };
+    let numbers: Vec<f64> = view_box
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|number| !number.is_empty())
+        .map_while(|number| number.parse().ok())
+        .collect();
+    let [min_x, min_y, width, height] = numbers[..] else {
+        return false;
+    };
+    min_x == 0.0 && min_y == 0.0 && fills("width", Some(width)) && fills("height", Some(height))
+}
+
+/// A length as an SVG attribute writes it, in user units or pixels.
+fn svg_length(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches("px").trim_end().parse().ok()
 }
 
 /// `namespace` as `node` can use it for an attribute: a prefixed declaration of
