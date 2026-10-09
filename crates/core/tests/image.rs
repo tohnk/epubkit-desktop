@@ -725,3 +725,42 @@ fn light_novel_mode_does_not_split_a_banner() {
         out.height()
     );
 }
+
+/// Fine regular patterns, screentone or hatching, have to average out to an
+/// even grey when shrunk. Averaging blocks of pixels first, to save time, let
+/// stripes five pixels apart beat against the blocks into broad bands.
+#[test]
+fn fine_stripes_shrink_to_an_even_grey() {
+    let stripes = GrayImage::from_fn(2001, 61, |x, _| Luma([if x % 5 < 2 { 0 } else { 255 }]));
+    let mut source = Vec::new();
+    DynamicImage::ImageLuma8(stripes)
+        .write_to(
+            &mut std::io::Cursor::new(&mut source),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let options = ImageOptions {
+        contrast_boost: false,
+        eink_quantize: false,
+        quality: 95,
+        ..ImageOptions::default()
+    };
+
+    let out = decode(&process_image(&source, "stripes.png", &options).unwrap()[0].bytes).to_luma8();
+
+    let (width, height) = out.dimensions();
+    let columns: Vec<f64> = (4..width - 4)
+        .map(|x| {
+            (2..height - 2)
+                .map(|y| out.get_pixel(x, y)[0] as f64)
+                .sum::<f64>()
+                / (height - 4) as f64
+        })
+        .collect();
+    let lightest = columns.iter().cloned().fold(f64::MIN, f64::max);
+    let darkest = columns.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(
+        lightest - darkest < 8.0,
+        "{width}x{height}: columns from {darkest:.0} to {lightest:.0}"
+    );
+}

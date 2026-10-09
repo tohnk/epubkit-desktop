@@ -240,7 +240,7 @@ pub fn process_image(
             details.push(format!(
                 "resized {before_w}x{before_h}→{target_w}x{target_h}"
             ));
-            shrink(page, target_w, target_h)
+            page.resize_exact(target_w, target_h, FilterType::Lanczos3)
         } else {
             page
         };
@@ -637,26 +637,6 @@ fn shown_scale(width: u32, height: u32, options: &ImageOptions) -> f64 {
         .min(1.0)
 }
 
-/// Shrink `page` to `width` x `height` as Pillow's `thumbnail` does: a large
-/// reduction first averages whole blocks of pixels down to within twice the
-/// size wanted, and Lanczos takes it the rest of the way. Lanczos over every
-/// pixel of a large photo comes out no different to see, for three times the
-/// work.
-fn shrink(page: DynamicImage, width: u32, height: u32) -> DynamicImage {
-    let factor_x = (page.width() / (width * 2)).max(1);
-    let factor_y = (page.height() / (height * 2)).max(1);
-    let page = if factor_x > 1 || factor_y > 1 {
-        let reduced = |size: u32, factor: u32| (size as f64 / factor as f64).round() as u32;
-        page.thumbnail_exact(
-            reduced(page.width(), factor_x),
-            reduced(page.height(), factor_y),
-        )
-    } else {
-        page
-    };
-    page.resize_exact(width, height, FilterType::Lanczos3)
-}
-
 /// Fit within a box, preserving aspect ratio and never enlarging.
 fn fit_within(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
     if width <= max_width && height <= max_height {
@@ -715,46 +695,4 @@ fn encode_baseline_jpeg(rgb: &RgbImage, quality: u8, halve_chroma: bool) -> Resu
         .map_err(|e| Error::Image(format!("JPEG encoding failed: {e}")))?;
 
     Ok(crate::jpeg::optimize_huffman(&out).unwrap_or(out))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A photo-like image: smooth tone, with detail at several scales, all of
-    /// which a fifth of its size can still show.
-    fn photo(width: u32, height: u32) -> DynamicImage {
-        DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-            let (fx, fy) = (x as f32 / width as f32, y as f32 / height as f32);
-            let v = 128.0 + 70.0 * (fx * 13.0).sin() * (fy * 9.0).cos() + 40.0 * (fx * 40.0).sin();
-            let v = v.clamp(0.0, 255.0) as u8;
-            Rgb([v, v.saturating_add(20), v.saturating_sub(20)])
-        }))
-    }
-
-    /// Reducing in two steps has to look the same as in one, which is the
-    /// whole of what it may be cheaper at.
-    #[test]
-    fn a_large_reduction_in_two_steps_looks_as_one_does() {
-        for (width, height, to_width, to_height) in [(960, 1440, 120, 180), (2401, 397, 480, 79)] {
-            let source = photo(width, height);
-            let one = source
-                .resize_exact(to_width, to_height, FilterType::Lanczos3)
-                .to_luma8();
-            let two = shrink(source, to_width, to_height).to_luma8();
-
-            assert_eq!(two.dimensions(), (to_width, to_height));
-            let differences: Vec<f64> = one
-                .pixels()
-                .zip(two.pixels())
-                .map(|(a, b)| (a[0] as f64 - b[0] as f64).abs())
-                .collect();
-            let mean = differences.iter().sum::<f64>() / differences.len() as f64;
-            let worst = differences.iter().cloned().fold(0.0, f64::max);
-            assert!(
-                mean < 1.0 && worst < 8.0,
-                "{width}x{height}: mean difference {mean:.2}, worst {worst}"
-            );
-        }
-    }
 }
