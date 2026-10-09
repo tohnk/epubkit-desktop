@@ -35,6 +35,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, GrayImage, ImageDecoder, ImageReader, Limits, Luma, Rgb, RgbImage};
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
 
+use crate::memory::MemoryBudget;
 use crate::{Error, Result};
 
 /// The SSD1677's four grey levels: black, dark grey, light grey, white.
@@ -152,45 +153,72 @@ pub fn should_process(filename: &str) -> bool {
 }
 
 /// `bytes`, an image, as a JPEG to show it small: in colour, turned as its
-/// EXIF data says, and shrunk to fit within `max_width` x `max_height`.
+/// EXIF data says, and shrunk to fit within `max_width` x `max_height`. What
+/// decoding it takes is held from `budget` until the thumbnail is made.
 ///
 /// Shrunk by averaging blocks of pixels, not resampled: at the size a
 /// thumbnail is shown, the two look alike, and averaging takes a third of the
 /// time.
-pub fn thumbnail(bytes: &[u8], max_width: u32, max_height: u32) -> Result<Vec<u8>> {
-    let image = flatten_onto_white(decode(bytes).map_err(|e| Error::Image(e.to_string()))?);
-    let (width, height) = fit_within(image.width(), image.height(), max_width, max_height);
-    let image = if (width, height) != (image.width(), image.height()) {
-        image.thumbnail_exact(width, height)
-    } else {
-        image
-    };
+pub fn thumbnail(
+    bytes: &[u8],
+    max_width: u32,
+    max_height: u32,
+    budget: &MemoryBudget,
+) -> Result<Vec<u8>> {
+    let failed = |e: ImageError| Error::Image(e.to_string());
+    let decoder = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| Error::Image(e.to_string()))?
+        .into_decoder()
+        .map_err(failed)?;
+    let _held = budget.hold(memory_for(&decoder));
+    drop(decoder);
+
+    // At eight bits a channel, which is all a thumbnail has: the block sums
+    // of a deeper image overflow.
+    let mut rgb = flatten_onto_white(decode(bytes).map_err(failed)?).into_rgb8();
+    let (width, height) = fit_within(rgb.width(), rgb.height(), max_width, max_height);
+    // Each sum is of 32 bits, so a reduction of more than a few thousand
+    // times over goes in steps of sixteen.
+    while u64::from(rgb.width() / width) * u64::from(rgb.height() / height) > 1 << 16 {
+        let step_width = rgb.width().div_ceil(16).max(width);
+        let step_height = rgb.height().div_ceil(16).max(height);
+        rgb = image::imageops::thumbnail(&rgb, step_width, step_height);
+    }
+    if (width, height) != rgb.dimensions() {
+        rgb = image::imageops::thumbnail(&rgb, width, height);
+    }
     // Halved chroma is plenty for a picture this small.
-    encode_baseline_jpeg(&image.to_rgb8(), 80, true)
+    encode_baseline_jpeg(&rgb, 80, true)
 }
 
 /// About as much memory as converting the image at `path` will hold at once,
 /// reckoned from its header, before the rest of the file is read: the file
-/// itself, the image decoded at its own depth, which a decoder or a turn can
-/// hold twice, and the copies at eight bits a channel that converting makes.
-/// Just the file, for an image whose header cannot be read or that is too
-/// large to convert at all.
+/// itself and [what decoding and converting it hold](memory_for). Just the
+/// file, for an image whose header cannot be read.
 pub fn memory_needed(path: &Path) -> u64 {
     let file = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    let Some(decoder) = ImageReader::open(path)
+    ImageReader::open(path)
         .and_then(ImageReader::with_guessed_format)
         .ok()
         .and_then(|reader| reader.into_decoder().ok())
-    else {
-        return file;
-    };
+        .map_or(file, |decoder| file.saturating_add(memory_for(&decoder)))
+}
 
+/// What decoding and converting the image `decoder` has read the header of
+/// holds at once: the image decoded at its own depth, which a decoder or a
+/// turn can hold twice, and the copies at eight bits a channel that
+/// converting makes. Nothing for an image too large to convert at all, which
+/// is refused before any of that.
+fn memory_for(decoder: &impl ImageDecoder) -> u64 {
     let (width, height) = decoder.dimensions();
     let pixels = u64::from(width) * u64::from(height);
     if pixels > MAX_PIXELS {
-        return file;
+        return 0;
     }
-    file.saturating_add(decoder.total_bytes().saturating_mul(2))
+    decoder
+        .total_bytes()
+        .saturating_mul(2)
         .saturating_add(pixels * 6)
 }
 

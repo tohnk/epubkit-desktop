@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, PoisonError};
 
+use crate::memory::MemoryBudget;
+
 use crate::html::{self, HtmlRepair};
 use crate::image::{self, DeviceProfile, ImageOptions};
 use crate::metadata::{self, FilenameFormat, FilenameOptions, MetadataEdits};
@@ -852,59 +854,6 @@ impl Drop for StopOnDrop<'_> {
         if !self.only_on_panic || std::thread::panicking() {
             self.order.stop();
         }
-    }
-}
-
-/// Memory to be shared out among threads, each holding some for as long as
-/// it needs it, and waiting while too little is left.
-struct MemoryBudget {
-    left: Mutex<u64>,
-    freed: Condvar,
-    total: u64,
-}
-
-impl MemoryBudget {
-    fn new(total: u64) -> Self {
-        Self {
-            left: Mutex::new(total),
-            freed: Condvar::new(),
-            total,
-        }
-    }
-
-    /// Hold `amount`, or the whole budget if it is more, waiting until that
-    /// much is left. It is given back when what this returns is dropped.
-    fn hold(&self, amount: u64) -> HeldMemory<'_> {
-        let amount = amount.min(self.total);
-        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
-        while *left < amount {
-            left = self
-                .freed
-                .wait(left)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *left -= amount;
-        HeldMemory {
-            budget: self,
-            amount,
-        }
-    }
-}
-
-struct HeldMemory<'a> {
-    budget: &'a MemoryBudget,
-    amount: u64,
-}
-
-impl Drop for HeldMemory<'_> {
-    fn drop(&mut self) {
-        let mut left = self
-            .budget
-            .left
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *left += self.amount;
-        self.budget.freed.notify_all();
     }
 }
 

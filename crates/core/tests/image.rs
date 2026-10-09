@@ -784,3 +784,21 @@ fn the_memory_an_image_needs_counts_its_file_and_its_depth() {
 
     assert!(needed >= file + 64 * 48 * 16, "{needed}");
 }
+
+/// A thumbnail averages blocks of pixels, and the block sum of a 16-bit image
+/// overflowed: a white 257 x 257 one shrunk to one pixel came out black, and
+/// a debug build panicked.
+#[test]
+fn a_deep_image_shrunk_far_stays_as_light_as_it_is() {
+    let white = image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_pixel(257, 257, Luma([65535]));
+    let mut png = Vec::new();
+    DynamicImage::ImageLuma16(white)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    let jpeg = epubkit_core::image::thumbnail(&png, 1, 1, &budget).unwrap();
+
+    let pixel = decode(&jpeg).to_luma8().get_pixel(0, 0)[0];
+    assert!(pixel > 250, "white came out {pixel}");
+}

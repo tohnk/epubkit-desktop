@@ -15,6 +15,7 @@ pub mod error;
 pub mod html;
 pub mod image;
 pub mod jpeg;
+pub mod memory;
 pub mod metadata;
 pub mod package;
 pub mod pipeline;

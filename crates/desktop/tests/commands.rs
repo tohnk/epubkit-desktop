@@ -652,3 +652,72 @@ fn a_cover_comes_back_as_a_thumbnail() {
     assert!(width <= 480 && height <= 720, "{width}x{height}");
     assert!(jpeg.len() < 200_000, "{} bytes", jpeg.len());
 }
+
+/// A PNG that says it is `width` x `height` RGBA and holds no pixels.
+fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    chunk(
+        &mut png,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// A cover too large to be made a thumbnail of is too large for the page
+/// too. It was sent whole all the same, a 14000 x 14000 one in a 600 KB
+/// PNG, for the page to decode at full size.
+#[test]
+fn a_cover_too_large_to_shrink_is_not_sent_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("book.epub");
+    let cover = png_claiming(14_000, 14_000);
+    write_epub(
+        &path,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", OPF),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover.png", &cover),
+        ],
+    );
+
+    let book = inspect(vec![path.to_string_lossy().to_string()]).swap_remove(0);
+
+    assert!(book.error.is_none(), "{:?}", book.error);
+    assert!(
+        book.cover.is_none(),
+        "sent: {:?}",
+        book.cover.map(|url| url.len())
+    );
+}
