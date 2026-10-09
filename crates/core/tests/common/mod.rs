@@ -125,6 +125,50 @@ pub fn png_gradient(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// A PNG whose header claims an image `width` x `height` of `bit_depth`
+/// bits a channel in PNG colour type `color_type`, 6 for RGBA say, with
+/// almost nothing in it: what reckoning it from its header sees, not what
+/// decoding it finds.
+#[allow(dead_code)]
+pub fn png_claiming(width: u32, height: u32, bit_depth: u8, color_type: u8) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[bit_depth, color_type, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    chunk(
+        &mut png,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
 /// Run `work`, failing if it takes longer than `limit`: a check on input that
 /// once took time growing with its square. Work that is too slow goes on in
 /// the background, so a regression fails the test rather than hanging it.

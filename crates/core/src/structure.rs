@@ -2,18 +2,23 @@
 //! rewriting after images are renamed, SVG cover unwrapping, and table of
 //! contents validation and regeneration. Port of `epub_structure.py`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use std::ops::Range;
 
 use cssparser::{ParseError, Parser as CssParser, ParserInput, Token};
-use libxml::tree::{Document, Namespace, Node};
+use libxml::bindings::xmlNodePtr;
+use libxml::tree::{Document, Namespace, Node, NodeType};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
 use crate::css::{self, Edit};
 use crate::html;
+use crate::layout::{media_applies, Layout, Reshaping, Sheet, Tri, MAX_PIECES};
 use crate::xml::{self, NS_XML};
 use crate::{Error, Result};
 
@@ -64,6 +69,22 @@ const HREF_ESCAPE: &AsciiSet = &CONTROLS
 /// How an image that replaces an SVG wrapper fills the page.
 const FULL_PAGE_STYLE: &str = "max-width:100%;max-height:100%;display:block;margin:auto";
 
+/// Elements that run in a line of text rather than making a block of their
+/// own, so that an image in one is in the line around it.
+const INLINE_ELEMENTS: &[&str] = &[
+    "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em",
+    "font", "i", "ins", "kbd", "label", "mark", "nobr", "picture", "q", "rb", "rp", "rt", "rtc",
+    "ruby", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "time", "tt", "u",
+    "var",
+];
+
+/// Elements that show something of their own in a line, as an image does.
+const SHOWN_ELEMENTS: &[&str] = &[
+    "audio", "canvas", "embed", "iframe", "img", "input", "math", "object", "svg", "video",
+];
+
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+
 /// One `<item>` from the OPF manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManifestItem {
@@ -95,6 +116,10 @@ pub struct ContentFiles {
     pub fonts: Vec<PathBuf>,
     pub ncx: Vec<PathBuf>,
     pub other: Vec<PathBuf>,
+    /// The chapters, SVG documents, stylesheets and tables of contents too
+    /// large to read whole, which are left exactly as they are. Each is in
+    /// no other list.
+    pub too_large: Vec<PathBuf>,
 }
 
 /// What `fix_toc` did.
@@ -218,12 +243,22 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             continue;
         }
         let media_type = item.media_type.to_ascii_lowercase();
-
-        if media_type == SVG_MEDIA_TYPE
+        let svg = media_type == SVG_MEDIA_TYPE
             || Path::new(&href)
                 .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-        {
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+
+        let document = svg
+            || matches!(
+                media_type.as_str(),
+                "application/xhtml+xml" | "text/html" | "text/css" | NCX_MEDIA_TYPE
+            );
+        if document && crate::too_large_to_read(&path) {
+            files.too_large.push(path);
+            continue;
+        }
+
+        if svg {
             files.svg.push(path.clone());
         }
 
@@ -236,6 +271,8 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             // Some books mislabel or omit the media type; fall back to the
             // extension before giving up on a file.
             _ if has_font_extension(&href) => files.fonts.push(path),
+            // An image is one whatever the manifest calls it.
+            _ if crate::image::is_raster_image(&path) => files.images.push(path),
             _ => files.other.push(path),
         }
     }
@@ -297,6 +334,43 @@ pub fn update_opf(doc: &Document, renames: &Renames) -> Result<usize> {
     Ok(updated)
 }
 
+/// Declare as JPEGs the images the image step converted under their own
+/// names: `paths`, relative to `opf_dir` in the book unpacked at `root`. A
+/// renamed image is declared one by [`update_opf`]. Returns how many entries
+/// changed.
+pub fn declare_jpegs(
+    doc: &Document,
+    root: &Path,
+    opf_dir: &Path,
+    paths: &[String],
+) -> Result<usize> {
+    let converted: HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|path| resolve_href(root, opf_dir, path))
+        .collect();
+    if converted.is_empty() {
+        return Ok(0);
+    }
+
+    let nodes = xml::find_nodes(
+        doc,
+        &format!("//{}/{}", xml::local("manifest"), xml::local("item")),
+    )?;
+
+    let mut changed = 0;
+    for mut node in nodes {
+        let href = decode(&node.get_attribute("href").unwrap_or_default());
+        let is_converted =
+            resolve_href(root, opf_dir, &href).is_some_and(|target| converted.contains(&target));
+        if is_converted && node.get_attribute("media-type").as_deref() != Some("image/jpeg") {
+            node.set_attribute("media-type", "image/jpeg").ok();
+            changed += 1;
+        }
+    }
+
+    Ok(changed)
+}
+
 /// Drop font entries from the manifest. Returns how many went.
 pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result<usize> {
     let font_names: Vec<String> = font_paths
@@ -347,6 +421,181 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
     item.set_attribute("media-type", "image/jpeg").ok();
 
     Ok(())
+}
+
+/// The raster images the book's chapters, SVG documents and stylesheets name
+/// that its manifest leaves out, in the order of their paths. They are part
+/// of the book as it is read all the same. A file under `META-INF` is the
+/// container's, not the book's, and one named in two spellings of a letter's
+/// case is taken once, as a filesystem that ignores case holds it once.
+///
+/// `chapters` are those the steps after the image step rewrite references
+/// in, and so are the SVG documents and stylesheets read here.
+pub fn undeclared_images(
+    root: &Path,
+    opf_dir: &Path,
+    opf: &Document,
+    chapters: &[&Path],
+    content: &ContentFiles,
+) -> Result<Vec<PathBuf>> {
+    let fold = |path: &Path| path.to_string_lossy().to_lowercase();
+    let mut taken: HashSet<String> = manifest_items(opf)?
+        .iter()
+        .filter_map(|item| resolve_href(root, opf_dir, &item.decoded_href()))
+        .map(|path| fold(&path))
+        .collect();
+
+    let mut named = BTreeSet::new();
+    for &path in chapters {
+        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+        let content = html::parse_content(&bytes)?;
+        named_files(
+            &content.doc,
+            root,
+            path.parent().unwrap_or(opf_dir),
+            &mut named,
+        )?;
+    }
+    // One that is not well-formed is left as it is, its references too.
+    for path in content.svg.iter().filter(|path| path.is_file()) {
+        if let Ok(doc) = xml::parse_file(path) {
+            named_files(&doc, root, path.parent().unwrap_or(opf_dir), &mut named)?;
+        }
+    }
+    for path in content.css.iter().filter(|path| path.is_file()) {
+        let css = crate::css::read_stylesheet(path)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        named.extend(
+            css_urls(&css)
+                .iter()
+                .filter_map(|url| target_of(root, base, url)),
+        );
+    }
+
+    let container = root.join("META-INF");
+    Ok(named
+        .into_iter()
+        .filter(|path| {
+            !path.starts_with(&container)
+                && path.is_file()
+                && crate::image::is_raster_image(path)
+                && taken.insert(fold(path))
+        })
+        .collect())
+}
+
+/// Note in `named` every file `doc`, a document in `base`, names where
+/// [`rewrite_references`] would rewrite a reference to it.
+fn named_files(
+    doc: &Document,
+    root: &Path,
+    base: &Path,
+    named: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut note = |reference: &str| named.extend(target_of(root, base, reference));
+    for node in xml::find_nodes(doc, "//*")? {
+        for &attribute in URL_ATTRIBUTES {
+            if let Some(value) = node.get_attribute_no_ns(attribute) {
+                note(&value);
+            }
+        }
+        if let Some(value) = node.get_attribute_ns("href", NS_XLINK) {
+            note(&value);
+        }
+        if let Some(srcset) = node.get_attribute_no_ns("srcset") {
+            for url in srcset_urls(&srcset) {
+                note(&srcset[url]);
+            }
+        }
+        if let Some(style) = node.get_attribute_no_ns("style") {
+            css_urls(&style).iter().for_each(|url| note(url));
+        }
+        if local_name(&node) == "style" {
+            css_urls(&node.get_content())
+                .iter()
+                .for_each(|url| note(url));
+        }
+    }
+    Ok(())
+}
+
+/// Of `images`, those any of `documents` might name, for documents the run
+/// leaves as they are, too large to read whole or too broken to read at all:
+/// an image such a document names keeps its name, and stays as it is, as the
+/// references to it are not rewritten. Each document is read as bytes, a
+/// little at a time, for each image's file name as it is, percent-escaped
+/// as a reference writes it, and in UTF-16 either way round, in any case of
+/// its letters. A name found where it is no reference only leaves an image
+/// unconverted.
+pub fn images_named_in(documents: &[PathBuf], images: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    const CHUNK: u64 = 1 << 20;
+
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    let mut owners = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        let Some(name) = image
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let escaped = encode(&name);
+        for spelling in [name, escaped] {
+            let utf16 = || spelling.encode_utf16();
+            for pattern in [
+                spelling.as_bytes().to_vec(),
+                utf16().flat_map(u16::to_le_bytes).collect(),
+                utf16().flat_map(u16::to_be_bytes).collect(),
+            ] {
+                patterns.push(pattern);
+                owners.push(index);
+            }
+        }
+    }
+
+    let mut named = HashSet::new();
+    if patterns.is_empty() || documents.is_empty() {
+        return Ok(named);
+    }
+    let searcher = aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&patterns)
+        .map_err(|e| Error::InvalidEpub(format!("too many image names to look for: {e}")))?;
+    // A name across the end of what was read is found once the rest is.
+    let overlap = patterns.iter().map(Vec::len).max().unwrap_or(1) - 1;
+
+    for document in documents {
+        let mut reader = fs::File::open(document).map_err(|e| Error::io(document, e))?;
+        let mut buffer = Vec::new();
+        loop {
+            let keep = buffer.len().min(overlap);
+            buffer.drain(..buffer.len() - keep);
+            let read = (&mut reader)
+                .take(CHUNK)
+                .read_to_end(&mut buffer)
+                .map_err(|e| Error::io(document, e))?;
+            for found in searcher.find_overlapping_iter(&buffer) {
+                named.insert(images[owners[found.pattern().as_usize()]].clone());
+            }
+            if read == 0 {
+                break;
+            }
+        }
+    }
+    Ok(named)
+}
+
+/// Declare the images at `paths`, relative to the OPF's directory, which the
+/// image step converted from files the manifest left out: each a JPEG, under
+/// an id of its own. Returns how many were declared.
+pub fn declare_images(doc: &Document, paths: &[String]) -> Result<usize> {
+    let mut ids = ids_in(doc)?;
+    for path in paths {
+        let id = unused_id(&ids, "image");
+        add_image_to_opf(doc, &encode(path), &id)?;
+        ids.insert(id);
+    }
+    Ok(paths.len())
 }
 
 /// Rewrite image references inside one XHTML file: every attribute that names
@@ -709,6 +958,571 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
     Ok(changed)
 }
 
+/// The images Light Novel mode has to leave in the shape they have, by the
+/// file each is: those something in the book shows in a frame made for that
+/// shape, or in a line of text, which a turned or split image would not fill,
+/// or would break.
+///
+/// Only two ways of showing an image can take a reshaped one, because
+/// [`show_reshaped_pages`] can show its pages there in its place: an `<img>`
+/// on its own, outside a heading, and an SVG that shows nothing but its image,
+/// on its own the same way. Every other is a fixed shape: an SVG that draws
+/// more, an SVG document, CSS, an image in a line of text or a heading, a link
+/// to the file, a `srcset` other than the image's own, and the book's cover.
+/// One is enough, since a file has one shape. So is an `<img>` or SVG on its
+/// own in a box the chapter's CSS sizes, which a reshaped image would not
+/// fit, and one in a chapter styled by a stylesheet too large to read: see
+/// [`free_images`].
+///
+/// `chapters` are read as the steps after the image step read them.
+pub fn fixed_shape_images(
+    root: &Path,
+    opf_dir: &Path,
+    opf: &Document,
+    chapters: &[&Path],
+    content: &ContentFiles,
+) -> Result<HashSet<PathBuf>> {
+    let mut fixed = HashSet::new();
+    let mut stylesheets = Stylesheets::new(root);
+    let budget = Cell::new(MATCHING_BUDGET);
+
+    // What a stylesheet shows, it shows in a box it sizes.
+    for path in content.css.iter().filter(|path| path.is_file()) {
+        stylesheets.at(path)?;
+    }
+
+    for &path in chapters {
+        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+        let content = html::parse_content(&bytes)?;
+        let base = path.parent().unwrap_or(opf_dir);
+        let free = match stylesheets.of_chapter(&content.doc, base)? {
+            Some(styles) => free_images(&content.doc, &styles, &budget)?,
+            None => HashSet::new(),
+        };
+        note_fixed_shapes(&content.doc, root, base, &free, &mut fixed)?;
+    }
+    fixed.extend(stylesheets.shown);
+
+    // An SVG document is drawn in its own box. One that is not well-formed is
+    // left as it is, as its references are.
+    for path in content.svg.iter().filter(|path| path.is_file()) {
+        let Ok(doc) = xml::parse_file(path) else {
+            continue;
+        };
+        let base = path.parent().unwrap_or(opf_dir);
+        note_fixed_shapes(&doc, root, base, &HashSet::new(), &mut fixed)?;
+    }
+
+    let cover = crate::metadata::extract_metadata(opf)?.cover_href;
+    if !cover.is_empty() {
+        fixed.extend(resolve_href(root, opf_dir, &decode(&cover)));
+    }
+
+    Ok(fixed)
+}
+
+/// How many steps of matching selectors Light Novel mode takes in a book at
+/// most, some eight seconds' worth. A book's CSS can ask for no end of them,
+/// where a real one asks for thousands in a chapter. Past this, a selector
+/// may or may not match, and every image left is taken to be framed.
+const MATCHING_BUDGET: u64 = 1 << 27;
+
+/// How deep `@import`s are followed. A stylesheet imported deeper could say
+/// anything.
+const MAX_IMPORT_DEPTH: usize = 16;
+
+/// The stylesheets that style a chapter, in the order the cascade takes them,
+/// each with whether it applies.
+type ChapterStyles = Vec<(Rc<Sheet>, Tri)>;
+
+/// A book's stylesheets, as Light Novel mode reads them: each one read
+/// once, and the images they show.
+struct Stylesheets<'a> {
+    root: &'a Path,
+    /// Each read so far, by file: `None` for one too large to read whole,
+    /// or that comes to more than they may, which could say anything.
+    read: HashMap<PathBuf, Option<Rc<Sheet>>>,
+    /// How many more pieces those may come to: see [`MAX_PIECES`].
+    left: usize,
+    shown: HashSet<PathBuf>,
+}
+
+impl<'a> Stylesheets<'a> {
+    fn new(root: &'a Path) -> Self {
+        Stylesheets {
+            root,
+            read: HashMap::new(),
+            left: MAX_PIECES,
+            shown: HashSet::new(),
+        }
+    }
+
+    /// The stylesheet at `path`, read once: `None` if it is too large to
+    /// read whole, or comes to more than the book's stylesheets may.
+    fn at(&mut self, path: &Path) -> Result<Option<Rc<Sheet>>> {
+        if let Some(sheet) = self.read.get(path) {
+            return Ok(sheet.clone());
+        }
+        let sheet = if crate::too_large_to_read(path) {
+            None
+        } else {
+            let css = crate::css::read_stylesheet(path)?;
+            let base = path.parent().unwrap_or(self.root);
+            for url in css_urls(&css) {
+                self.shown.extend(target_of(self.root, base, &url));
+            }
+            Sheet::parse(&css, &mut self.left).map(Rc::new)
+        };
+        self.read.insert(path.to_path_buf(), sheet.clone());
+        Ok(sheet)
+    }
+
+    /// The stylesheets that style the chapter `doc`, in `base`: those
+    /// `<?xml-stylesheet?>` instructions and `<link>`s name, and its
+    /// `<style>` elements, each after what it imports. `None` if one of them
+    /// cannot be read, which could say anything.
+    fn of_chapter(&mut self, doc: &Document, base: &Path) -> Result<Option<ChapterStyles>> {
+        let mut styles = Vec::new();
+        let mut preferred = None;
+        // What the chapter's own `<style>` elements may come to, which is
+        // let go of with the chapter.
+        let mut left = MAX_PIECES;
+
+        for instruction in stylesheet_instructions(doc) {
+            let attributes = pseudo_attributes(&instruction.get_content());
+            let get = |name: &str| attributes.get(name).map(String::as_str);
+            let alternate = get("alternate") == Some("yes");
+            // Not every reader follows them.
+            let applies = sheet_applies(
+                get("type"),
+                get("media"),
+                alternate,
+                get("title"),
+                &mut preferred,
+            )
+            .and(Tri::Maybe);
+            let href = get("href").unwrap_or_default();
+            if !self.add_linked(base, href, applies, &mut Vec::new(), &mut styles)? {
+                return Ok(None);
+            }
+        }
+
+        let elements = "//*[local-name()='link' or local-name()='style']";
+        for element in xml::find_nodes(doc, elements)? {
+            let attribute = |name: &str| element.get_attribute_no_ns(name);
+            let kind = attribute("type");
+            let media = attribute("media");
+            let title = attribute("title");
+            if local_name(&element) == "style" {
+                let applies = sheet_applies(
+                    kind.as_deref(),
+                    media.as_deref(),
+                    false,
+                    title.as_deref(),
+                    &mut preferred,
+                );
+                if applies == Tri::No {
+                    continue;
+                }
+                let Some(sheet) = Sheet::parse(&element.get_content(), &mut left) else {
+                    return Ok(None);
+                };
+                if !self.add_with_imports(
+                    base,
+                    Rc::new(sheet),
+                    applies,
+                    &mut Vec::new(),
+                    &mut styles,
+                )? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let rel = attribute("rel").unwrap_or_default().to_ascii_lowercase();
+            let rel: Vec<&str> = rel.split_ascii_whitespace().collect();
+            if !rel.contains(&"stylesheet") {
+                continue;
+            }
+            let mut applies = sheet_applies(
+                kind.as_deref(),
+                media.as_deref(),
+                rel.contains(&"alternate"),
+                title.as_deref(),
+                &mut preferred,
+            );
+            if attribute("disabled").is_some() {
+                applies = applies.and(Tri::Maybe);
+            }
+            let href = attribute("href").unwrap_or_default();
+            if !self.add_linked(base, &href, applies, &mut Vec::new(), &mut styles)? {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(styles))
+    }
+
+    /// Add to `styles` the stylesheet `href` names from `base`, after what
+    /// it imports, as `applies` says: `false` if it, or one it imports, cannot
+    /// be read whole. One that is not in the book, or one `importing` is
+    /// importing already, adds nothing.
+    fn add_linked(
+        &mut self,
+        base: &Path,
+        href: &str,
+        applies: Tri,
+        importing: &mut Vec<PathBuf>,
+        styles: &mut ChapterStyles,
+    ) -> Result<bool> {
+        if applies == Tri::No {
+            return Ok(true);
+        }
+        // A `data:` URL holds a stylesheet this does not read.
+        if href
+            .trim_start()
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        {
+            return Ok(false);
+        }
+        let Some(path) = target_of(self.root, base, href) else {
+            return Ok(true);
+        };
+        if !path.is_file() || importing.contains(&path) {
+            return Ok(true);
+        }
+        if importing.len() >= MAX_IMPORT_DEPTH {
+            return Ok(false);
+        }
+        let Some(sheet) = self.at(&path)? else {
+            return Ok(false);
+        };
+        let base = path.parent().unwrap_or(self.root).to_path_buf();
+        importing.push(path);
+        let read = self.add_with_imports(&base, sheet, applies, importing, styles)?;
+        importing.pop();
+        Ok(read)
+    }
+
+    /// Add `sheet`, whose urls lead from `base`, to `styles`, after what it
+    /// imports: `false` if one of those cannot be read whole.
+    fn add_with_imports(
+        &mut self,
+        base: &Path,
+        sheet: Rc<Sheet>,
+        applies: Tri,
+        importing: &mut Vec<PathBuf>,
+        styles: &mut ChapterStyles,
+    ) -> Result<bool> {
+        for (url, imported) in &sheet.imports {
+            if !self.add_linked(base, url, applies.and(*imported), importing, styles)? {
+                return Ok(false);
+            }
+        }
+        styles.push((sheet, applies));
+        Ok(true)
+    }
+}
+
+/// The `<?xml-stylesheet?>` instructions before `doc`'s root element, in
+/// order.
+fn stylesheet_instructions(doc: &Document) -> Vec<Node> {
+    let mut found = Vec::new();
+    let mut node = doc
+        .get_root_element()
+        .and_then(|root| root.get_prev_sibling());
+    while let Some(current) = node {
+        if current.get_type() == Some(NodeType::PiNode) && current.get_name() == "xml-stylesheet" {
+            found.push(current.clone());
+        }
+        node = current.get_prev_sibling();
+    }
+    found.reverse();
+    found
+}
+
+/// The pseudo-attributes of a processing instruction, `name="value"` or
+/// `name='value'`, as far as they can be read.
+fn pseudo_attributes(data: &str) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    let mut rest = data;
+    while let Some(equals) = rest.find('=') {
+        let name = rest[..equals].trim().to_string();
+        let value = rest[equals + 1..].trim_start();
+        let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            break;
+        };
+        let Some(end) = value[1..].find(quote) else {
+            break;
+        };
+        let text = value[1..1 + end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
+        found.insert(name, text);
+        rest = &value[1 + end + 1..];
+    }
+    found
+}
+
+/// Whether a stylesheet a chapter names applies where the book is read, by
+/// its `type`, its `media`, and the set it is in. One named as an alternate,
+/// or titled other than the first titled one, the `preferred` set, applies
+/// only if a reader is asked for it.
+fn sheet_applies(
+    kind: Option<&str>,
+    media: Option<&str>,
+    alternate: bool,
+    title: Option<&str>,
+    preferred: &mut Option<String>,
+) -> Tri {
+    let css = kind.is_none_or(|kind| {
+        let kind = kind.split(';').next().unwrap_or_default().trim();
+        kind.is_empty() || kind.eq_ignore_ascii_case("text/css")
+    });
+    if !css {
+        return Tri::No;
+    }
+    let mut applies = media_applies(media.unwrap_or_default());
+    let title = title.map(str::trim).filter(|title| !title.is_empty());
+    if alternate {
+        applies = applies.and(Tri::Maybe);
+    } else if let Some(title) = title {
+        match preferred {
+            None => *preferred = Some(title.to_string()),
+            Some(preferred) if preferred == title => {}
+            Some(_) => applies = applies.and(Tri::Maybe),
+        }
+    }
+    applies
+}
+
+/// Note in `fixed` every file `doc` names but for what shows one of its
+/// `free` images, an `<img>`'s `src` or an SVG `<image>`'s `href`.
+fn note_fixed_shapes(
+    doc: &Document,
+    root: &Path,
+    base: &Path,
+    free: &HashSet<xmlNodePtr>,
+    fixed: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for node in xml::find_nodes(doc, "//*")? {
+        let name = local_name(&node);
+        let is_free = free.contains(&node.node_ptr());
+        let shows = |attribute: &str| {
+            is_free
+                && matches!(
+                    (name.as_str(), attribute),
+                    ("img", "src") | ("image", "href")
+                )
+        };
+
+        let mut shown = None;
+        for &attribute in URL_ATTRIBUTES {
+            let Some(value) = node.get_attribute_no_ns(attribute) else {
+                continue;
+            };
+            if shows(attribute) {
+                shown = target_of(root, base, &value);
+            } else {
+                fixed.extend(target_of(root, base, &value));
+            }
+        }
+        if let Some(value) = node.get_attribute_ns("href", NS_XLINK) {
+            if shows("href") {
+                shown = shown.or_else(|| target_of(root, base, &value));
+            } else {
+                fixed.extend(target_of(root, base, &value));
+            }
+        }
+
+        // A candidate naming the image's own file goes as its `src` goes:
+        // the pages of a reshaped image are shown without a `srcset`.
+        if let Some(srcset) = node.get_attribute_no_ns("srcset") {
+            for url in srcset_urls(&srcset) {
+                let target = target_of(root, base, &srcset[url]);
+                if target.is_some() && target != shown {
+                    fixed.extend(target);
+                }
+            }
+        }
+
+        if let Some(style) = node.get_attribute_no_ns("style") {
+            for url in css_urls(&style) {
+                fixed.extend(target_of(root, base, &url));
+            }
+        }
+        if name == "style" {
+            for url in css_urls(&node.get_content()) {
+                fixed.extend(target_of(root, base, &url));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The file `reference`, written in a document in `base`, names in the book.
+fn target_of(root: &Path, base: &Path, reference: &str) -> Option<PathBuf> {
+    resolve_href(root, base, &Reference::parse(reference)?.path())
+}
+
+/// The images in a chapter that pages could take the place of, as
+/// [`show_reshaped_pages`] shows them: each `<img>` on its own, and the image
+/// of each SVG that shows nothing else, on its own the same way, but for
+/// those `styles` frame.
+///
+/// An image is framed by a box around it of a set height or shape, or a
+/// screen high, which has no room for its pages: they take more room down
+/// the page than it did, and turned, it is another shape. The second page
+/// was cut off below it, or ran over what came after. A box the book turns
+/// or lays over the page turned the pages again, or laid them over each
+/// other. A height that is a percentage is one only where the box it is of
+/// has a height set, or is the screen. The page's own boxes, `<html>` and
+/// `<body>`, frame only what they hide, as what they hold runs on onto the
+/// pages after.
+///
+/// Each page is styled too, as it will be, and is framed by a height of its
+/// own, or by being a screen high with a width, which gave it the image's
+/// size or proportions. An `<img>`'s pages keep its style. An SVG gives way
+/// to an `<img>` for each, styled to fit the page, and one stands in for
+/// them here while the chapter is matched; see [`Reshaping`] for what of the
+/// pages cannot be known.
+fn free_images(
+    doc: &Document,
+    styles: &ChapterStyles,
+    budget: &Cell<u64>,
+) -> Result<HashSet<xmlNodePtr>> {
+    let mut free = HashSet::new();
+    let mut wrappers = Vec::new();
+    for svg in xml::find_nodes(doc, &outermost_svgs())? {
+        if let Some(image) = wrapped_image(&svg).filter(|_| on_its_own(&svg)) {
+            wrappers.push((svg, image));
+        }
+    }
+    let images: Vec<Node> = xml::find_nodes(doc, &format!("//{}", xml::local("img")))?
+        .into_iter()
+        .filter(on_its_own)
+        .collect();
+    if wrappers.is_empty() && images.is_empty() {
+        return Ok(free);
+    }
+
+    let mut reshaping = Reshaping::default();
+    let mut stand_ins = Vec::new();
+    for (svg, image) in &wrappers {
+        let Some(mut parent) = svg.get_parent() else {
+            continue;
+        };
+        let Ok(mut page) = parent.new_child(parent.get_namespace(), "img") else {
+            continue;
+        };
+        page.set_attribute("src", "").ok();
+        page.set_attribute("alt", "").ok();
+        page.set_attribute("style", FULL_PAGE_STYLE).ok();
+        let mut svg = svg.clone();
+        svg.add_prev_sibling(&mut page).ok();
+        reshaping.changing.insert(parent.node_ptr());
+        reshaping.pages.insert(page.node_ptr());
+        stand_ins.push((svg, image.clone(), page));
+    }
+    for image in &images {
+        reshaping.pages.insert(image.node_ptr());
+        if let Some(parent) = image.get_parent() {
+            reshaping.changing.insert(parent.node_ptr());
+        }
+    }
+
+    {
+        let sheets: Vec<(&Sheet, Tri)> = styles
+            .iter()
+            .map(|(sheet, applies)| (&**sheet, *applies))
+            .collect();
+        let layout = Layout::new(&sheets, &reshaping, budget);
+        let framed_around = |shown: &Node| {
+            let mut ancestor = shown.get_parent();
+            while let Some(node) = ancestor {
+                if node.get_type() == Some(NodeType::ElementNode) && layout.frames(&node) {
+                    return true;
+                }
+                ancestor = node.get_parent();
+            }
+            false
+        };
+        for (svg, image, page) in &stand_ins {
+            if !layout.frames_itself(page) && !framed_around(svg) {
+                free.insert(image.node_ptr());
+            }
+        }
+        for image in &images {
+            if !layout.frames_itself(image) && !framed_around(image) {
+                free.insert(image.node_ptr());
+            }
+        }
+    }
+
+    for (_, _, page) in stand_ins {
+        page.free_subtree();
+    }
+    Ok(free)
+}
+
+/// Is `image` shown on its own: outside a heading, and with nothing else in
+/// its line, no text, no other image? Its line is the nearest block around
+/// it. What runs in a line of text, a link or an emphasis say, is looked
+/// through, and a block inside starts lines of its own.
+fn on_its_own(image: &Node) -> bool {
+    let mut block = image.get_parent();
+    while let Some(parent) = &block {
+        if !INLINE_ELEMENTS.contains(&local_name(parent).as_str()) {
+            break;
+        }
+        block = parent.get_parent();
+    }
+    let Some(block) = block else {
+        return true;
+    };
+
+    let mut ancestor = Some(block.clone());
+    while let Some(node) = ancestor {
+        if HEADINGS.contains(&local_name(&node).as_str()) {
+            return false;
+        }
+        ancestor = node.get_parent();
+    }
+
+    !shares_a_line(&block, image)
+}
+
+/// Does anything but `image` show in `line`'s own line: text that is not
+/// blank, or another image or embedded thing?
+fn shares_a_line(line: &Node, image: &Node) -> bool {
+    let mut child = line.get_first_child();
+    while let Some(node) = child {
+        let shared = match node.get_type() {
+            Some(NodeType::TextNode) | Some(NodeType::CDataSectionNode) => {
+                !node.get_content().trim().is_empty()
+            }
+            // An entity left as written stands for text.
+            Some(NodeType::EntityRefNode) => true,
+            Some(NodeType::ElementNode) if node.node_ptr() != image.node_ptr() => {
+                let name = local_name(&node);
+                SHOWN_ELEMENTS.contains(&name.as_str())
+                    || (INLINE_ELEMENTS.contains(&name.as_str()) && shares_a_line(&node, image))
+            }
+            _ => false,
+        };
+        if shared {
+            return true;
+        }
+        child = node.get_next_sibling();
+    }
+    false
+}
+
 /// Replace SVG-wrapped cover images with a plain `<img>`.
 ///
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
@@ -724,7 +1538,8 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         let Some(path) = resolve_href(root, opf_dir, &decode(&href)) else {
             continue;
         };
-        if !path.is_file() {
+        // One too large to read is left as it is.
+        if !path.is_file() || crate::too_large_to_read(&path) {
             continue;
         }
 
@@ -866,7 +1681,61 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
     let drawn_as_is = ["transform", "clip-path", "mask", "filter"]
         .into_iter()
         .all(|attribute| image.get_attribute(attribute).is_none());
-    drawn_as_is.then_some(image)
+    (drawn_as_is && shows_whole(svg, &image)).then_some(image)
+}
+
+/// Does `svg` show the whole of `image`, as an `<img>` would: in a box that is
+/// the image's own, so that nothing of it is cropped, slid aside or sliced
+/// off? The box is the viewBox, which has to start at the origin and be the
+/// image's size, or without one the SVG itself, which the image has to fill.
+fn shows_whole(svg: &Node, image: &Node) -> bool {
+    let at_origin = ["x", "y"].into_iter().all(|attribute| {
+        image
+            .get_attribute(attribute)
+            .is_none_or(|value| svg_length(&value) == Some(0.0))
+    });
+    let sliced = [svg, image].into_iter().any(|node| {
+        node.get_attribute("preserveAspectRatio")
+            .is_some_and(|value| value.contains("slice"))
+    });
+    let styled = [svg, image].into_iter().any(|node| {
+        node.get_attribute("style").is_some_and(|style| {
+            let style = style.to_ascii_lowercase();
+            ["transform", "clip", "mask", "filter", "opacity"]
+                .into_iter()
+                .any(|property| style.contains(property))
+        })
+    });
+    if !at_origin || sliced || styled || svg.get_attribute("transform").is_some() {
+        return false;
+    }
+
+    // The image's width or height fills `size`: is all of it, or is the
+    // same length.
+    let fills = |attribute: &str, size: Option<f64>| match image.get_attribute(attribute) {
+        Some(value) if value.trim() == "100%" => true,
+        Some(value) => size
+            .zip(svg_length(&value))
+            .is_some_and(|(size, length)| (size - length).abs() < 0.5),
+        None => false,
+    };
+    let Some(view_box) = svg.get_attribute("viewBox") else {
+        return fills("width", None) && fills("height", None);
+    };
+    let numbers: Vec<f64> = view_box
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|number| !number.is_empty())
+        .map_while(|number| number.parse().ok())
+        .collect();
+    let [min_x, min_y, width, height] = numbers[..] else {
+        return false;
+    };
+    min_x == 0.0 && min_y == 0.0 && fills("width", Some(width)) && fills("height", Some(height))
+}
+
+/// A length as an SVG attribute writes it, in user units or pixels.
+fn svg_length(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches("px").trim_end().parse().ok()
 }
 
 /// `namespace` as `node` can use it for an attribute: a prefixed declaration of
@@ -1166,26 +2035,53 @@ fn css_url_edits(css: &str, base: &Path, renames: &Renames) -> Vec<Edit> {
     let mut parser = CssParser::new(&mut input);
     find_css_urls(
         &mut parser,
-        css,
-        base,
-        renames,
         MAX_CSS_NESTING,
         false,
-        &mut edits,
+        &mut |range, url, written| {
+            let Some(new_url) = rewrite_reference(url, base, renames) else {
+                return;
+            };
+            let new_text = match written {
+                CssUrl::Unquoted => {
+                    let token = &css[range.clone()];
+                    let opening = token.find('(').map_or(0, |at| at + 1);
+                    format!("{}{})", &token[..opening], unquoted_css_url(&new_url))
+                }
+                CssUrl::Quoted => quoted_css_string(&css[range.clone()], &new_url),
+            };
+            edits.push((range, new_text));
+        },
     );
     edits
 }
 
-/// Note, in order, what each url in `parser`'s input that names a renamed
-/// file becomes. Strings are urls when `in_image_set`.
+/// Every url in CSS text, found as [`css_url_edits`] finds them.
+fn css_urls(css: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut input = ParserInput::new(css);
+    let mut parser = CssParser::new(&mut input);
+    find_css_urls(&mut parser, MAX_CSS_NESTING, false, &mut |_, url, _| {
+        urls.push(url.to_string())
+    });
+    urls
+}
+
+/// How a url is written in CSS.
+#[derive(Clone, Copy)]
+enum CssUrl {
+    /// Inside an unquoted `url()`, whose whole token is where it is written.
+    Unquoted,
+    /// As a quoted string, in `url("…")` or `image-set()`.
+    Quoted,
+}
+
+/// Hand `found` each url in `parser`'s input, in order: where it is written,
+/// what it says, and how. Strings are urls when `in_image_set`.
 fn find_css_urls(
     parser: &mut CssParser<'_, '_>,
-    css: &str,
-    base: &Path,
-    renames: &Renames,
     depth: usize,
     in_image_set: bool,
-    edits: &mut Vec<Edit>,
+    found: &mut dyn FnMut(Range<usize>, &str, CssUrl),
 ) {
     loop {
         let start = parser.position().byte_index();
@@ -1195,19 +2091,8 @@ fn find_css_urls(
         let end = parser.position().byte_index();
 
         match token {
-            Token::UnquotedUrl(url) => {
-                if let Some(new_url) = rewrite_reference(&url, base, renames) {
-                    let written = &css[start..end];
-                    let opening = written.find('(').map_or(0, |at| at + 1);
-                    edits.push((
-                        start..end,
-                        format!("{}{})", &written[..opening], unquoted_css_url(&new_url)),
-                    ));
-                }
-            }
-            Token::QuotedString(url) if in_image_set => {
-                edit_css_string(css, start..end, &url, base, renames, edits);
-            }
+            Token::UnquotedUrl(url) => found(start..end, &url, CssUrl::Unquoted),
+            Token::QuotedString(url) if in_image_set => found(start..end, &url, CssUrl::Quoted),
             Token::Function(name) if depth > 0 => {
                 let name = name.to_ascii_lowercase();
                 parser
@@ -1218,12 +2103,12 @@ fn find_css_urls(
                             let start = inner.position().byte_index();
                             if let Ok(Token::QuotedString(url)) = inner.next().cloned() {
                                 let end = inner.position().byte_index();
-                                edit_css_string(css, start..end, &url, base, renames, edits);
+                                found(start..end, &url, CssUrl::Quoted);
                             }
                         } else {
                             let image_set =
                                 matches!(name.as_str(), "image-set" | "-webkit-image-set");
-                            find_css_urls(inner, css, base, renames, depth - 1, image_set, edits);
+                            find_css_urls(inner, depth - 1, image_set, found);
                         }
                         Ok::<_, ParseError<()>>(())
                     })
@@ -1234,7 +2119,7 @@ fn find_css_urls(
             {
                 parser
                     .parse_nested_block(|inner| {
-                        find_css_urls(inner, css, base, renames, depth - 1, false, edits);
+                        find_css_urls(inner, depth - 1, false, found);
                         Ok::<_, ParseError<()>>(())
                     })
                     .ok();
@@ -1244,20 +2129,10 @@ fn find_css_urls(
     }
 }
 
-/// Note what the quoted string at `range`, whose value is `url`, becomes if it
-/// names a renamed file: the same quotes around the new url.
-fn edit_css_string(
-    css: &str,
-    range: Range<usize>,
-    url: &str,
-    base: &Path,
-    renames: &Renames,
-    edits: &mut Vec<Edit>,
-) {
-    let Some(new_url) = rewrite_reference(url, base, renames) else {
-        return;
-    };
-    let quote = css[range.start..].chars().next().unwrap_or('"');
+/// `new_url` as a CSS string in the quotes `written`, the string it replaces,
+/// opens with.
+fn quoted_css_string(written: &str, new_url: &str) -> String {
+    let quote = written.chars().next().unwrap_or('"');
     let mut escaped = String::with_capacity(new_url.len() + 2);
     escaped.push(quote);
     for c in new_url.chars() {
@@ -1272,7 +2147,7 @@ fn edit_css_string(
         }
     }
     escaped.push(quote);
-    edits.push((range, escaped));
+    escaped
 }
 
 /// `url` as written inside an unquoted `url()`, or quoted if it has anything
@@ -1302,6 +2177,10 @@ fn unquoted_css_url(url: &str) -> String {
 fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
     if !ncx_path.is_file() {
         return Ok(false);
+    }
+    // One too large to read is left as it is, as any other document is.
+    if crate::too_large_to_read(ncx_path) {
+        return Ok(true);
     }
 
     let Ok(doc) = xml::parse_file(ncx_path) else {
@@ -1403,6 +2282,9 @@ fn relative_parts(root: &Path, from: &Path, to: &Path) -> Option<Vec<String>> {
 }
 
 fn chapter_title(path: &Path) -> Option<String> {
+    if crate::too_large_to_read(path) {
+        return None;
+    }
     let bytes = fs::read(path).ok()?;
     let content = html::parse_content(&bytes).ok()?;
 
@@ -1505,4 +2387,147 @@ fn escape_xml_text(text: &str) -> String {
 
 fn escape_xml_attribute(text: &str) -> String {
     escape_xml_text(text).replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A book in a temporary directory, holding `files`, each a path and
+    /// its contents, and a chapter, `text/chapter.xhtml`, with `prolog`
+    /// before its root element and `head` in its head.
+    fn book(files: &[(&str, &str)], prolog: &str, head: &str) -> (tempfile::TempDir, Document) {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let chapter = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>{prolog}<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>{head}</head><body><p>Text.</p></body></html>"#
+        );
+        let doc = html::parse_content(chapter.as_bytes()).unwrap().doc;
+        (dir, doc)
+    }
+
+    /// The stylesheets that style the chapter, by file or `<style>`, and
+    /// whether each applies; `None` if one cannot be read whole.
+    fn styles_of(files: &[(&str, &str)], prolog: &str, head: &str) -> Option<Vec<(String, Tri)>> {
+        let (dir, doc) = book(files, prolog, head);
+        let mut stylesheets = Stylesheets::new(dir.path());
+        let styles = stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()?;
+        let named = |sheet: &Rc<Sheet>| {
+            stylesheets
+                .read
+                .iter()
+                .find(|(_, read)| read.as_ref().is_some_and(|read| Rc::ptr_eq(read, sheet)))
+                .map(|(path, _)| path.strip_prefix(dir.path()).unwrap().display().to_string())
+                .unwrap_or_else(|| "<style>".to_string())
+        };
+        Some(
+            styles
+                .iter()
+                .map(|(sheet, applies)| (named(sheet), *applies))
+                .collect(),
+        )
+    }
+
+    fn named(styles: &[(&str, Tri)]) -> Option<Vec<(String, Tri)>> {
+        Some(
+            styles
+                .iter()
+                .map(|(name, applies)| (name.to_string(), *applies))
+                .collect(),
+        )
+    }
+
+    /// A chapter is styled by what its `xml-stylesheet` instructions, which
+    /// not every reader follows, and its `<link>`s name, and its `<style>`
+    /// elements, in that order, each after what it imports.
+    #[test]
+    fn a_chapter_is_styled_by_what_it_names_in_order() {
+        let files = [
+            ("styles/a.css", "@import 'b.css';"),
+            ("styles/b.css", "@import url(a.css);"),
+            ("styles/c.css", ""),
+            ("styles/pi.css", ""),
+            ("styles/xsl.css", ""),
+        ];
+        let prolog = r#"<?xml-stylesheet href="../styles/pi.css" type="text/css"?><?xml-stylesheet href="../styles/xsl.css" type="text/xsl"?>"#;
+        let head = r#"<link rel="stylesheet" href="../styles/a.css"/><style>@import "../styles/c.css";</style><link rel="stylesheet" media="print" href="../styles/c.css"/><link rel="icon" href="../styles/c.css"/>"#;
+        assert_eq!(
+            styles_of(&files, prolog, head),
+            named(&[
+                ("styles/pi.css", Tri::Maybe),
+                ("styles/b.css", Tri::Yes),
+                ("styles/a.css", Tri::Yes),
+                ("styles/c.css", Tri::Yes),
+                ("<style>", Tri::Yes),
+            ])
+        );
+    }
+
+    /// Of the sets of stylesheets a chapter offers, one applies unless a
+    /// reader is asked for another: those named alternates, and those titled
+    /// other than the first that is titled.
+    #[test]
+    fn a_stylesheet_of_another_set_may_apply() {
+        let files = [("a.css", ""), ("b.css", ""), ("c.css", ""), ("d.css", "")];
+        let head = r#"<link rel="stylesheet" title="Day" href="../a.css"/><link rel="stylesheet" title="Night" href="../b.css"/><link rel="alternate stylesheet" title="Sepia" href="../c.css"/><link rel="stylesheet" title="Day" href="../d.css"/>"#;
+        assert_eq!(
+            styles_of(&files, "", head),
+            named(&[
+                ("a.css", Tri::Yes),
+                ("b.css", Tri::Maybe),
+                ("c.css", Tri::Maybe),
+                ("d.css", Tri::Yes),
+            ])
+        );
+    }
+
+    /// A stylesheet this cannot read could frame anything: one too large to
+    /// read whole, one that comes to more than the book's may, one imported
+    /// too deep, one a `data:` URL holds. One not in the book is read by no
+    /// reader either.
+    #[test]
+    fn a_stylesheet_that_cannot_be_read_leaves_nothing_known() {
+        let link = |href: &str| format!(r#"<link rel="stylesheet" href="{href}"/>"#);
+        assert_eq!(
+            styles_of(&[], "", &link("../missing.css")),
+            Some(Vec::new())
+        );
+        assert_eq!(styles_of(&[], "", &link("data:text/css,p{}")), None);
+
+        let (dir, doc) = book(&[], "", &link("../large.css"));
+        let large = fs::File::create(dir.path().join("large.css")).unwrap();
+        large.set_len(crate::MAX_DOCUMENT_BYTES + 1).unwrap();
+        let mut stylesheets = Stylesheets::new(dir.path());
+        assert!(stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()
+            .is_none());
+
+        let (dir, doc) = book(
+            &[("many.css", ".a { height: 0 } .b { height: 0 }")],
+            "",
+            &link("../many.css"),
+        );
+        let mut stylesheets = Stylesheets::new(dir.path());
+        stylesheets.left = 3;
+        assert!(stylesheets
+            .of_chapter(&doc, &dir.path().join("text"))
+            .unwrap()
+            .is_none());
+
+        let chain: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("s{i}.css"), format!("@import 's{}.css';", i + 1)))
+            .collect();
+        let files: Vec<(&str, &str)> = chain
+            .iter()
+            .map(|(path, css)| (path.as_str(), css.as_str()))
+            .collect();
+        assert_eq!(styles_of(&files, "", &link("../s0.css")), None);
+    }
 }

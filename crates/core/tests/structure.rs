@@ -1585,3 +1585,100 @@ fn hrefs_resolve_inside_the_book_or_not_at_all() {
     assert_eq!(inside("Text/../../../x"), None);
     assert_eq!(inside("/../x"), None);
 }
+
+/// An SVG with nothing in it but its image can still show only part of it:
+/// a viewBox over the right half of a spread, or an image slid out of the
+/// box, or sliced to fill it. An `<img>` in its place showed the whole
+/// picture. Only an SVG whose box is its image's own is unwrapped.
+#[test]
+fn an_svg_that_shows_part_of_its_image_is_not_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" {svg}><image {image} xlink:href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cases = [
+        // The right half only.
+        (
+            r#"width="500" height="400" viewBox="500 0 500 400""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // A box smaller than the image, which shows its left part.
+        (
+            r#"viewBox="0 0 500 400""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // The image slid down inside its box.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"y="100" width="1000" height="400""#,
+            false,
+        ),
+        // Sliced to fill a box of another shape.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="1000" height="400" preserveAspectRatio="xMidYMid slice""#,
+            false,
+        ),
+        (
+            r#"viewBox="0 0 1000 400" preserveAspectRatio="xMinYMin slice""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // Faded or clipped by a style.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="1000" height="400" style="clip-path: inset(0 50% 0 0)""#,
+            false,
+        ),
+        // The whole image, as cover wrappers have it.
+        (
+            r#"width="100%" height="100%" viewBox="0 0 1000 400" preserveAspectRatio="xMidYMid meet""#,
+            r#"width="1000" height="400""#,
+            true,
+        ),
+        (
+            r#"viewBox="0,0,1000,400""#,
+            r#"x="0" y="0" width="1000px" height="400px""#,
+            true,
+        ),
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="100%" height="100%""#,
+            true,
+        ),
+    ];
+
+    for (svg, image, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>: {after}"
+        );
+        assert_eq!(
+            after.contains("<svg"),
+            !unwrapped,
+            "<svg {svg}><image {image}/>"
+        );
+    }
+}

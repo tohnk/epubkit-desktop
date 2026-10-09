@@ -8,10 +8,10 @@
 use std::collections::BTreeSet;
 
 use epubkit_core::image::{
-    adjust_contrast, autocontrast, device, floyd_steinberg, luma_601, process_image,
-    should_process, to_gray_601, ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS, X3, X4,
+    adjust_contrast, autocontrast, device, floyd_steinberg, luma_601, process_image, to_gray_601,
+    ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS, X3, X4,
 };
-use image::{DynamicImage, GrayImage, Luma, Rgb, RgbImage};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!(
@@ -419,16 +419,40 @@ fn every_output_is_renamed_to_jpg() {
     }
 }
 
+/// An image is named and counted by what it is, whatever its file is
+/// called: one with no extension, or another than its format's, comes out a
+/// `.jpg` of its name, its format read from its bytes.
 #[test]
-fn supported_extensions_are_recognized_case_insensitively() {
-    for name in [
-        "a.png", "b.JPG", "c.Jpeg", "d.webp", "e.TIFF", "f.bmp", "g.gif",
+fn an_image_is_converted_by_what_it_is_not_its_name() {
+    let png = photo(60, 80);
+    let mut jpeg = Vec::new();
+    image::load_from_memory(&png)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+        .unwrap();
+
+    for (name, bytes, filename, conversion) in [
+        ("spread", &png, "spread.jpg", "PNG→JPEG"),
+        ("plate.bin", &png, "plate.jpg", "PNG→JPEG"),
+        ("misnamed.JPG", &png, "misnamed.jpg", "PNG→JPEG"),
+        ("photo.jpe", &jpeg, "photo.jpg", "baseline JPEG"),
+        ("scan.jfif", &jpeg, "scan.jpg", "baseline JPEG"),
+        ("e.TIF", &tiff(&png), "e.jpg", "TIFF→JPEG"),
     ] {
-        assert!(should_process(name), "{name} should be processable");
+        let results = process_image(bytes, name, &ImageOptions::default()).unwrap();
+        assert_eq!(results[0].filename, filename, "{name}");
+        assert_eq!(results[0].conversion, conversion, "{name}");
     }
-    for name in ["a.svg", "b.xhtml", "c.css", "d.otf", "e"] {
-        assert!(!should_process(name), "{name} should be skipped");
-    }
+}
+
+/// `png` written again as a TIFF.
+fn tiff(png: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::load_from_memory(png)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Tiff)
+        .unwrap();
+    out
 }
 
 #[test]
@@ -477,4 +501,384 @@ fn gray_conversion_goes_through_601() {
         vec![76, 150, 29],
         "these are Pillow's values for pure red, green and blue"
     );
+}
+
+// ------------------------------------------------------------- orientation
+
+/// A JPEG stored `width` x `height`, black left of `width / 2` and white to
+/// the right, saying in its EXIF data that it is to be shown turned:
+/// orientation 6 means a quarter turn clockwise.
+fn turned_photo(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+    let mut rgb = RgbImage::new(width, height);
+    for (x, _, pixel) in rgb.enumerate_pixels_mut() {
+        *pixel = if x < width / 2 {
+            Rgb([0, 0, 0])
+        } else {
+            Rgb([255, 255, 255])
+        };
+    }
+    let mut jpeg = Vec::new();
+    DynamicImage::ImageRgb8(rgb)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+
+    // APP1 "Exif": a big-endian TIFF header and one IFD entry, Orientation.
+    let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+    exif.extend_from_slice(&orientation.to_be_bytes());
+    exif.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut segment = vec![0xFF, 0xE1];
+    segment.extend_from_slice(&(exif.len() as u16 + 2).to_be_bytes());
+    segment.extend_from_slice(&exif);
+
+    jpeg.splice(2..2, segment);
+    jpeg
+}
+
+/// Mean grey of the top and the bottom half of an image.
+fn halves(image: &DynamicImage) -> (f64, f64) {
+    let gray = image.to_luma8();
+    let mean = |rows: std::ops::Range<u32>| {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for y in rows {
+            for x in 0..gray.width() {
+                total += gray.get_pixel(x, y)[0] as f64;
+                count += 1.0;
+            }
+        }
+        total / count
+    };
+    let middle = gray.height() / 2;
+    (mean(0..middle), mean(middle..gray.height()))
+}
+
+/// Readers show a photo the way its EXIF orientation says, so the converted
+/// image has to be turned that way: its tag does not survive conversion.
+#[test]
+fn a_photo_is_turned_the_way_its_exif_says() {
+    let source = turned_photo(60, 40, 6);
+
+    let out =
+        decode(&process_image(&source, "phone.jpg", &ImageOptions::default()).unwrap()[0].bytes);
+
+    assert_eq!((out.width(), out.height()), (40, 60), "shown portrait");
+    let (top, bottom) = halves(&out);
+    assert!(
+        top < 64.0 && bottom > 192.0,
+        "the stored left half is shown on top: top {top:.0}, bottom {bottom:.0}"
+    );
+}
+
+/// Light Novel mode turns landscape artwork. A photo stored landscape but
+/// shown portrait is not landscape artwork, and is not turned again.
+#[test]
+fn light_novel_mode_sees_a_photo_in_the_shape_it_is_shown() {
+    let source = turned_photo(60, 40, 6);
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..ImageOptions::default()
+    };
+
+    let results = process_image(&source, "phone.jpg", &options).unwrap();
+    assert!(!results[0].reshaped, "{}", results[0].details);
+
+    let out = decode(&results[0].bytes);
+    assert_eq!((out.width(), out.height()), (40, 60));
+    let (top, bottom) = halves(&out);
+    assert!(
+        top < 64.0 && bottom > 192.0,
+        "upright, not turned twice: top {top:.0}, bottom {bottom:.0}"
+    );
+}
+
+// ------------------------------------------------------------------- size
+
+/// A PNG that says it is `width` x `height` RGBA and holds no pixels: enough
+/// for a decoder to judge its size by, with nothing to decode.
+fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]); // eight-bit RGBA
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    // An empty zlib stream.
+    chunk(
+        &mut png,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Pillow converts an image of up to about 179 million pixels. The image
+/// crate's default allocation limit refused a 12000 x 12000 RGBA one, 144
+/// million, which was then left in the book at full size.
+#[test]
+fn an_image_pillow_would_convert_is_not_refused_for_its_size() {
+    let source = png_claiming(12_000, 12_000);
+
+    let error = process_image(&source, "plate.png", &ImageOptions::default())
+        .expect_err("it has no pixels to convert")
+        .to_string();
+    assert!(!error.contains("limit"), "refused for its size: {error}");
+}
+
+/// Past Pillow's limit an image is taken for a decompression bomb, and is
+/// refused before anything is set aside for its pixels.
+#[test]
+fn an_image_past_pillows_limit_is_refused_before_it_is_decoded() {
+    let source = png_claiming(15_000, 15_000);
+
+    let error = process_image(&source, "bomb.png", &ImageOptions::default())
+        .expect_err("too large")
+        .to_string();
+    assert!(error.contains("limit"), "{error}");
+}
+
+/// How the first component of a JPEG is sampled, as its frame header says:
+/// `0x22` for luma at twice the chroma's resolution each way, `0x11` for not.
+fn luma_sampling(jpeg: &[u8]) -> u8 {
+    let frame = jpeg
+        .windows(2)
+        .position(|marker| marker == [0xFF, 0xC0])
+        .expect("a baseline frame");
+    jpeg[frame + 11]
+}
+
+/// A grey image kept in colour is still grey: its chroma is flat, and
+/// halving it costs nothing, where a full-resolution copy of nothing made the
+/// file an eighth bigger. The upstream code saved it as greyscale.
+#[test]
+fn a_grey_image_kept_in_colour_is_not_coded_as_colour() {
+    let gradient = GrayImage::from_fn(240, 360, |x, y| Luma([((x + 2 * y) % 256) as u8]));
+    let mut source = Vec::new();
+    DynamicImage::ImageLuma8(gradient)
+        .write_to(
+            &mut std::io::Cursor::new(&mut source),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let options = ImageOptions {
+        grayscale: false,
+        ..ImageOptions::default()
+    };
+
+    let colour = process_image(&source, "grey.png", &options).unwrap();
+    assert_eq!(luma_sampling(&colour[0].bytes), 0x22);
+
+    // An image with colour in it keeps its chroma at full resolution.
+    let colourful = process_image(&photo(240, 360), "colour.png", &options).unwrap();
+    assert_eq!(luma_sampling(&colourful[0].bytes), 0x11);
+}
+
+// ---------------------------------------- Light Novel mode: what is reshaped
+
+fn light_novel(source: &[u8]) -> Vec<epubkit_core::image::ProcessedImage> {
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..ImageOptions::default()
+    };
+    process_image(source, "art.png", &options).unwrap()
+}
+
+/// The panel never enlarges an image, so one it already shows whole, an
+/// ornament or a small figure, is shown no bigger turned: turning it only
+/// stands it on end.
+#[test]
+fn light_novel_mode_leaves_an_image_the_panel_shows_whole_alone() {
+    let results = light_novel(&photo(300, 200));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+    let out = decode(&results[0].bytes);
+    assert_eq!((out.width(), out.height()), (300, 200));
+}
+
+/// Turned, a nearly square image is shown hardly bigger, which is not worth
+/// turning the reader for.
+#[test]
+fn light_novel_mode_leaves_a_nearly_square_image_alone() {
+    let results = light_novel(&photo(1300, 1200));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+}
+
+/// An image far wider than tall is a rule or a banner, not a spread of two
+/// pages, and its halves would be nonsense.
+#[test]
+fn light_novel_mode_does_not_split_a_banner() {
+    let results = light_novel(&photo(1500, 400));
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].reshaped, "{}", results[0].details);
+    let out = decode(&results[0].bytes);
+    assert!(
+        out.width() > out.height() * 3,
+        "{}x{}",
+        out.width(),
+        out.height()
+    );
+}
+
+/// Fine regular patterns, screentone or hatching, have to average out to an
+/// even grey when shrunk. Averaging blocks of pixels first, to save time, let
+/// stripes five pixels apart beat against the blocks into broad bands.
+#[test]
+fn fine_stripes_shrink_to_an_even_grey() {
+    let stripes = GrayImage::from_fn(2001, 61, |x, _| Luma([if x % 5 < 2 { 0 } else { 255 }]));
+    let mut source = Vec::new();
+    DynamicImage::ImageLuma8(stripes)
+        .write_to(
+            &mut std::io::Cursor::new(&mut source),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let options = ImageOptions {
+        contrast_boost: false,
+        eink_quantize: false,
+        quality: 95,
+        ..ImageOptions::default()
+    };
+
+    let out = decode(&process_image(&source, "stripes.png", &options).unwrap()[0].bytes).to_luma8();
+
+    let (width, height) = out.dimensions();
+    let columns: Vec<f64> = (4..width - 4)
+        .map(|x| {
+            (2..height - 2)
+                .map(|y| out.get_pixel(x, y)[0] as f64)
+                .sum::<f64>()
+                / (height - 4) as f64
+        })
+        .collect();
+    let lightest = columns.iter().cloned().fold(f64::MIN, f64::max);
+    let darkest = columns.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(
+        lightest - darkest < 8.0,
+        "{width}x{height}: columns from {darkest:.0} to {lightest:.0}"
+    );
+}
+
+/// What converting an image will hold is reckoned before its file is read:
+/// the file itself, and the image decoded at its own depth, eight bytes a
+/// pixel for sixteen bits a channel with alpha, with its flat copy of three
+/// bytes a pixel made beside it, where one of eight bits, four bytes a
+/// pixel, is flattened where it lies.
+#[test]
+fn the_memory_an_image_needs_counts_its_file_and_its_depth() {
+    let (width, height) = (2000u32, 1500u32);
+    let pixels = u64::from(width) * u64::from(height);
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("deep.png");
+    let shallow = dir.path().join("shallow.png");
+    DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgba([1, 2, 3, 4]),
+    ))
+    .save(&deep)
+    .unwrap();
+    DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        width,
+        height,
+        image::Rgba([1, 2, 3, 4]),
+    ))
+    .save(&shallow)
+    .unwrap();
+    let options = ImageOptions::default();
+
+    let needed = epubkit_core::image::memory_needed(&deep, &options);
+    let file = std::fs::metadata(&deep).unwrap().len();
+    assert!(needed >= file + pixels * 11, "{needed}");
+    let shallow_needed = epubkit_core::image::memory_needed(&shallow, &options);
+    let shallow_file = std::fs::metadata(&shallow).unwrap().len();
+    assert!(
+        shallow_needed >= shallow_file + pixels * 4,
+        "{shallow_needed}"
+    );
+    assert!(needed > shallow_needed, "{needed} {shallow_needed}");
+}
+
+/// A progressive JPEG is decoded whole before any of it is drawn, every
+/// coefficient of every component kept until then, which a JPEG in one scan
+/// does not keep: a tall one, where decoding it is the most converting it
+/// holds, is reckoned to need more.
+#[test]
+fn the_memory_a_progressive_jpeg_needs_counts_its_coefficients() {
+    let (width, height) = (600u16, 12000u16);
+    let pixels = u64::from(width) * u64::from(height);
+    let rgb: Vec<u8> = (0..pixels * 3).map(|i| (i % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut needed = Vec::new();
+    for progressive in [false, true] {
+        let path = dir.path().join(format!("{progressive}.jpg"));
+        let mut encoder = jpeg_encoder::Encoder::new_file(&path, 80).unwrap();
+        encoder.set_progressive(progressive);
+        encoder
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        let file = std::fs::metadata(&path).unwrap().len();
+        let reckoned = epubkit_core::image::memory_needed(&path, &ImageOptions::default());
+        needed.push(reckoned - file);
+    }
+    assert!(needed[1] >= needed[0] + pixels, "{needed:?}");
+}
+
+/// A thumbnail that would need more memory than its budget has is not made,
+/// rather than made with the whole budget and more besides.
+#[test]
+fn a_thumbnail_too_large_for_its_budget_is_not_made() {
+    let source = photo(1000, 1000);
+    let small = epubkit_core::memory::MemoryBudget::new(1 << 20);
+    assert!(epubkit_core::image::thumbnail(&source, 480, 720, &small).is_err());
+    let ample = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    assert!(epubkit_core::image::thumbnail(&source, 480, 720, &ample).is_ok());
+}
+
+/// A thumbnail averages blocks of pixels, and the block sum of a 16-bit image
+/// overflowed: a white 257 x 257 one shrunk to one pixel came out black, and
+/// a debug build panicked.
+#[test]
+fn a_deep_image_shrunk_far_stays_as_light_as_it_is() {
+    let white = image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_pixel(257, 257, Luma([65535]));
+    let mut png = Vec::new();
+    DynamicImage::ImageLuma16(white)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    let jpeg = epubkit_core::image::thumbnail(&png, 1, 1, &budget).unwrap();
+
+    let pixel = decode(&jpeg).to_luma8().get_pixel(0, 0)[0];
+    assert!(pixel > 250, "white came out {pixel}");
 }

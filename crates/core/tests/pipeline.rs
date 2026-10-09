@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -448,6 +449,15 @@ fn optimize_book(
     body: &str,
     options: &ProcessingOptions,
 ) -> tempfile::TempDir {
+    optimize_book_with_report(images, body, options).0
+}
+
+/// [`optimize_book`], and what the run reported.
+fn optimize_book_with_report(
+    images: &[(&str, Vec<u8>)],
+    body: &str,
+    options: &ProcessingOptions,
+) -> (tempfile::TempDir, ProcessingReport) {
     let mut manifest = String::new();
     for (index, (href, _)) in images.iter().enumerate() {
         let media_type = if href.to_ascii_lowercase().ends_with(".png") {
@@ -502,11 +512,11 @@ fn optimize_book(
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
     common::write_epub(&input, &entries);
-    process_epub(&input, &output, options, |_, _| {}).unwrap();
+    let report = process_epub(&input, &output, options, |_, _| {}).unwrap();
 
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
-    work
+    (work, report)
 }
 
 /// Where `href`, from the archive directory `base`, leads in the archive,
@@ -957,6 +967,324 @@ fn rules_only_an_svg_document_uses_are_kept() {
     }
 }
 
+/// An image is known by its media type and its bytes, not its name. A PNG
+/// the manifest declares with no extension, or with one the image step did
+/// not know, was left as it was, and nothing said so; so were JPEGs named
+/// `.jpe` and `.jfif`. A PNG named as a JPEG is counted as the PNG it is.
+#[test]
+fn an_image_is_converted_whatever_its_name() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let jpeg = solid(image::ImageFormat::Jpeg, 255);
+    let files = [
+        ("images/spread", "image/png", png.clone()),
+        ("images/plate.bin", "image/png", png.clone()),
+        ("images/photo.jpe", "image/jpeg", jpeg.clone()),
+        ("images/scan.jfif", "image/jpeg", jpeg),
+        ("images/misnamed.jpg", "image/jpeg", png),
+    ];
+    let body: String = files
+        .iter()
+        .map(|(href, ..)| format!(r#"<p><img src="../{href}" alt=""/></p>"#))
+        .collect();
+    let (work, report) = optimize_files(&files, "", "", &body, &ProcessingOptions::default());
+
+    let converted =
+        ["spread", "plate", "photo", "scan", "misnamed"].map(|stem| format!("images/{stem}.jpg"));
+    assert_eq!(
+        chapter_sources(work.path()),
+        converted
+            .iter()
+            .map(|href| format!("../{href}"))
+            .collect::<Vec<_>>()
+    );
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in &converted {
+        let bytes = fs::read(work.path().join("OEBPS").join(href)).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg,
+            "{href}"
+        );
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+    }
+    for (href, ..) in &files[..4] {
+        assert!(
+            !work.path().join("OEBPS").join(href).exists(),
+            "{href} stayed"
+        );
+    }
+    assert_manifest_matches_archive(work.path());
+
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 5/5 images (3 PNG→JPEG, 2 baseline JPEG)"),
+        "{summary}"
+    );
+}
+
+/// An image is an image whatever media type the manifest gives it. One
+/// declared `application/octet-stream`, or with no media type at all, was
+/// left as it was. A file that only begins like one, text that starts "BM"
+/// as a BMP does, is not one, and is left alone without a word.
+#[test]
+fn an_image_declared_as_something_else_is_converted() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let notes = b"BMW notes, not a bitmap at all".to_vec();
+    let files = [
+        ("images/plate.png", "application/octet-stream", png.clone()),
+        ("images/scan.png", "", png),
+        ("images/notes.txt", "text/plain", notes.clone()),
+    ];
+    let body = r#"<p><img src="../images/plate.png" alt=""/></p><p><img src="../images/scan.png" alt=""/></p><p><a href="../images/notes.txt">Notes</a></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/plate.jpg", "../images/scan.jpg"]
+    );
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in ["images/plate.jpg", "images/scan.jpg"] {
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+    }
+    assert!(
+        opf.contains(r#"href="images/notes.txt" media-type="text/plain""#),
+        "{opf}"
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/notes.txt")).unwrap(),
+        notes
+    );
+    assert_manifest_matches_archive(work.path());
+    assert_eq!(
+        (
+            report.images_converted,
+            report.images_unconverted,
+            report.images_total
+        ),
+        (2, 0, 2)
+    );
+}
+
+/// An image a chapter or a stylesheet shows is part of the book as it is
+/// read, though the manifest leaves it out. It was left as it was. Now it is
+/// converted, its references follow, and it is declared. An image nothing
+/// names, and a file named that is not an image, are left alone.
+#[test]
+fn an_image_the_manifest_leaves_out_is_converted_and_declared() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let css = b"body { background-image: url(../images/paper.png); }\n".to_vec();
+    let files = [
+        ("styles/main.css", "text/css", css),
+        ("images/missing.png", UNDECLARED, png.clone()),
+        ("images/paper.png", UNDECLARED, png.clone()),
+        ("images/stray.png", UNDECLARED, png.clone()),
+        ("images/notes.txt", UNDECLARED, b"notes".to_vec()),
+    ];
+    let body = r#"<p><img src="../images/missing.png" alt=""/></p><p><a href="../images/notes.txt">Notes</a></p>"#;
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        body,
+        &ProcessingOptions::default(),
+    );
+
+    assert_eq!(chapter_sources(work.path()), ["../images/missing.jpg"]);
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/main.css")).unwrap();
+    assert!(css.contains("url(../images/paper.jpg)"), "{css}");
+
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    for href in ["images/missing.jpg", "images/paper.jpg"] {
+        assert!(
+            opf.contains(&format!(r#"href="{href}" media-type="image/jpeg""#)),
+            "{href}: {opf}"
+        );
+        assert!(work.path().join("OEBPS").join(href).is_file(), "{href}");
+    }
+    for left in ["images/stray.png", "images/notes.txt"] {
+        assert!(work.path().join("OEBPS").join(left).is_file(), "{left}");
+        assert!(!opf.contains(left), "{left}: {opf}");
+    }
+    assert!(!work.path().join("OEBPS/images/missing.png").exists());
+
+    assert_eq!(report.images_converted, 2);
+    let summary = report.summary();
+    assert!(
+        summary.contains("Declared 2 images the manifest left out"),
+        "{summary}"
+    );
+}
+
+/// Split in Light Novel mode, a spread the manifest left out has both its
+/// pages declared, the first as the image it was, the second beside it.
+#[test]
+fn a_spread_the_manifest_leaves_out_has_both_pages_declared() {
+    let files = [("images/spread.png", UNDECLARED, spread())];
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        "",
+        r#"<div><img src="../images/spread.png" alt=""/></div>"#,
+        &light_novel(),
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_manifest_matches_archive(work.path());
+    assert_eq!((report.images_declared, report.spreads_split), (1, 1));
+}
+
+/// A document too large to read whole, a chapter of more than 32 MiB here,
+/// is left exactly as it is, and counted: parsing one takes some fifteen
+/// times its size. So is every image it might name, which would otherwise
+/// be converted and renamed out from under it, a name written with a
+/// percent-escape included; one only the rest of the book names is
+/// converted as usual.
+#[test]
+fn a_document_too_large_to_read_is_left_as_it_is_with_the_images_it_names() {
+    let filler =
+        "<p>The long afternoon light was failing, and she said it would be well enough.</p>\n";
+    let big = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Big</title></head><body>
+<p><img src="../images/my%20plate.png" alt=""/></p>
+{}</body></html>
+"#,
+        filler.repeat(32 * 1024 * 1024 / filler.len() + 1)
+    );
+    let png = solid(image::ImageFormat::Png, 0);
+    let files = [
+        ("images/my plate.png", "image/png", png.clone()),
+        ("images/other.png", "image/png", png),
+        (
+            "text/big.xhtml",
+            "application/xhtml+xml",
+            big.clone().into_bytes(),
+        ),
+    ];
+    let body = r#"<p><img src="../images/my%20plate.png" alt=""/></p><p><img src="../images/other.png" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert!(
+        fs::read(work.path().join("OEBPS/text/big.xhtml")).unwrap() == big.as_bytes(),
+        "the large chapter changed"
+    );
+    assert!(work.path().join("OEBPS/images/my plate.png").is_file());
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/my%20plate.png", "../images/other.jpg"]
+    );
+    assert_eq!(report.documents_too_large, 1);
+    assert_eq!((report.images_converted, report.images_unconverted), (1, 1));
+    let summary = report.summary();
+    assert!(
+        summary.contains("Left 1 document too large to process as it was"),
+        "{summary}"
+    );
+}
+
+/// A package document too large to read whole leaves nothing to go on, and
+/// the book is refused, saying why, rather than read into memory.
+#[test]
+fn a_package_document_too_large_to_read_refuses_the_book() {
+    let padding = "<!-- padding -->".repeat(32 * 1024 * 1024 / 16 + 1);
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:big</dc:identifier><dc:title>Big</dc:title></metadata>
+  <manifest><item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+{padding}
+</package>
+"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", common::CHAPTER_XHTML),
+        ],
+    );
+
+    let error = process_epub(
+        &input,
+        &dir.path().join("out.epub"),
+        &ProcessingOptions::default(),
+        |_, _| {},
+    )
+    .expect_err("a package document of 32 MiB is read");
+    assert!(error.to_string().contains("too large"), "{error}");
+}
+
+/// An image no decoder reads, an icon here, is left as it was, and said to
+/// be: the image step skipped it by its name, and the summary was silent. An
+/// SVG is drawn, not converted, and counts as neither.
+#[test]
+fn an_image_no_decoder_reads_is_counted_and_an_svg_is_not() {
+    let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>
+"#;
+    let icon = b"\x00\x00\x01\x00 not really an icon".to_vec();
+    let files = [
+        (
+            "images/plate.png",
+            "image/png",
+            solid(image::ImageFormat::Png, 0),
+        ),
+        ("images/mark.ico", "image/x-icon", icon.clone()),
+        ("images/map.svg", "image/svg+xml", svg.to_vec()),
+    ];
+    let body = r#"<p><img src="../images/plate.png" alt=""/><img src="../images/mark.ico" alt=""/><img src="../images/map.svg" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        [
+            "../images/plate.jpg",
+            "../images/mark.ico",
+            "../images/map.svg"
+        ]
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/mark.ico")).unwrap(),
+        icon
+    );
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/images/map.svg")).unwrap(),
+        svg
+    );
+
+    assert_eq!(
+        (
+            report.images_converted,
+            report.images_unconverted,
+            report.images_total
+        ),
+        (1, 1, 2)
+    );
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 1/2 images (1 PNG→JPEG)"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("Left 1 image that could not be converted as it was"),
+        "{summary}"
+    );
+}
+
 // ---------------------------------------------------------- Light Novel mode
 
 /// A double-page spread: black on the left, white on the right.
@@ -1332,4 +1660,781 @@ fn the_container_cannot_point_at_a_package_outside_the_book() {
         "the package outside the book was rewritten"
     );
     assert_eq!(report.output_filename, "A Writer - Test Book.epub");
+}
+
+/// An image that cannot be converted stays as it was, and the summary says
+/// so, rather than leaving it to be worked out from the count of converted
+/// images.
+#[test]
+fn an_image_that_cannot_be_converted_is_counted_in_the_summary() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:unconverted</dc:identifier>
+    <dc:title>Unconverted</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="good" href="good.png" media-type="image/png"/>
+    <item id="bad" href="bad.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>
+<body><p><img src="good.png" alt=""/></p><p><img src="bad.png" alt=""/></p></body></html>
+"#;
+    let good = common::png_gradient(60, 80);
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter),
+            ("OEBPS/good.png", &good),
+            ("OEBPS/bad.png", b"not an image at all"),
+        ],
+    );
+    let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    assert_eq!(report.images_converted, 1);
+    let summary = report.summary();
+    assert!(
+        summary.contains("Left 1 image that could not be converted as it was"),
+        "{summary}"
+    );
+    assert!(entry_names(&output).contains(&"OEBPS/bad.png".to_string()));
+}
+
+/// The summary counts images by how their format changed. It counted them by
+/// the first thing said about each, which for a JPEG is how it was resized,
+/// so a book of JPEGs listed one entry per size.
+#[test]
+fn the_summary_counts_images_by_format_not_by_size() {
+    let images = [
+        ("images/a.jpg", solid(image::ImageFormat::Jpeg, 40)),
+        ("images/b.jpg", jpeg_of(1200, 1600)),
+        ("images/c.jpg", jpeg_of(900, 1200)),
+        ("images/d.png", solid(image::ImageFormat::Png, 200)),
+    ];
+    let body = "<p>Text.</p>";
+
+    let (_, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    let summary = report.summary();
+    assert!(
+        summary.contains("Converted 4/4 images (1 PNG→JPEG, 3 baseline JPEG)"),
+        "{summary}"
+    );
+}
+
+fn jpeg_of(width: u32, height: u32) -> Vec<u8> {
+    let image =
+        image::GrayImage::from_fn(width, height, |x, y| image::Luma([((x ^ y) & 0xFF) as u8]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut out),
+            image::ImageFormat::Jpeg,
+        )
+        .expect("encode fixture image");
+    out
+}
+
+/// A converted image is a JPEG whatever it was before, and its manifest entry
+/// has to say so, under its old name too: a PNG named `plate.jpg` and
+/// declared `image/png` came out a JPEG still declared a PNG.
+#[test]
+fn an_image_converted_under_its_own_name_is_declared_a_jpeg() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:in-place</dc:identifier>
+    <dc:title>In place</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="plate.jpg" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#;
+    let chapter = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>
+<body><p><img src="plate.jpg" alt=""/></p></body></html>
+"#;
+    let png = solid(image::ImageFormat::Png, 120);
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter1.xhtml", chapter),
+            ("OEBPS/plate.jpg", &png),
+        ],
+    );
+    process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    let plate = fs::read(work.path().join("OEBPS/plate.jpg")).unwrap();
+    assert_eq!(&plate[..2], &[0xFF, 0xD8], "converted to JPEG");
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    assert!(
+        opf.contains(r#"<item id="plate" href="plate.jpg" media-type="image/jpeg"/>"#),
+        "{opf}"
+    );
+}
+
+// ------------------------------------------ Light Novel mode: shapes kept
+
+/// Optimize, in Light Novel mode, a book whose one chapter,
+/// `OEBPS/text/chapter1.xhtml`, has `head` and `body`, with `files` beside it,
+/// each a path in `OEBPS`, a media type and its bytes, and `metadata` in its
+/// package. Returns the unpacked output.
+fn light_novel_book(
+    files: &[(&str, &str, Vec<u8>)],
+    metadata: &str,
+    head: &str,
+    body: &str,
+) -> tempfile::TempDir {
+    optimize_files(files, metadata, head, body, &light_novel()).0
+}
+
+/// What [`optimize_files`] takes for the media type of a file it is to leave
+/// out of the manifest, though the book holds it.
+const UNDECLARED: &str = "(not in the manifest)";
+
+/// [`light_novel_book`] with `options`, and what the run reported. A file of
+/// media type [`UNDECLARED`] is in the book but not in its manifest.
+fn optimize_files(
+    files: &[(&str, &str, Vec<u8>)],
+    metadata: &str,
+    head: &str,
+    body: &str,
+    options: &ProcessingOptions,
+) -> (tempfile::TempDir, ProcessingReport) {
+    let manifest: String = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, media_type, _))| *media_type != UNDECLARED)
+        .map(|(index, (href, media_type, _))| {
+            format!(r#"<item id="file{index}" href="{href}" media-type="{media_type}"/>"#)
+        })
+        .collect();
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:shapes</dc:identifier>
+    <dc:title>Shapes</dc:title>
+    {metadata}
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    {manifest}
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink"><head><title>One</title>{head}</head><body>{body}</body></html>
+"#
+    );
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".into(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".into(),
+            common::CONTAINER_XML.to_vec(),
+        ),
+        ("OEBPS/content.opf".into(), opf.into_bytes()),
+        ("OEBPS/text/chapter1.xhtml".into(), chapter.into_bytes()),
+    ];
+    for (href, _, bytes) in files {
+        entries.push((format!("OEBPS/{href}"), bytes.clone()));
+    }
+    let entries: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    common::write_epub(&input, &entries);
+    let report = process_epub(&input, &output, options, |_, _| {}).unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    package::extract_epub(&output, work.path()).unwrap();
+    (work, report)
+}
+
+/// The converted image at `path` in the unpacked book is one image, in the
+/// shape it came in: wider than tall, with no pages split off it.
+fn assert_shape_kept(work: &Path, path: &str) {
+    let parts: Vec<String> = image_files(work)
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .filter(|file| file.contains("_part"))
+        .collect();
+    assert!(parts.is_empty(), "split: {parts:?}");
+
+    let image = image::open(work.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert!(
+        image.width() > image.height() * 2,
+        "{path} was turned: {}x{}",
+        image.width(),
+        image.height()
+    );
+}
+
+/// An SVG document draws its image in a box the image's own shape, and is
+/// shown as it is: a split image's other page was declared but shown
+/// nowhere, so half the picture was lost.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_an_svg_document_draws() {
+    let map = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="map.png"/><text x="600" y="200">North</text></svg>
+"#;
+    let work = light_novel_book(
+        &[
+            ("images/map.png", "image/png", spread()),
+            ("images/map.svg", "image/svg+xml", map.to_vec()),
+        ],
+        "",
+        "",
+        r#"<p><img src="../images/map.svg" alt="A map"/></p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/map.jpg");
+    let svg = fs::read_to_string(work.path().join("OEBPS/images/map.svg")).unwrap();
+    assert!(svg.contains(r#"xlink:href="map.jpg""#), "{svg}");
+}
+
+/// A background fills its box however it is shaped, and only the first page
+/// of a split one was ever named.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_a_background() {
+    let css = b"body { background-image: url(../images/paper.png); }\n";
+    let work = light_novel_book(
+        &[
+            ("images/paper.png", "image/png", spread()),
+            ("styles/main.css", "text/css", css.to_vec()),
+        ],
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        "<p>Text.</p>",
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/paper.jpg");
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/main.css")).unwrap();
+    assert!(css.contains("url(../images/paper.jpg)"), "{css}");
+}
+
+/// An SVG that draws more than its image, a label here, places what it draws
+/// on the image as it is shaped. A reshaped image no longer lies under them.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_an_illustration_draws() {
+    let work = light_novel_book(
+        &[("images/plate.png", "image/png", spread())],
+        "",
+        "",
+        r#"<div><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/plate.png"/><text x="700" y="200">A label</text></svg></div>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+    let chapter = read_chapter(work.path());
+    assert!(chapter.contains("A label"), "{chapter}");
+    assert_eq!(chapter.matches("plate.jpg").count(), 1, "{chapter}");
+}
+
+/// An image in a line of text is part of the line. Split, its halves were
+/// shown one after the other in it; turned, it stood on end.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_in_text() {
+    let work = light_novel_book(
+        &[("images/mark.png", "image/png", spread())],
+        "",
+        "",
+        r#"<p>A word <img src="../images/mark.png" alt="mark"/> in a line.</p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/mark.jpg");
+    assert_eq!(chapter_sources(work.path()), ["../images/mark.jpg"]);
+}
+
+/// A heading's image is its title, not a page of art: split, "Chapter One"
+/// read "One Chapter", right half first.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_a_heading_image() {
+    let work = light_novel_book(
+        &[("images/title.png", "image/png", spread())],
+        "",
+        "",
+        r#"<h1><img src="../images/title.png" alt="Chapter One"/></h1><p>Text.</p>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/title.jpg");
+    assert_eq!(chapter_sources(work.path()), ["../images/title.jpg"]);
+}
+
+/// The cover is what a reader shows for the book. Turned, it lay on its side
+/// there; split, it was half of itself.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_the_cover() {
+    let work = light_novel_book(
+        &[("images/cover.png", "image/png", spread())],
+        r#"<meta name="cover" content="file0"/>"#,
+        "",
+        r#"<div><img src="../images/cover.png" alt="Cover"/></div>"#,
+    );
+
+    assert_shape_kept(work.path(), "OEBPS/images/cover.jpg");
+}
+
+/// A spread shown on its own as a page of art is still split.
+#[test]
+fn light_novel_mode_still_splits_a_spread_shown_on_its_own() {
+    let work = light_novel_book(
+        &[("images/spread.png", "image/png", spread())],
+        "",
+        "",
+        r#"<p>Text before.</p><div class="plate"><img src="../images/spread.png" alt="A spread"/></div><p>Text after.</p>"#,
+    );
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+}
+
+/// Optimize, in Light Novel mode, a book showing `images/plate.png` by
+/// `body`, with `css` in a stylesheet the chapter links and `style` in a
+/// `<style>` element of its own. Returns the unpacked output.
+fn styled_plate(css: &str, style: &str, body: &str) -> tempfile::TempDir {
+    light_novel_book(
+        &[
+            ("images/plate.png", "image/png", spread()),
+            ("styles/main.css", "text/css", css.as_bytes().to_vec()),
+        ],
+        "",
+        &format!(
+            r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/><style type="text/css">{style}</style>"#
+        ),
+        body,
+    )
+}
+
+/// An image in a box the book sizes for it would not fit it reshaped: a
+/// split image's second page was cut off below the frame, or ran over what
+/// came after it, and a turned one stood on end in a box made for it lying
+/// down. Nor would an image the book turns itself, or lays over another
+/// thing: its pages were turned again, or laid over each other.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_in_a_frame() {
+    let cases = [
+        // A frame by style attributes, and the same by a stylesheet.
+        (
+            "",
+            "",
+            r#"<p>Text.</p><div style="width:500px;height:200px;overflow:hidden"><img src="../images/plate.png" alt="" style="width:100%;height:100%"/></div><p>After.</p>"#,
+        ),
+        (
+            ".frame { width: 500px; height: 200px; overflow: hidden; } .frame img { width: 100%; height: 100%; }",
+            "",
+            r#"<p>Text.</p><div class="frame"><img src="../images/plate.png" alt=""/></div><p>After.</p>"#,
+        ),
+        // A height capped in another unit, by an id, in a media query of
+        // the chapter's own style.
+        (
+            "",
+            "@media screen { #box { max-height: 12em } }",
+            r#"<div id="box"><p><img src="../images/plate.png" alt=""/></p></div>"#,
+        ),
+        // A box a screen high holds one page, and a box of a set shape one
+        // shape.
+        (
+            "div.page { height: 100vh }",
+            "",
+            r#"<div class="page"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "figure { aspect-ratio: 5 / 2 }",
+            "",
+            r#"<figure><img src="../images/plate.png" alt=""/></figure>"#,
+        ),
+        // A frame around an SVG that shows the image.
+        (
+            "",
+            "",
+            r#"<div style="height: 200px"><svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 1000 400"><image width="1000" height="400" xlink:href="../images/plate.png"/></svg></div>"#,
+        ),
+        // The image's own height, which each page would take.
+        (
+            "img.plate { height: 200px }",
+            "",
+            r#"<div><img class="plate" src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // An image the book turns, and one it lays over the page.
+        (
+            "",
+            "",
+            r#"<div><img src="../images/plate.png" alt="" style="transform: rotate(90deg)"/></div>"#,
+        ),
+        (
+            ".over { position: absolute; top: 0; left: 0 }",
+            "",
+            r#"<div><img class="over" src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A height that is a share of the page's, through every box from the
+        // page down.
+        (
+            "html, body { height: 100% } .frame { height: 100% }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "html, body, .plates { height: 100% } .frame { max-height: 50% }",
+            "",
+            r#"<div class="plates"><div class="frame"><p><img src="../images/plate.png" alt=""/></p></div></div>"#,
+        ),
+        // The page's own box, a screen high, hiding what overflows it.
+        (
+            "body { height: 100vh; overflow: hidden }",
+            "",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A height the image's pages after the first take, which lose the
+        // id that undoes it for the first.
+        (
+            "img.plate { height: 200px } #plate { height: auto }",
+            "",
+            r#"<div><img id="plate" class="plate" src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A frame on some screens, and one only some screens undo.
+        (
+            "@media (orientation: landscape) { .frame { height: 200px } }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            ".frame { height: 200px } @media (min-width: 2000px) { .frame { height: auto } }",
+            "",
+            r#"<div class="frame"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+    ];
+
+    for (css, style, body) in cases {
+        let work = styled_plate(css, style, body);
+        assert_eq!(
+            chapter_sources(work.path()),
+            ["../images/plate.jpg"],
+            "css: {css:?}, style: {style:?}, body: {body}"
+        );
+        assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+    }
+}
+
+/// Only what a reshaped image would not fit keeps it whole: a box fitted to
+/// the page, one that grows to hold both pages, and rules for other things
+/// leave a spread to be split.
+#[test]
+fn light_novel_mode_still_splits_a_spread_in_a_box_that_grows() {
+    let cases = [
+        // Fitted to the page, as light novels' plates are.
+        (
+            ".plate { height: 100%; text-align: center } .plate img { max-width: 100%; max-height: 100% }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A screen high itself, which each page then is.
+        (
+            "img { height: 95vh }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A set width, or a least height, which a box grows past.
+        (
+            "div.wide { width: 500px; min-height: 10em }",
+            r#"<div class="wide"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // Rules for something else: another class, a box drawn before the
+        // image's, and a box of the right class but another element.
+        (
+            ".other { height: 200px } div.plate:before { content: ''; height: 2em } p.plate { height: 200px }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A box of the right class elsewhere: inside another, after another.
+        (
+            ".gallery .plate { height: 200px } h1 + .plate { height: 200px }",
+            r#"<p>Text.</p><div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A frame the cascade undoes: by a later rule, a more specific one,
+        // and the box's own style.
+        (
+            ".plate { height: 200px } .plate { height: auto }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "div#plates { height: auto } .plate { height: 200px }",
+            r#"<div id="plates" class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            ".plate { height: 200px }",
+            r#"<div class="plate" style="height: auto"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        // A share of a page whose boxes grow: the page's own run on onto the
+        // pages after, and a box between them and the frame grows.
+        (
+            "html, body { height: 100% }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "body { height: 100vh }",
+            r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+        (
+            "html, body { height: 100% } .plate { height: 100% }",
+            r#"<div><div class="plate"><img src="../images/plate.png" alt=""/></div></div>"#,
+        ),
+        // A frame for print only.
+        (
+            "@media print { .plate { height: 200px } }",
+            r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#,
+        ),
+    ];
+
+    for (css, body) in cases {
+        let work = styled_plate(css, "", body);
+        assert_eq!(
+            chapter_sources(work.path()),
+            ["../images/plate_part1.jpg", "../images/plate_part2.jpg"],
+            "css: {css:?}, body: {body}"
+        );
+    }
+}
+
+/// What styles a chapter is what it links, and what that imports, as a
+/// reader reads them: a frame in a stylesheet it does not link, or links or
+/// imports for print, frames nothing there, and one it imports does.
+#[test]
+fn light_novel_mode_reads_the_stylesheets_a_chapter_links() {
+    let frame = ".plate { height: 200px }";
+    let body = r#"<div class="plate"><img src="../images/plate.png" alt=""/></div>"#;
+    let link = r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#;
+    let sources = |stylesheets: &[(&str, &str)], head: &str| {
+        let mut files = vec![("images/plate.png", "image/png", spread())];
+        for (href, css) in stylesheets {
+            files.push((href, "text/css", css.as_bytes().to_vec()));
+        }
+        chapter_sources(light_novel_book(&files, "", head, body).path())
+    };
+    let split = ["../images/plate_part1.jpg", "../images/plate_part2.jpg"];
+    let whole = ["../images/plate.jpg"];
+
+    assert_eq!(sources(&[("styles/frames.css", frame)], ""), split);
+    assert_eq!(
+        sources(
+            &[("styles/main.css", ""), ("styles/frames.css", frame)],
+            link
+        ),
+        split
+    );
+    assert_eq!(
+        sources(
+            &[("styles/main.css", frame)],
+            r#"<link rel="stylesheet" type="text/css" media="print" href="../styles/main.css"/>"#
+        ),
+        split
+    );
+    assert_eq!(
+        sources(
+            &[
+                ("styles/main.css", "@import url(\"frames.css\") print;"),
+                ("styles/frames.css", frame)
+            ],
+            link
+        ),
+        split
+    );
+
+    assert_eq!(
+        sources(
+            &[
+                ("styles/main.css", "@import url(\"frames.css\");"),
+                ("styles/frames.css", frame)
+            ],
+            link
+        ),
+        whole
+    );
+    assert_eq!(
+        sources(
+            &[("styles/frames.css", frame)],
+            r#"<style type="text/css">@import "../styles/frames.css";</style>"#
+        ),
+        whole
+    );
+}
+
+/// A stylesheet too large to read could frame anything, and the images of a
+/// chapter it styles keep their shape.
+#[test]
+fn light_novel_mode_keeps_the_shape_of_an_image_a_stylesheet_too_large_to_read_styles() {
+    let rule = ".other { color: black }\n";
+    let large = rule.repeat(32 * 1024 * 1024 / rule.len() + 1);
+    let work = light_novel_book(
+        &[
+            ("images/plate.png", "image/png", spread()),
+            ("styles/main.css", "text/css", large.into_bytes()),
+        ],
+        "",
+        r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+        r#"<div><img src="../images/plate.png" alt=""/></div>"#,
+    );
+    assert_eq!(chapter_sources(work.path()), ["../images/plate.jpg"]);
+    assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+}
+
+// --------------------------------------------- images converted in parallel
+
+/// Images are converted on several threads, and finish in whatever order
+/// they finish, a large one last. Which takes which name is settled in the
+/// manifest's order all the same, so a book converts the same every time.
+#[test]
+fn images_take_their_names_in_manifest_order_whatever_finishes_first() {
+    let large = image::GrayImage::from_pixel(1200, 1800, image::Luma([0]));
+    let mut large_png = Vec::new();
+    image::DynamicImage::ImageLuma8(large)
+        .write_to(
+            &mut std::io::Cursor::new(&mut large_png),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let images = [
+        ("images/plate.png", large_png),
+        ("images/plate.gif", solid(image::ImageFormat::Png, 128)),
+        ("images/plate.bmp", solid(image::ImageFormat::Png, 255)),
+        ("images/plate.jpeg", solid(image::ImageFormat::Jpeg, 128)),
+        ("images/plate.webp", solid(image::ImageFormat::Png, 0)),
+    ];
+
+    let mut books = Vec::new();
+    for _ in 0..3 {
+        let work = convert_images_book(&images);
+        assert_eq!(
+            chapter_sources(work.path()),
+            [
+                "../images/plate.jpg",
+                "../images/plate-2.jpg",
+                "../images/plate-3.jpg",
+                "../images/plate-4.jpg",
+                "../images/plate-5.jpg",
+            ]
+        );
+        assert_eq!(shown_greys(work.path()), [0, 128, 255, 128, 0]);
+        assert_manifest_matches_archive(work.path());
+        books.push(
+            image_files(work.path())
+                .iter()
+                .map(|file| {
+                    let name = file.strip_prefix(work.path()).unwrap().to_path_buf();
+                    (name, fs::read(file).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+    assert!(
+        books.windows(2).all(|pair| pair[0] == pair[1]),
+        "converted differently"
+    );
+}
+
+/// A TIFF header claiming 4294967295 x 4294967295 pixels of one grey sample.
+fn impossible_tiff() -> Vec<u8> {
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    let entries: &[(u16, u16, u32)] = &[
+        (256, 4, u32::MAX), // width
+        (257, 4, u32::MAX), // height
+        (258, 3, 8),        // bits per sample
+        (259, 3, 1),        // uncompressed
+        (262, 3, 1),        // black is zero
+        (273, 4, 0),        // strip offsets
+        (277, 3, 1),        // samples per pixel
+        (278, 4, u32::MAX), // rows per strip
+        (279, 4, 0),        // strip byte counts
+    ];
+    tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(tag, kind, value) in entries {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        if kind == 3 {
+            tiff.extend_from_slice(&(value as u16).to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+        } else {
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    tiff.extend_from_slice(&[0; 4]);
+    tiff
+}
+
+/// An image whose conversion would need more memory than the image step sets
+/// aside for every image together, a 12000 x 12000 PNG of sixteen bits a
+/// channel with alpha here, is left as it is, and said to be, before any of
+/// it is decoded. One the whole budget was too little for converted all the
+/// same, with nothing else beside it, to well past the budget: this one
+/// would take 1.7 GB.
+#[test]
+fn an_image_too_large_for_the_memory_set_aside_is_left_as_it_is() {
+    let images = [
+        ("images/vast.png", common::png_claiming(12000, 12000, 16, 6)),
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+    ];
+    let body = r#"<p><img src="../images/vast.png" alt=""/></p><p><img src="../images/plate.png" alt=""/></p>"#;
+
+    let (work, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    assert_eq!((report.images_converted, report.images_unconverted), (1, 1));
+    assert!(work.path().join("OEBPS/images/vast.png").is_file());
+    let detail = report
+        .image_details
+        .iter()
+        .find(|detail| detail.starts_with("vast.png"))
+        .expect("a word on vast.png");
+    assert!(
+        detail.contains("more than the 1024 MB set aside"),
+        "{detail}"
+    );
+}
+
+/// An image whose header claims more pixels than any could hold is one that
+/// cannot be converted, like any other. Reckoning the memory it would need
+/// overflowed, which in a debug build stopped the whole book.
+#[test]
+fn an_image_claiming_impossible_dimensions_is_skipped() {
+    let images = [
+        ("images/huge.tif", impossible_tiff()),
+        ("images/plate.png", solid(image::ImageFormat::Png, 0)),
+    ];
+    let body = r#"<p><img src="../images/huge.tif" alt=""/></p><p><img src="../images/plate.png" alt=""/></p>"#;
+
+    let (work, report) = optimize_book_with_report(&images, body, &ProcessingOptions::default());
+
+    assert_eq!(report.images_converted, 1);
+    assert_eq!(report.images_unconverted, 1);
+    assert!(work.path().join("OEBPS/images/huge.tif").is_file());
 }
