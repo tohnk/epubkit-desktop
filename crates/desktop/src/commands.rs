@@ -379,8 +379,14 @@ fn cover_data_url(cover: &preview::Cover) -> Option<String> {
     // Shared by every book being read, however many are dropped at once.
     static PREVIEW_MEMORY: MemoryBudget = MemoryBudget::new(512 << 20);
 
-    let thumbnail =
-        image::thumbnail(&cover.bytes, THUMBNAIL.0, THUMBNAIL.1, &PREVIEW_MEMORY).ok()?;
+    // The cover is the book's to make of what it likes, and an image decoder
+    // that panics on it leaves this one book without a cover, not every book
+    // dropped with it.
+    let thumbnail = std::panic::catch_unwind(|| {
+        image::thumbnail(&cover.bytes, THUMBNAIL.0, THUMBNAIL.1, &PREVIEW_MEMORY)
+    })
+    .ok()?
+    .ok()?;
     Some(format!(
         "data:image/jpeg;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(thumbnail)

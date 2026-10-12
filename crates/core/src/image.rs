@@ -29,7 +29,7 @@
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use image::error::{ImageError, LimitError, LimitErrorKind};
+use image::error::{DecodingError, ImageError, ImageFormatHint, LimitError, LimitErrorKind};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{
@@ -838,15 +838,24 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 /// turn it to show it as a reader does. The tag does not survive conversion,
 /// so the pixels have to, but they are turned once flat, when they are no
 /// deeper than they have to be.
+///
+/// An image of no pixels across or down, which a GIF's canvas can be, shows
+/// nothing, and is refused before anything is sized from it.
 fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
-    let mut decoder = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()?
-        .into_decoder()?;
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let format = reader.format();
+    let mut decoder = reader.into_decoder()?;
     // A tag that cannot be read leaves the image as it is stored, as a
     // reader would.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 
     let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(ImageError::Decoding(DecodingError::new(
+            format.map_or(ImageFormatHint::Unknown, ImageFormatHint::Exact),
+            "the image has no pixels",
+        )));
+    }
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(ImageError::Limits(LimitError::from_kind(
             LimitErrorKind::DimensionError,

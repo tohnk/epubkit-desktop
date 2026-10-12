@@ -882,3 +882,45 @@ fn a_deep_image_shrunk_far_stays_as_light_as_it_is() {
     let pixel = decode(&jpeg).to_luma8().get_pixel(0, 0)[0];
     assert!(pixel > 250, "white came out {pixel}");
 }
+
+/// A GIF whose canvas is `width` x `height`, with one pixel drawn at its
+/// origin: a GIF decoder takes a canvas of no width or height as it is.
+fn gif_canvas(width: u16, height: u16) -> Vec<u8> {
+    let mut gif = b"GIF89a".to_vec();
+    gif.extend_from_slice(&width.to_le_bytes());
+    gif.extend_from_slice(&height.to_le_bytes());
+    // Two colours, black and white.
+    gif.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF]);
+    // A frame of one pixel, coded in LZW, and the end.
+    gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]);
+    gif.extend_from_slice(&[2, 2, 0x44, 0x01, 0, 0x3B]);
+    gif
+}
+
+/// An image with no pixels across or down shows nothing, and is refused as
+/// one that cannot be decoded. Shrinking it for a thumbnail divided by its
+/// width, and a panic there took every book dropped with it.
+#[test]
+fn an_image_with_no_pixels_is_refused_not_panicked_on() {
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    for (width, height) in [(0, 1), (1, 0), (0, 0)] {
+        let gif = gif_canvas(width, height);
+        let canvas = image::load_from_memory(&gif).map(|image| (image.width(), image.height()));
+        assert_eq!(canvas.ok(), Some((u32::from(width), u32::from(height))));
+
+        assert!(
+            epubkit_core::image::thumbnail(&gif, 480, 720, &budget).is_err(),
+            "{width}x{height}"
+        );
+        for light_novel_mode in [false, true] {
+            let options = ImageOptions {
+                light_novel_mode,
+                ..ImageOptions::default()
+            };
+            assert!(
+                process_image(&gif, "blank.gif", &options).is_err(),
+                "{width}x{height}"
+            );
+        }
+    }
+}

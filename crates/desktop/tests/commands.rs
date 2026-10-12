@@ -160,6 +160,45 @@ fn a_broken_file_fails_on_its_own() {
     assert_eq!(books[1].filename, "bad.epub");
 }
 
+/// A GIF whose canvas is no pixels wide, with one pixel drawn on it.
+const BLANK_GIF: &[u8] = &[
+    b'G', b'I', b'F', b'8', b'9', b'a', 0, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x2C, 0,
+    0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0, 0x3B,
+];
+
+/// A cover no thumbnail can be made of must not sink the drop either: its
+/// book is listed without one, beside the books that were fine.
+#[test]
+fn a_cover_with_no_pixels_leaves_only_its_own_book_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let blank = dir.path().join("blank.epub");
+    let good = dir.path().join("good.epub");
+    // What the cover is, is read from its bytes, whatever its name.
+    write_epub(
+        &blank,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", OPF),
+            ("OEBPS/c1.xhtml", CHAPTER),
+            ("OEBPS/cover.png", BLANK_GIF),
+        ],
+    );
+    demo_epub(&good);
+
+    let books = inspect(vec![
+        blank.to_string_lossy().to_string(),
+        good.to_string_lossy().to_string(),
+    ]);
+
+    assert_eq!(books.len(), 2);
+    assert!(books[0].error.is_none(), "{:?}", books[0].error);
+    assert_eq!(books[0].title, "The Long Afternoon");
+    assert!(books[0].cover.is_none());
+    assert!(books[1].error.is_none(), "{:?}", books[1].error);
+    assert!(books[1].cover.is_some());
+}
+
 #[test]
 fn a_drm_protected_book_says_so_before_anything_is_processed() {
     let dir = tempfile::tempdir().unwrap();
