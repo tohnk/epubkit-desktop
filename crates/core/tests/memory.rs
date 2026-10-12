@@ -1,0 +1,153 @@
+//! What reading and converting an image holds, counted by an allocator that
+//! keeps a tally. Tests here run one at a time, so the tally is theirs.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use epubkit_core::image::{
+    is_raster_image, memory_needed, process_image, ImageOptions, HEADER_MEMORY,
+};
+use image::ImageEncoder;
+
+/// The system's allocator, counting what is live and the most that was.
+struct Tally;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn grew(by: usize) {
+    let live = LIVE.fetch_add(by, Ordering::SeqCst) + by;
+    PEAK.fetch_max(live, Ordering::SeqCst);
+}
+
+unsafe impl GlobalAlloc for Tally {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = System.alloc(layout);
+        if !pointer.is_null() {
+            grew(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        System.dealloc(pointer, layout);
+        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let moved = System.realloc(pointer, layout, size);
+        if !moved.is_null() {
+            if size > layout.size() {
+                grew(size - layout.size());
+            } else {
+                LIVE.fetch_sub(layout.size() - size, Ordering::SeqCst);
+            }
+        }
+        moved
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Tally = Tally;
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// What `work` returns, and the most it held at once beyond what was held
+/// before it.
+fn peak_of<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    let before = LIVE.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let done = work();
+    (done, PEAK.load(Ordering::SeqCst) - before)
+}
+
+/// A JPEG of 16 x 16 pixels with `extra` bytes of comments after its start,
+/// which a decoder passes over.
+fn jpeg_with_comments(extra: usize) -> Vec<u8> {
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        16,
+        16,
+        image::Rgb([90, 120, 150]),
+    ))
+    .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+    .unwrap();
+
+    let mut out = jpeg[..2].to_vec();
+    let mut left = extra;
+    while left > 0 {
+        let body = left.min(65533);
+        out.extend_from_slice(&[0xFF, 0xFE]);
+        out.extend_from_slice(&(body as u16 + 2).to_be_bytes());
+        out.resize(out.len() + body, b'c');
+        left -= body;
+    }
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+/// A PNG of one pixel whose ICC profile is `size` bytes, which pack small.
+fn png_with_profile(size: usize) -> Vec<u8> {
+    let mut png = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder.set_icc_profile(vec![0; size]).unwrap();
+    encoder
+        .write_image(&[200, 100, 50], 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    png
+}
+
+/// Reckoning what converting an image takes, or whether it is one, reads its
+/// header, and no more. A JPEG's decoder copied the whole file as it was made,
+/// comments it passes over and all, and a PNG's unpacked its ICC profile, all
+/// before anything was set aside for either.
+#[test]
+fn reading_a_header_holds_little_of_the_file() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let jpeg = dir.path().join("comments.jpg");
+    std::fs::write(&jpeg, jpeg_with_comments(8 << 20)).unwrap();
+    let png = dir.path().join("profile.png");
+    std::fs::write(&png, png_with_profile(64 << 20)).unwrap();
+    let options = ImageOptions::default();
+
+    for (path, most) in [(&jpeg, 1 << 20), (&png, HEADER_MEMORY as usize)] {
+        let (needed, peak) = peak_of(|| memory_needed(path, &options));
+        assert!(needed > std::fs::metadata(path).unwrap().len());
+        assert!(peak <= most, "{}: reckoning held {peak}", path.display());
+        let (raster, peak) = peak_of(|| is_raster_image(path));
+        assert!(raster);
+        assert!(peak <= most, "{}: telling held {peak}", path.display());
+    }
+}
+
+/// Converting an image holds no more than was set aside for it: the file, and
+/// what decoding and converting it hold, a JPEG decoder's copy of the file
+/// and what a PNG decoder keeps of its chunks among it.
+#[test]
+fn converting_an_image_holds_no_more_than_was_set_aside() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in [
+        ("comments.jpg", jpeg_with_comments(48 << 20)),
+        ("profile.png", png_with_profile(64 << 20)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        drop(bytes);
+        for light_novel_mode in [false, true] {
+            let options = ImageOptions {
+                light_novel_mode,
+                ..ImageOptions::default()
+            };
+            let needed = memory_needed(&path, &options);
+            let file = std::fs::read(&path).unwrap();
+            let (converted, peak) = peak_of(|| process_image(&file, name, &options));
+            assert!(converted.is_ok(), "{name}");
+            let held = (file.len() + peak) as u64;
+            assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+        }
+    }
+}

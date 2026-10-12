@@ -591,8 +591,9 @@ finished in.
 What an image needs is reckoned from its header before its file is read, by
 what each step of converting it holds at once, measured for each format: the
 file; the image decoded at its own depth, with what its decoder keeps beside
-it, every coefficient of a progressive JPEG say, or a TIFF decoder's own
-copy; a copy made to flatten a deeper image's alpha; a copy turned as the
+it, every coefficient of a progressive JPEG say, a JPEG decoder's copy of the
+file and of the segments it reads, a PNG decoder's of its chunks, or a TIFF
+decoder's own copy; a copy made to flatten a deeper image's alpha; a copy turned as the
 EXIF data says, or as Light Novel mode might; and the buffer resampling it
 holds, four `f32` for every source column at each row of the result. Never
 less than the conversion takes, and some 32 MB more. The 1 GiB is shared by
@@ -607,6 +608,20 @@ not copied, and turned only once flat; and a split spread's pages are read
 from the image where they lie, not cut out of it first. The same image comes
 out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
 794 MB.
+
+Reading the header holds little, and that is set aside too while it is read.
+A JPEG's is read marker by marker, passing over every segment but its frame
+and its EXIF, as its decoder copies the whole file as it is made. Any other
+image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
+its text and EXIF chunks and unpack of its ICC profile, or a WebP's read of
+its EXIF, which with the buffers it doubles as they grow is 16 MiB at most,
+and 16 MiB is what is set aside. A larger profile, which nothing here uses,
+is let go of unread, and an image with more text than that is left as it is
+and counted. Decoding it holds the same, and that is reckoned in what it
+needs. A JPEG that a thumbnail of a book's cover or a check of the file had
+copied whole, comments and all, before anything was set aside, is read now
+for a few kilobytes, and a one-pixel PNG whose ICC profile unpacks to 64 MiB
+holds 9 MB rather than 69.
 
 A thumbnail for the desktop's book list is reckoned the same way, out of
 512 MiB for all of them, and one that would need more is not made: the book

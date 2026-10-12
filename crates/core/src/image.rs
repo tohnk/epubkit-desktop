@@ -54,6 +54,13 @@ pub const MAX_PIXELS: u64 = 178_956_970;
 /// at sixteen bits a channel with alpha, and for the decoder's own buffers.
 const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 8 + 128 * 1024 * 1024;
 
+/// What reading an image's header may hold beside it: the ICC profile a
+/// PNG's decoder unpacks, and the text and EXIF chunks it keeps, or a WebP's
+/// EXIF. A decoder is held to half of this as it is made, as a buffer it
+/// grows doubles, and can come to twice what it counts before it stops; it
+/// lets go of an ICC profile larger, which nothing here uses.
+pub const HEADER_MEMORY: u64 = 16 << 20;
+
 pub const DEFAULT_DEVICE: &str = "x4";
 
 /// A reader's panel, in display orientation.
@@ -145,7 +152,8 @@ pub struct ProcessedImage {
 
 /// `bytes`, an image, as a JPEG to show it small: in colour, turned as its
 /// EXIF data says, and shrunk to fit within `max_width` x `max_height`. What
-/// decoding it takes is held from `budget` until the thumbnail is made.
+/// reading its header may take is held from `budget` while it is read, and
+/// what decoding it takes, until the thumbnail is made.
 ///
 /// Shrunk by averaging blocks of pixels, not resampled: at the size a
 /// thumbnail is shown, the two look alike, and averaging takes a third of the
@@ -157,11 +165,12 @@ pub fn thumbnail(
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
     let failed = |e: ImageError| Error::Image(e.to_string());
-    let needed = Footprint::of(
-        ImageReader::new(Cursor::new(bytes)),
-        &mut Cursor::new(bytes),
-    )
-    .map_or(0, |footprint| footprint.thumbnail());
+    let needed = {
+        let _reading = budget.hold(HEADER_MEMORY);
+        Header::read(Cursor::new(bytes))
+            .and_then(|header| Footprint::of(header, bytes.len() as u64))
+            .map_or(0, |footprint| footprint.thumbnail())
+    };
     if needed > budget.total() {
         return Err(Error::Image(format!(
             "making a thumbnail would take {} MB, more than the {} MB set aside",
@@ -194,13 +203,10 @@ pub fn thumbnail(
 
 /// Is the file at `path` an image the image step reads: in a format it
 /// decodes, with a header that reads? A file that only begins like one, text
-/// starting "BM" as a BMP does, is not.
+/// starting "BM" as a BMP does, is not. Only its header is read, as
+/// [`Header::read`] reads it.
 pub fn is_raster_image(path: &Path) -> bool {
-    ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
-        .ok()
-        .and_then(|reader| reader.into_decoder().ok())
-        .is_some()
+    header_of(path).is_some()
 }
 
 /// About as much memory as converting the image at `path` for `options`
@@ -209,13 +215,98 @@ pub fn is_raster_image(path: &Path) -> bool {
 /// hold](Footprint::converting). Just the file for an image whose header
 /// cannot be read, which fails as it is decoded, and for one past
 /// [`MAX_PIXELS`], refused before anything is allocated for it.
+///
+/// Reading the header holds no more than [`HEADER_MEMORY`], which the caller
+/// sets aside while it is read.
 pub fn memory_needed(path: &Path, options: &ImageOptions) -> u64 {
     let file = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    let footprint = ImageReader::open(path)
-        .ok()
-        .zip(std::fs::File::open(path).ok())
-        .and_then(|(reader, mut header)| Footprint::of(reader, &mut header));
+    let footprint = header_of(path).and_then(|header| Footprint::of(header, file));
     file.saturating_add(footprint.map_or(0, |footprint| footprint.converting(options)))
+}
+
+/// The header of the image at `path`: see [`Header::read`].
+fn header_of(path: &Path) -> Option<Header> {
+    let file = std::fs::File::open(path).ok()?;
+    Header::read(std::io::BufReader::new(file))
+}
+
+/// What an image's header says, read without the rest of the file, or more
+/// than [`HEADER_MEMORY`] held reading it.
+struct Header {
+    format: ImageFormat,
+    /// Its size as stored, before its EXIF orientation turns it.
+    width: u32,
+    height: u32,
+    /// What its decoder decodes it as.
+    color: image::ColorType,
+    /// How its EXIF data turns it, as its decoder reads it.
+    orientation: Orientation,
+    /// A JPEG's frame, which tells what its decoder keeps beside the image.
+    jpeg: Option<JpegFrame>,
+    /// How a WebP is coded, which tells the same.
+    webp: Option<WebpKind>,
+}
+
+impl Header {
+    /// The header of the image `reader` reads, from its start: `None` for an
+    /// image in no format the image step decodes, or whose header does not
+    /// read. A JPEG's is read here, marker by marker, as its decoder reads the
+    /// whole file as it is made, and copies each segment it knows; any other's
+    /// decoder reads its header, held to [`HEADER_MEMORY`].
+    fn read<R: BufRead + Seek>(reader: R) -> Option<Header> {
+        let reader = ImageReader::new(reader).with_guessed_format().ok()?;
+        let format = reader.format()?;
+        let mut inner = reader.into_inner();
+        if format == ImageFormat::Jpeg {
+            let frame = jpeg_frame(&mut inner)?;
+            return Some(Header {
+                format,
+                width: u32::from(frame.width),
+                height: u32::from(frame.height),
+                // Grey for one component, and RGB for any other number.
+                color: if frame.sampling.len() == 1 {
+                    image::ColorType::L8
+                } else {
+                    image::ColorType::Rgb8
+                },
+                orientation: frame.orientation,
+                jpeg: Some(frame),
+                webp: None,
+            });
+        }
+
+        let webp = if format == ImageFormat::WebP {
+            let kind = webp_kind(&mut inner);
+            inner.seek(SeekFrom::Start(0)).ok()?;
+            kind
+        } else {
+            None
+        };
+        let mut reader = ImageReader::with_format(inner, format);
+        reader.limits(header_limits());
+        let mut decoder = reader.into_decoder().ok()?;
+        let (width, height) = decoder.dimensions();
+        Some(Header {
+            format,
+            width,
+            height,
+            color: decoder.color_type(),
+            // A tag that cannot be read leaves the image as it is stored, as
+            // a reader would.
+            orientation: decoder.orientation().unwrap_or(Orientation::NoTransforms),
+            jpeg: None,
+            webp,
+        })
+    }
+}
+
+/// Limits that hold a decoder, as it is made, within [`HEADER_MEMORY`]: to
+/// half of it, as the buffer a PNG's unpacks its ICC profile into doubles as
+/// it grows, past what it counts.
+fn header_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(HEADER_MEMORY / 2);
+    limits
 }
 
 /// What an image takes in memory as it is decoded and converted, reckoned
@@ -252,24 +343,24 @@ struct Footprint {
 const PAGE_MEMORY: u64 = 32 << 20;
 
 impl Footprint {
-    /// Read from an image's header by `reader`, and from `header`, the same
-    /// image, where its format keeps what its decoder holds further in.
-    /// `None` for one that cannot be decoded, or is past [`MAX_PIXELS`].
-    fn of<R: BufRead + Seek>(
-        reader: ImageReader<R>,
-        header: &mut (impl Read + Seek),
-    ) -> Option<Self> {
-        let reader = reader.with_guessed_format().ok()?;
-        let format = reader.format()?;
-        let mut decoder = reader.into_decoder().ok()?;
-        let (width, height) = decoder.dimensions();
+    /// Reckoned from the `header` of an image whose file is `file` bytes
+    /// long. `None` for one past [`MAX_PIXELS`].
+    fn of(header: Header, file: u64) -> Option<Self> {
+        let Header {
+            format,
+            width,
+            height,
+            color,
+            orientation,
+            jpeg,
+            webp,
+        } = header;
         let pixels = u64::from(width) * u64::from(height);
         if pixels > MAX_PIXELS {
             return None;
         }
 
-        let color = decoder.color_type();
-        let decoded = decoder.total_bytes();
+        let decoded = pixels * u64::from(color.bytes_per_pixel());
         let gray = matches!(
             color,
             image::ColorType::L8
@@ -291,7 +382,7 @@ impl Footprint {
             }
         };
         let quarter_turn = matches!(
-            decoder.orientation().unwrap_or(Orientation::NoTransforms),
+            orientation,
             Orientation::Rotate90
                 | Orientation::Rotate270
                 | Orientation::Rotate90FlipH
@@ -299,12 +390,15 @@ impl Footprint {
         );
 
         let decoding = match format {
-            ImageFormat::Png | ImageFormat::Bmp => 0,
+            // The chunks it keeps, and the ICC profile it unpacks.
+            ImageFormat::Png => HEADER_MEMORY,
+            ImageFormat::Bmp => 0,
             // The indices of a frame, beside its colours.
             ImageFormat::Gif => pixels,
-            // Every coefficient of a progressive scan is kept to its end.
-            ImageFormat::Jpeg => jpeg_coefficients(header, width, height).unwrap_or(decoded),
-            ImageFormat::WebP => match webp_kind(header) {
+            // Its copy of the file, and of each segment it knows, beside it;
+            // and every coefficient of a progressive scan, kept to its end.
+            ImageFormat::Jpeg => file * 2 + jpeg.as_ref().map_or(0, jpeg_coefficients),
+            ImageFormat::WebP => match webp {
                 // Luma and quarter-size chroma.
                 Some(WebpKind::Lossy) => pixels * 3 / 2,
                 // Decoded where it lies; a byte a pixel to spare.
@@ -401,77 +495,106 @@ fn resample_buffer(width: u32, height: u32, options: &ImageOptions) -> u64 {
     }
 }
 
-/// What the decoder of the JPEG `header` reads keeps beside the image: for a
-/// progressive one, every coefficient, two bytes each, of each component at
-/// the size its sampling makes it; for one in one scan, nothing.
-fn jpeg_coefficients(header: &mut (impl Read + Seek), width: u32, height: u32) -> Option<u64> {
-    let frame = jpeg_frame(header)?;
+/// What the decoder of the JPEG whose frame is `frame` keeps beside the
+/// image: for a progressive one, every coefficient, two bytes each, of each
+/// component at the size its sampling makes it; for one in one scan, nothing.
+fn jpeg_coefficients(frame: &JpegFrame) -> u64 {
     if !frame.progressive {
-        return Some(0);
+        return 0;
     }
     let most =
         |pick: fn(&(u8, u8)) -> u8| frame.sampling.iter().map(pick).max().unwrap_or(1).max(1);
     let (most_h, most_v) = (u64::from(most(|s| s.0)), u64::from(most(|s| s.1)));
-    let mcus_x = u64::from(width).div_ceil(8 * most_h);
-    let mcus_y = u64::from(height).div_ceil(8 * most_v);
-    Some(
-        frame
-            .sampling
-            .iter()
-            .map(|&(h, v)| mcus_x * u64::from(h) * mcus_y * u64::from(v) * 64 * 2)
-            .sum(),
-    )
+    let mcus_x = u64::from(frame.width).div_ceil(8 * most_h);
+    let mcus_y = u64::from(frame.height).div_ceil(8 * most_v);
+    frame
+        .sampling
+        .iter()
+        .map(|&(h, v)| mcus_x * u64::from(h) * mcus_y * u64::from(v) * 64 * 2)
+        .sum()
 }
 
-/// A JPEG's frame, as its start-of-frame marker says.
+/// A JPEG's frame, as its start-of-frame marker says, and how its EXIF data
+/// turns it.
 struct JpegFrame {
+    width: u16,
+    height: u16,
     progressive: bool,
-    /// How each component is sampled, across and down.
+    /// How each of its components is sampled, across and down.
     sampling: Vec<(u8, u8)>,
+    orientation: Orientation,
 }
 
 /// The frame of the JPEG `reader` holds, found by stepping over the markers
-/// before it.
+/// before its scan as its decoder steps over them, and how the last EXIF
+/// segment among them turns it, as its decoder takes it. Each segment is
+/// passed over unread but those two kinds, which are a few kilobytes at most.
+/// `None` where its decoder reads no frame: at the end of the image before a
+/// scan, or at a frame or a segment of a kind it does not read.
 fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
     let mut two = [0u8; 2];
     reader.read_exact(&mut two).ok()?;
     if two != [0xFF, 0xD8] {
         return None;
     }
+    let mut frame = None;
+    let mut orientation = Orientation::NoTransforms;
+    let mut byte = [0u8; 1];
+    let mut last = 0;
     loop {
-        let mut byte = [0u8; 1];
         reader.read_exact(&mut byte).ok()?;
-        if byte[0] != 0xFF {
-            return None;
+        let mut marker = byte[0];
+        // Fill bytes after a marker's 0xFF, or a zero stuffed after it.
+        if last == 0xFF {
+            while marker == 0xFF || marker == 0 {
+                last = marker;
+                reader.read_exact(&mut byte).ok()?;
+                marker = byte[0];
+            }
         }
-        // Fill bytes before the marker.
-        while byte[0] == 0xFF {
-            reader.read_exact(&mut byte).ok()?;
+        // A byte between segments, which its decoder passes over.
+        if last != 0xFF {
+            last = marker;
+            continue;
         }
-        let marker = byte[0];
+        last = marker;
         match marker {
-            0x01 | 0xD0..=0xD8 => continue,
-            0xD9 | 0xDA => return None,
+            // The scan, which the frame comes before.
+            0xDA => break,
+            0xD9 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCC..=0xCF | 0xDC => return None,
             _ => {}
         }
+        // Any other marker has a length, a lone one too.
         reader.read_exact(&mut two).ok()?;
         let length = u16::from_be_bytes(two);
         let body = usize::from(length.checked_sub(2)?);
-        // Every start of frame but those of a table or reserved marker.
-        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
-            let mut frame = vec![0; body];
-            reader.read_exact(&mut frame).ok()?;
-            let count = usize::from(*frame.get(5)?);
-            let sampling = (0..count)
-                .map(|component| frame.get(7 + 3 * component).map(|hv| (hv >> 4, hv & 15)))
-                .collect::<Option<Vec<_>>>()?;
-            return Some(JpegFrame {
-                progressive: matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE),
-                sampling,
-            });
+        let starts_frame = matches!(marker, 0xC0..=0xC2);
+        if !starts_frame && marker != 0xE1 {
+            reader.seek(SeekFrom::Current(body as i64)).ok()?;
+            continue;
         }
-        reader.seek(SeekFrom::Current(body as i64)).ok()?;
+        let mut data = vec![0; body];
+        reader.read_exact(&mut data).ok()?;
+        if starts_frame {
+            let count = usize::from(*data.get(5)?);
+            let sampling = (0..count)
+                .map(|component| data.get(7 + 3 * component).map(|hv| (hv >> 4, hv & 15)))
+                .collect::<Option<Vec<_>>>()?;
+            frame = Some(JpegFrame {
+                width: u16::from_be_bytes([*data.get(3)?, *data.get(4)?]),
+                height: u16::from_be_bytes([*data.get(1)?, *data.get(2)?]),
+                progressive: marker == 0xC2,
+                sampling,
+                orientation: Orientation::NoTransforms,
+            });
+        } else if data.len() > 6 && data.starts_with(b"Exif\0\0") {
+            orientation =
+                Orientation::from_exif_chunk(&data[6..]).unwrap_or(Orientation::NoTransforms);
+        }
     }
+    let mut frame = frame?;
+    frame.orientation = orientation;
+    Some(frame)
 }
 
 /// How a WebP is coded.
@@ -841,9 +964,14 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 ///
 /// An image of no pixels across or down, which a GIF's canvas can be, shows
 /// nothing, and is refused before anything is sized from it.
+///
+/// Its decoder is held to [`HEADER_MEMORY`] as it is made, as [`Footprint`]
+/// reckons it: what a PNG's keeps of its chunks, or a WebP's reads of its
+/// EXIF. A JPEG's copies the file, which is reckoned too.
 fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
-    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let format = reader.format();
+    reader.limits(header_limits());
     let mut decoder = reader.into_decoder()?;
     // A tag that cannot be read leaves the image as it is stored, as a
     // reader would.
@@ -1172,10 +1300,52 @@ mod tests {
             encoder.set_progressive(progressive);
             encoder.set_sampling_factor(sampling);
             encoder.encode(&rgb, width, height, ColorType::Rgb).unwrap();
-            let coefficients =
-                jpeg_coefficients(&mut Cursor::new(&jpeg), u32::from(width), u32::from(height));
-            assert_eq!(coefficients, Some(expected), "{progressive} {sampling:?}");
+            let frame = jpeg_frame(&mut Cursor::new(&jpeg)).unwrap();
+            assert_eq!(
+                jpeg_coefficients(&frame),
+                expected,
+                "{progressive} {sampling:?}"
+            );
         }
+    }
+
+    /// A JPEG's header is read up to its scan, past comments and segments it
+    /// does not need: its size, its components, and the turn its EXIF says.
+    #[test]
+    fn a_jpegs_header_is_read_past_what_it_does_not_need() {
+        let rgb = vec![128u8; 40 * 30 * 3];
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg, 80)
+            .encode(&rgb, 40, 30, ColorType::Rgb)
+            .unwrap();
+        // EXIF in TIFF's little-endian form: one entry, an orientation of 6.
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0".to_vec();
+        exif.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let segment = |marker: u8, body: &[u8]| {
+            let mut segment = vec![0xFF, marker];
+            segment.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+            segment.extend_from_slice(body);
+            segment
+        };
+        let mut file = jpeg[..2].to_vec();
+        file.extend(segment(0xFE, &[b'c'; 1000]));
+        // Bytes between segments, and a fill byte before a marker, which its
+        // decoder passes over too.
+        file.extend_from_slice(b"stray\xFF");
+        file.extend(segment(0xE1, &exif));
+        file.extend(segment(0xE2, &[0; 500]));
+        file.extend_from_slice(&jpeg[2..]);
+
+        let header = Header::read(Cursor::new(&file)).unwrap();
+        assert_eq!((header.width, header.height), (40, 30));
+        assert_eq!(header.color, image::ColorType::Rgb8);
+        assert_eq!(header.orientation, Orientation::Rotate90);
+        let decoder = ImageReader::new(Cursor::new(&file))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(decoder.dimensions(), (40, 30));
     }
 
     /// The kind of a WebP is read from its chunks, an extended one's too.

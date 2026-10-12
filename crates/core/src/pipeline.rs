@@ -672,8 +672,12 @@ fn convert_images<P: FnMut(u8, &str)>(
         |job| -> Result<Converted> {
             // Set aside before the file is read, so a thread waiting its turn
             // holds nothing; and an image that would need more than all
-            // there is to set aside is left as it is.
-            let needed = image::memory_needed(job.path, job.options);
+            // there is to set aside is left as it is. Reading its header to
+            // know holds a little too, which is set aside while it is read.
+            let needed = {
+                let _reading = IMAGE_MEMORY.hold(image::HEADER_MEMORY);
+                image::memory_needed(job.path, job.options)
+            };
             if needed > IMAGE_MEMORY.total() {
                 return Ok(Converted::TooLarge(needed));
             }
