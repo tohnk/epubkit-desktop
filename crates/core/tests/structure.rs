@@ -1772,3 +1772,71 @@ fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
         );
     }
 }
+
+/// An SVG with no viewBox draws its image at the size it gives it, unscaled,
+/// in a box of the SVG's own width and height. An image of that very size at
+/// its origin is all it shows, and the SVG is unwrapped, as one with a viewBox
+/// is. One whose box is smaller than its image, or of a size that is not a
+/// number, or that CSS may size otherwise, may crop it, and stays.
+#[test]
+fn an_svg_with_no_view_box_that_its_image_fills_is_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" {svg}><image {image} href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let whole = r#"width="1000" height="400""#;
+    let cases = [
+        (whole, whole, "", true),
+        (r#"width="1000px" height="400px""#, whole, "", true),
+        (whole, r#"width="100%" height="100%""#, "", true),
+        (whole, whole, "svg { display: block; margin: 0 auto }", true),
+        (whole, whole, "svg { height: auto; max-width: none }", true),
+        // A box that crops it, or that may.
+        (r#"width="500" height="400""#, whole, "", false),
+        (whole, r#"width="500" height="400""#, "", false),
+        (r#"width="100%" height="100%""#, whole, "", false),
+        ("", whole, "", false),
+        (whole, whole, "svg { max-width: 100% }", false),
+        (whole, whole, "svg { width: 500px }", false),
+        (
+            r#"width="1000" height="400" style="height: 200px""#,
+            whole,
+            "",
+            false,
+        ),
+    ];
+
+    for (svg, image, css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>, {css}: {after}"
+        );
+        assert_eq!(
+            after.contains("<svg"),
+            !unwrapped,
+            "<svg {svg}><image {image}/>, {css}"
+        );
+    }
+}

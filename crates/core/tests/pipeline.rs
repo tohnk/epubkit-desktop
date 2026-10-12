@@ -1401,6 +1401,28 @@ fn an_svg_wrapped_spread_becomes_one_image_per_page() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// An SVG with no viewBox shows its image unscaled, in a box of its own width
+/// and height: one of the spread's very size shows all of it, and gives way
+/// to a plain image per page, as one with a viewBox does. Such a wrapper was
+/// kept, and the spread with it, turned on its side.
+#[test]
+fn an_svg_with_no_view_box_around_a_spread_becomes_one_image_per_page() {
+    let work = optimize_book(
+        &[("images/spread.png", spread())],
+        r#"<div><svg xmlns="http://www.w3.org/2000/svg" width="1000" height="400"><image width="1000" height="400" href="../images/spread.png"/></svg></div>"#,
+        &light_novel(),
+    );
+
+    let chapter = read_chapter(work.path());
+    assert!(!chapter.contains("<svg"), "{chapter}");
+    assert_eq!(
+        chapter_sources(work.path()),
+        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
+    );
+    assert_eq!(shown_greys(work.path()), [255, 0]);
+    assert_manifest_matches_archive(work.path());
+}
+
 /// A wrapper that draws its spread otherwise than an `<img>` would, clipped
 /// to its left page by its own attribute, or faded by a stylesheet, keeps it
 /// whole: plain images of its pages in its place would show what it hid,

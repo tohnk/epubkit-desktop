@@ -1718,18 +1718,22 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
 /// Neither may be turned or slid, clipped, masked, filtered, faded, blended
 /// or hidden, by an attribute, its style or the chapter's stylesheets as
 /// `layout` reads them; nor may CSS put the image elsewhere, or at another
-/// size, than its attributes do.
+/// size, than its attributes do. And an SVG with no viewBox, which draws its
+/// image unscaled in its own box, may not have that box sized by CSS either,
+/// which could make it smaller than the image.
 fn drawn_as_it_is(layout: &Layout, svg: &Node, image: &Node) -> bool {
     !layout.drawn_otherwise(svg)
         && !layout.drawn_otherwise(image)
         && !layout.placed_otherwise(image)
+        && (svg.get_attribute("viewBox").is_some() || !layout.sized_otherwise(svg))
 }
 
 /// Does `svg` show the whole of `image`, as its attributes place it, as an
 /// `<img>` would: in a box that is the image's own, so that nothing of it is
 /// cropped, slid aside or sliced off? The box is the viewBox, which has to
 /// start at the origin and be the image's size, or without one the SVG
-/// itself, which the image has to fill.
+/// itself, which the image has to fill: all of it, or the very width and
+/// height the SVG gives itself in numbers.
 fn shows_whole(svg: &Node, image: &Node) -> bool {
     let at_origin = ["x", "y"].into_iter().all(|attribute| {
         image
@@ -1754,7 +1758,11 @@ fn shows_whole(svg: &Node, image: &Node) -> bool {
         None => false,
     };
     let Some(view_box) = svg.get_attribute("viewBox") else {
-        return fills("width", None) && fills("height", None);
+        let own = |attribute: &str| {
+            svg.get_attribute(attribute)
+                .and_then(|value| svg_length(&value))
+        };
+        return fills("width", own("width")) && fills("height", own("height"));
     };
     let numbers: Vec<f64> = view_box
         .split(|c: char| c == ',' || c.is_ascii_whitespace())

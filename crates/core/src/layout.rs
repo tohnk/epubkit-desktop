@@ -1093,6 +1093,7 @@ enum Property {
     Height,
     MaxHeight,
     Width,
+    MaxWidth,
     AspectRatio,
     Position,
     /// `transform`, by whichever name an engine gives it.
@@ -1130,10 +1131,11 @@ enum Property {
     Display,
 }
 
-const PROPERTIES: [Property; 24] = [
+const PROPERTIES: [Property; 25] = [
     Property::Height,
     Property::MaxHeight,
     Property::Width,
+    Property::MaxWidth,
     Property::AspectRatio,
     Property::Position,
     Property::Transform,
@@ -1311,9 +1313,10 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
         "height" => (&[Height], false),
         "max-height" => (&[MaxHeight], false),
         "width" => (&[Width], false),
+        "max-width" => (&[MaxWidth], false),
         // Across or down the page, as it is written.
         "block-size" | "inline-size" => (&[Height, Width], true),
-        "max-block-size" | "max-inline-size" => (&[MaxHeight], true),
+        "max-block-size" | "max-inline-size" => (&[MaxHeight, MaxWidth], true),
         "aspect-ratio" => (&[AspectRatio], false),
         "position" => (&[Position], false),
         "transform" | "-webkit-transform" | "-moz-transform" | "-ms-transform" | "-o-transform" => {
@@ -1440,6 +1443,7 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
             }
         }
         Property::Width
+        | Property::MaxWidth
         | Property::AspectRatio
         | Property::Transform
         | Property::Rotate
@@ -2090,6 +2094,19 @@ impl<'a> Layout<'a> {
             .any(|property| own.could_be_any(property, &[Value::Set, Value::Unknown]))
     }
 
+    /// Could CSS give `element` a size of its own, beside what its attributes
+    /// say: a width or a height, a cap on either, or a ratio?
+    pub(crate) fn sized_otherwise(&self, element: &Node) -> bool {
+        let own = self.sizing(element);
+        let set = [Value::Set, Value::Unknown];
+        let height = [Value::Length, Value::Screen, Value::Percent, Value::Unknown];
+        own.could_be_any(Property::Width, &set)
+            || own.could_be_any(Property::MaxWidth, &set)
+            || own.could_be_any(Property::AspectRatio, &set)
+            || own.could_be_any(Property::Height, &height)
+            || own.could_be_any(Property::MaxHeight, &height)
+    }
+
     /// Could CSS put `element`, an SVG `<image>`, elsewhere or at another
     /// size than its attributes do, as SVG 2 lets its `x`, `y`, `width` and
     /// `height` properties?
@@ -2355,6 +2372,8 @@ mod tests {
             ("height: 50cqh", Value::Unknown),
             ("height: inherit", Value::Inherit),
             ("max-height: none", Value::Initial),
+            ("max-width: 100%", Value::Set),
+            ("max-width: none", Value::Initial),
             ("width: 100%", Value::Set),
             ("width: auto", Value::Initial),
             ("aspect-ratio: 5 / 2", Value::Set),
@@ -2535,6 +2554,7 @@ mod tests {
             (
                 layout.drawn_otherwise(&node),
                 layout.placed_otherwise(&node),
+                layout.sized_otherwise(&node),
             )
         };
         let drawn = |css: &str, id: &str| laid_out(css, id).0;
@@ -2564,6 +2584,14 @@ mod tests {
         assert!(placed("image { x: 5px }"));
         assert!(placed("svg image { width: 50% }"));
         assert!(!placed("image { width: auto }"));
+
+        let sized = |css: &str| laid_out(css, "plain").2;
+        assert!(!sized(""));
+        assert!(!sized("svg { height: auto; max-width: none }"));
+        assert!(sized("svg { max-width: 100% }"));
+        assert!(sized("svg { max-inline-size: 30em }"));
+        assert!(sized("svg { aspect-ratio: 2 }"));
+        assert!(sized("svg { height: 50vh }"));
     }
 
     /// A percentage of the height of a box whose own height grows with what it

@@ -761,7 +761,10 @@ Nor does it unwrap one that shows only part of its image: a viewBox over the
 right half of a spread, an image slid out of its box, or one sliced to fill a
 box of another shape. An `<img>` in its place showed the whole picture. The
 port replaces only an SVG whose box is its image's own: a viewBox from the
-origin the image's size, or none and an image filling the SVG.
+origin the image's size, or none and an image filling the SVG, all of it or
+the very width and height the SVG gives itself in numbers. With no viewBox
+nothing scales the image to the box, so CSS may not size that box either:
+`max-width: 100%`, say, could make it narrower than the image.
 
 Nor one that draws its image otherwise than an `<img>` would: turned or
 slid, clipped by `clip-path`, `clip` or rounded corners, masked, filtered,
