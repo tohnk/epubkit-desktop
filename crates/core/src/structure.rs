@@ -110,8 +110,9 @@ pub struct ContentFiles {
     pub css: Vec<PathBuf>,
     pub images: Vec<PathBuf>,
     /// The SVG documents, known by their media type, whatever their name, or
-    /// by their name, whatever media type the book gives them: a wrong guess
-    /// costs only a parse that fails. Each is in another list too.
+    /// by their name, whatever media type the book gives them, unless they
+    /// read as a raster image: a wrong guess costs only a parse that fails.
+    /// Each is in another list too.
     pub svg: Vec<PathBuf>,
     pub fonts: Vec<PathBuf>,
     pub ncx: Vec<PathBuf>,
@@ -243,10 +244,13 @@ pub fn find_content_files(root: &Path, opf_dir: &Path, doc: &Document) -> Result
             continue;
         }
         let media_type = item.media_type.to_ascii_lowercase();
+        // A raster named like an SVG, whatever it is declared, is converted
+        // as the raster it is.
         let svg = media_type == SVG_MEDIA_TYPE
             || Path::new(&href)
                 .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+                && !crate::image::is_raster_image(&path);
 
         let document = svg
             || matches!(

@@ -1071,6 +1071,50 @@ fn an_image_declared_as_something_else_is_converted() {
     );
 }
 
+/// A raster image is converted whatever it is named. A PNG declared
+/// `image/png` but named `.svg` was taken for an SVG by its name, and left as
+/// it was, counted nowhere. An SVG declared as one, or named as one and
+/// declared as something else, is drawn, and stays as it is.
+#[test]
+fn a_raster_named_like_an_svg_is_converted() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#.to_vec();
+    let files = [
+        ("images/spread.svg", "image/png", png),
+        ("images/drawing.svg", "image/svg+xml", svg.clone()),
+        ("images/mislabelled.svg", "image/png", svg.clone()),
+    ];
+    let body = r#"<p><img src="../images/spread.svg" alt=""/></p><p><img src="../images/drawing.svg" alt=""/></p><p><img src="../images/mislabelled.svg" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+
+    assert_eq!(
+        chapter_sources(work.path()),
+        [
+            "../images/spread.jpg",
+            "../images/drawing.svg",
+            "../images/mislabelled.svg"
+        ]
+    );
+    let opf = fs::read_to_string(work.path().join("OEBPS/content.opf")).unwrap();
+    assert!(
+        opf.contains(r#"href="images/spread.jpg" media-type="image/jpeg""#),
+        "{opf}"
+    );
+    for drawn in ["drawing.svg", "mislabelled.svg"] {
+        let path = work.path().join("OEBPS/images").join(drawn);
+        assert_eq!(fs::read(path).unwrap(), svg, "{drawn}");
+    }
+    assert_manifest_matches_archive(work.path());
+    assert_eq!(
+        (
+            report.images_converted,
+            report.images_unconverted,
+            report.images_total
+        ),
+        (1, 0, 1)
+    );
+}
+
 /// An image a chapter or a stylesheet shows is part of the book as it is
 /// read, though the manifest leaves it out. It was left as it was. Now it is
 /// converted, its references follow, and it is declared. An image nothing

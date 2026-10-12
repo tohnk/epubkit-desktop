@@ -560,7 +560,8 @@ The reference tried only images named `.png`, `.gif`, `.webp`, `.bmp`,
 the manifest declared with no extension, or as `spread.bin`, or a JPEG named
 `.jpe` or `.jfif`, stayed as it was, and the summary did not mention it. The
 port tries every image the manifest declares but an SVG, known by its media
-type or its name, and reads each one's format from its bytes. The converted
+type, or by its name where its bytes do not read as a raster image, and reads
+each one's format from its bytes. The converted
 file takes the name with `.jpg` for whatever extension it had, references
 follow it, and the summary counts it by what it was: a PNG named `plate.jpg`
 is a `PNG→JPEG`. One no decoder reads is left as it was and counted as such.
