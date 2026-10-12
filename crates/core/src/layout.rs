@@ -1095,8 +1095,13 @@ enum Property {
     Width,
     AspectRatio,
     Position,
-    /// `transform` and the like, and `rotate`, `scale` and `translate`.
+    /// `transform`, by whichever name an engine gives it.
     Transform,
+    /// `rotate`, `scale` and `translate`, each of which turns, scales or
+    /// slides a box beside its `transform`, not in its place.
+    Rotate,
+    Scale,
+    Translate,
     /// Whether what overflows the box across the page is not shown as it
     /// is, which leaves what overflows it down the page hidden or scrolled
     /// too.
@@ -1107,16 +1112,27 @@ enum Property {
     Contain,
 }
 
-const PROPERTIES: [Property; 9] = [
+const PROPERTIES: [Property; 12] = [
     Property::Height,
     Property::MaxHeight,
     Property::Width,
     Property::AspectRatio,
     Property::Position,
     Property::Transform,
+    Property::Rotate,
+    Property::Scale,
+    Property::Translate,
     Property::OverflowX,
     Property::OverflowY,
     Property::Contain,
+];
+
+/// The properties that turn, scale or slide a box.
+const TURNING: [Property; 4] = [
+    Property::Transform,
+    Property::Rotate,
+    Property::Scale,
+    Property::Translate,
 ];
 
 /// What a property's value does to a box, as far as that matters here.
@@ -1235,8 +1251,12 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
         "max-block-size" | "max-inline-size" => (&[MaxHeight], true),
         "aspect-ratio" => (&[AspectRatio], false),
         "position" => (&[Position], false),
-        "transform" | "-webkit-transform" | "-moz-transform" | "-ms-transform" | "-o-transform"
-        | "rotate" | "scale" | "translate" => (&[Transform], false),
+        "transform" | "-webkit-transform" | "-moz-transform" | "-ms-transform" | "-o-transform" => {
+            (&[Transform], false)
+        }
+        "rotate" => (&[Rotate], false),
+        "scale" => (&[Scale], false),
+        "translate" => (&[Translate], false),
         "overflow" => (&[OverflowX, OverflowY], false),
         "overflow-x" => (&[OverflowX], false),
         "overflow-y" => (&[OverflowY], false),
@@ -1332,7 +1352,12 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
                 Value::Initial
             }
         }
-        Property::Width | Property::AspectRatio | Property::Transform => {
+        Property::Width
+        | Property::AspectRatio
+        | Property::Transform
+        | Property::Rotate
+        | Property::Scale
+        | Property::Translate => {
             if terms.any_number() || !left_alone(&["auto", "none"]) {
                 Value::Set
             } else {
@@ -1857,7 +1882,7 @@ impl<'a> Layout<'a> {
     pub(crate) fn frames(&self, element: &Node) -> bool {
         let own = self.sizing(element);
         let set = |property| own.could_be_any(property, &[Value::Set, Value::Unknown]);
-        if set(Property::Transform) {
+        if TURNING.into_iter().any(set) {
             return true;
         }
         if matches!(local_name(element).as_str(), "html" | "body") {
@@ -1877,7 +1902,7 @@ impl<'a> Layout<'a> {
             || own.could_be_any(Property::MaxHeight, &of_its_own)
             || set(Property::AspectRatio)
             || set(Property::Position)
-            || set(Property::Transform)
+            || TURNING.into_iter().any(set)
             || set(Property::Contain)
         {
             return true;
@@ -2244,6 +2269,26 @@ mod tests {
         let node = element(&table, "table");
         assert!(laid_out("", &node, &Reshaping::default()).0);
         assert!(!laid_out("table { height: auto }", &node, &Reshaping::default()).0);
+    }
+
+    /// `rotate`, `scale` and `translate` turn or slide a box beside its
+    /// `transform`, not in its place: a `transform: none` after one leaves the
+    /// box turned all the same.
+    #[test]
+    fn rotate_scale_and_translate_are_not_transform() {
+        let content = document(r#"<div id="frame"><img id="image" src="a.png" alt=""/></div>"#);
+        let framed =
+            |css: &str| laid_out(css, &element(&content, "frame"), &Reshaping::default()).0;
+        for turn in ["rotate: 90deg", "scale: 2", "translate: 10px 0"] {
+            let css = format!("#frame {{ {turn} }} #frame {{ transform: none }}");
+            assert!(framed(&css), "{css}");
+            let css = format!("#frame {{ transform: rotate(90deg) }} #frame {{ {turn} }}");
+            assert!(framed(&css), "{css}");
+        }
+        assert!(!framed(
+            "#frame { transform: rotate(90deg) } #frame { transform: none }"
+        ));
+        assert!(!framed("#frame { rotate: 90deg } #frame { rotate: none }"));
     }
 
     /// A percentage of the height of a box whose own height grows with what it

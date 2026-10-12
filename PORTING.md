@@ -652,8 +652,9 @@ ems or the like or a screen high in `vh`, of a set `aspect-ratio`, or sized
 by `contain: size`, cut the second page off or let it run over what came
 after. A height that is a percentage is one where it holds: where the box it
 is a share of has a height set, or is the page, through every box between.
-A `transform`, or `position: absolute` or `fixed`, on the box or the image
-turned the pages again or laid them over each other. And the image's own
+A `transform`, or a `rotate`, `scale` or `translate`, which apply beside it,
+or `position: absolute` or `fixed`, on the box or the image turned the pages
+again or laid them over each other. And the image's own
 height, which each page keeps, gave every page its size, as a screen high
 with a set width gave them its proportions. The page's own boxes, `<html>`
 and `<body>`, frame nothing by their height alone, as what they hold runs on
