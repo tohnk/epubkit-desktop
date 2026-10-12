@@ -1682,3 +1682,93 @@ fn an_svg_that_shows_part_of_its_image_is_not_unwrapped() {
         );
     }
 }
+
+/// An SVG that shows the whole of its image can still draw it otherwise than
+/// an `<img>` would: clipped, masked, filtered, faded, blended or hidden, by an
+/// attribute of its own or of its image, or by the chapter's stylesheets,
+/// which can slide, turn or size the image too. An `<img>` in its place
+/// showed the whole picture, as it is. Such an SVG stays as it is; one the
+/// stylesheets only lay out, or draw as it is after all, is unwrapped.
+#[test]
+fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><defs><clipPath id="crop"><rect width="500" height="400"/></clipPath></defs></svg>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="cover" viewBox="0 0 1000 400" {svg}><image width="1000" height="400" {image} xlink:href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cases = [
+        // Its own attributes, or its image's.
+        (r#"clip-path="url(#crop)""#, "", "", false),
+        (r#"opacity="0.25""#, "", "", false),
+        (r#"mask="url(#fade)""#, "", "", false),
+        (r#"filter="url(#blur)""#, "", "", false),
+        (r#"visibility="hidden""#, "", "", false),
+        (r#"style="opacity: 0.5""#, "", "", false),
+        ("", r#"opacity="0.5""#, "", false),
+        ("", r#"transform="translate(-500)""#, "", false),
+        // The chapter's stylesheets.
+        ("", "", ".cover { clip-path: url(#crop) }", false),
+        ("", "", "svg { -webkit-mask-image: url(fade.png) }", false),
+        ("", "", "svg { border-radius: 50% }", false),
+        ("", "", "body > svg { filter: grayscale(1) }", false),
+        ("", "", "svg { mix-blend-mode: multiply }", false),
+        ("", "", "svg.cover { display: none }", false),
+        (
+            "",
+            "",
+            "@media (min-width: 600px) { svg { opacity: .5 } }",
+            false,
+        ),
+        ("", "", "image { transform: translateX(-500px) }", false),
+        ("", "", "svg image { translate: -500px 0 }", false),
+        ("", "", "image { x: -500px }", false),
+        ("", "", "image { width: 500px }", false),
+        // Laid out, or drawn as it is after all.
+        (
+            "",
+            "",
+            "svg { display: block; margin: 0 auto; width: 100%; height: 100% }",
+            true,
+        ),
+        (r#"opacity="1" display="inline""#, "", "", true),
+        ("", "", "svg { opacity: .5 } svg { opacity: 1 }", true),
+        (r#"opacity="0.25""#, "", "svg { opacity: 1 }", true),
+        ("", "", "svg { border-radius: 0 }", true),
+        ("", "", "p svg { clip-path: url(#crop) }", true),
+        ("", "", "@media print { svg { opacity: .5 } }", true),
+    ];
+
+    for (svg, image, css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>, {css}: {after}"
+        );
+        assert_eq!(
+            after.contains(r#"class="cover""#),
+            !unwrapped,
+            "<svg {svg}><image {image}/>, {css}"
+        );
+    }
+}

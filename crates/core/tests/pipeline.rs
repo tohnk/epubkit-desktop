@@ -1401,6 +1401,41 @@ fn an_svg_wrapped_spread_becomes_one_image_per_page() {
     assert_manifest_matches_archive(work.path());
 }
 
+/// A wrapper that draws its spread otherwise than an `<img>` would, clipped
+/// to its left page by its own attribute, or faded by a stylesheet, keeps it
+/// whole: plain images of its pages in its place would show what it hid,
+/// and lose what it did to the rest.
+#[test]
+fn an_svg_that_draws_its_spread_otherwise_keeps_it_whole() {
+    let defs = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><defs><clipPath id="left"><rect width="500" height="400"/></clipPath></defs></svg>"#;
+    for (svg, css) in [
+        (r#"clip-path="url(#left)""#, ""),
+        ("", "svg { opacity: .5 }"),
+    ] {
+        let files = [
+            ("images/spread.png", "image/png", spread()),
+            ("styles/main.css", "text/css", css.as_bytes().to_vec()),
+        ];
+        let body = format!(
+            r#"{defs}<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="plate" viewBox="0 0 1000 400" {svg}><image width="1000" height="400" xlink:href="../images/spread.png"/></svg></div>"#
+        );
+        let work = light_novel_book(
+            &files,
+            "",
+            r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
+            &body,
+        );
+
+        let chapter = read_chapter(work.path());
+        assert!(
+            chapter.contains(r#"class="plate""#),
+            "{svg} {css}: {chapter}"
+        );
+        assert_shape_kept(work.path(), "OEBPS/images/spread.jpg");
+        assert_manifest_matches_archive(work.path());
+    }
+}
+
 /// A spread outside the package's folder, or reached by an href with `..` in
 /// it, is split and shown like any other.
 #[test]

@@ -1457,7 +1457,10 @@ fn free_images(
             false
         };
         for (svg, image, page) in &stand_ins {
-            if !layout.frames_itself(page) && !framed_around(svg) {
+            if !layout.frames_itself(page)
+                && !framed_around(svg)
+                && drawn_as_it_is(&layout, svg, image)
+            {
                 free.insert(image.node_ptr());
             }
         }
@@ -1532,11 +1535,15 @@ fn shares_a_line(line: &Node, image: &Node) -> bool {
 /// Store and Gutenberg EPUBs often wrap the cover in an SVG with a viewBox,
 /// which small e-ink readers render poorly or not at all. Only the first few
 /// spine entries are examined — a cover later than that is not a cover — and
-/// only an SVG that does nothing but show its image is replaced.
+/// only an SVG that does nothing but show its image, as it is, is replaced:
+/// see [`wrapped_image`] and [`drawn_as_it_is`]. A chapter styled by a
+/// stylesheet too large to read is left as it is.
 pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usize> {
     const SPINE_ENTRIES_TO_CHECK: usize = 3;
 
     let mut fixed = 0;
+    let mut stylesheets = Stylesheets::new(root);
+    let budget = Cell::new(MATCHING_BUDGET);
 
     for (_, href) in spine_hrefs(doc)?.into_iter().take(SPINE_ENTRIES_TO_CHECK) {
         let Some(path) = resolve_href(root, opf_dir, &decode(&href)) else {
@@ -1551,20 +1558,40 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         let Ok(content) = html::parse_content(&bytes) else {
             continue;
         };
+        let base = path.parent().unwrap_or(opf_dir);
+        let Some(styles) = stylesheets.of_chapter(&content.doc, base)? else {
+            continue;
+        };
+
+        // Each wrapper is found, as the chapter is styled, before any of
+        // them is replaced.
+        let mut wrappers = Vec::new();
+        {
+            let sheets: Vec<(&Sheet, Tri)> = styles
+                .iter()
+                .map(|(sheet, applies)| (&**sheet, *applies))
+                .collect();
+            let reshaping = Reshaping::default();
+            let layout = Layout::new(&sheets, &reshaping, &budget);
+            for svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
+                let Some(image) = wrapped_image(&svg) else {
+                    continue;
+                };
+                if !drawn_as_it_is(&layout, &svg, &image) {
+                    continue;
+                }
+                let target = image
+                    .get_attribute_ns("href", NS_XLINK)
+                    .or_else(|| image.get_attribute("href"))
+                    .unwrap_or_default();
+                if !target.is_empty() {
+                    wrappers.push((svg, target));
+                }
+            }
+        }
 
         let mut fixed_here = 0;
-        for mut svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
-            let Some(image) = wrapped_image(&svg) else {
-                continue;
-            };
-            let target = image
-                .get_attribute_ns("href", NS_XLINK)
-                .or_else(|| image.get_attribute("href"))
-                .unwrap_or_default();
-            if target.is_empty() {
-                continue;
-            }
-
+        for (mut svg, target) in wrappers {
             let Some(mut parent) = svg.get_parent() else {
                 continue;
             };
@@ -1665,9 +1692,11 @@ fn outermost_svgs() -> String {
     format!("//{svg}[not(ancestor::{svg})]", svg = xml::local("svg"))
 }
 
-/// The image an SVG wraps, if showing it is all the SVG does: the image is
-/// its one element apart from a title, a description or metadata, and is not
-/// drawn transformed, clipped, masked or filtered.
+/// The image an SVG wraps, if showing the whole of it is all the SVG does:
+/// the image is its one element apart from a title, a description or
+/// metadata, in a box that is its own (see [`shows_whole`]). Whether either
+/// is drawn otherwise, by an attribute or a style, is [`drawn_as_it_is`]'s to
+/// say.
 ///
 /// Anything more, a label, a line, a second image, makes the SVG an
 /// illustration, and an `<img>` in its place would lose the rest.
@@ -1682,16 +1711,25 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
     }
 
     let image = image?;
-    let drawn_as_is = ["transform", "clip-path", "mask", "filter"]
-        .into_iter()
-        .all(|attribute| image.get_attribute(attribute).is_none());
-    (drawn_as_is && shows_whole(svg, &image)).then_some(image)
+    shows_whole(svg, &image).then_some(image)
 }
 
-/// Does `svg` show the whole of `image`, as an `<img>` would: in a box that is
-/// the image's own, so that nothing of it is cropped, slid aside or sliced
-/// off? The box is the viewBox, which has to start at the origin and be the
-/// image's size, or without one the SVG itself, which the image has to fill.
+/// Does `svg` draw `image`, the image it wraps, as an `<img>` of it would?
+/// Neither may be turned or slid, clipped, masked, filtered, faded, blended
+/// or hidden, by an attribute, its style or the chapter's stylesheets as
+/// `layout` reads them; nor may CSS put the image elsewhere, or at another
+/// size, than its attributes do.
+fn drawn_as_it_is(layout: &Layout, svg: &Node, image: &Node) -> bool {
+    !layout.drawn_otherwise(svg)
+        && !layout.drawn_otherwise(image)
+        && !layout.placed_otherwise(image)
+}
+
+/// Does `svg` show the whole of `image`, as its attributes place it, as an
+/// `<img>` would: in a box that is the image's own, so that nothing of it is
+/// cropped, slid aside or sliced off? The box is the viewBox, which has to
+/// start at the origin and be the image's size, or without one the SVG
+/// itself, which the image has to fill.
 fn shows_whole(svg: &Node, image: &Node) -> bool {
     let at_origin = ["x", "y"].into_iter().all(|attribute| {
         image
@@ -1702,15 +1740,7 @@ fn shows_whole(svg: &Node, image: &Node) -> bool {
         node.get_attribute("preserveAspectRatio")
             .is_some_and(|value| value.contains("slice"))
     });
-    let styled = [svg, image].into_iter().any(|node| {
-        node.get_attribute("style").is_some_and(|style| {
-            let style = style.to_ascii_lowercase();
-            ["transform", "clip", "mask", "filter", "opacity"]
-                .into_iter()
-                .any(|property| style.contains(property))
-        })
-    });
-    if !at_origin || sliced || styled || svg.get_attribute("transform").is_some() {
+    if !at_origin || sliced {
         return false;
     }
 

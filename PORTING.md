@@ -638,7 +638,7 @@ cover lay on its side in a reader's library.
 Before converting images in Light Novel mode, the port reads how the book
 shows each one, and reshapes only an image shown as a page of its own: an
 `<img>` outside a heading with nothing else in its line, or an SVG that shows
-nothing but its image, on its own the same way. Anything else that names
+nothing but its image, as it is, on its own the same way. Anything else that names
 the file keeps its shape: an SVG that draws more, an SVG document, a
 stylesheet or `style`, an image in text or a heading, a link to the file, a
 `srcset` other than the image's own, and the cover. For this the chapters are
@@ -761,8 +761,17 @@ Nor does it unwrap one that shows only part of its image: a viewBox over the
 right half of a spread, an image slid out of its box, or one sliced to fill a
 box of another shape. An `<img>` in its place showed the whole picture. The
 port replaces only an SVG whose box is its image's own: a viewBox from the
-origin the image's size, or none and an image filling the SVG, with nothing
-transforming, clipping or fading it.
+origin the image's size, or none and an image filling the SVG.
+
+Nor one that draws its image otherwise than an `<img>` would: turned or
+slid, clipped by `clip-path`, `clip` or rounded corners, masked, filtered,
+faded, blended with what is behind it, or hidden. The SVG's attributes or its
+image's can do that, their `style`, or the chapter's stylesheets, read
+through the cascade as Light Novel mode reads them, where an attribute is a
+declaration that any rule setting the same takes the place of; and the
+stylesheets can put the image elsewhere or at another size, as SVG 2 lets
+`x`, `y`, `width` and `height` do. A chapter styled by a stylesheet too large
+to read keeps its wrappers. Light Novel mode keeps such an image whole.
 
 ### A document too large to read whole is left as it is
 

@@ -1086,8 +1086,8 @@ fn local_name(node: &Node) -> String {
 
 // ------------------------------------------------------------ declarations
 
-/// The properties that size or place a box, as far as Light Novel mode reads
-/// them.
+/// The properties that size, place or draw a box, as far as Light Novel mode,
+/// and the unwrapping of an SVG around an image, read them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Property {
     Height,
@@ -1110,9 +1110,27 @@ enum Property {
     OverflowY,
     /// Whether the box is sized as if it held nothing: `contain: size`.
     Contain,
+    /// Where SVG 2 puts an element whose `x` and `y` CSS sets.
+    X,
+    Y,
+    /// The path `offset-path` moves a box along.
+    OffsetPath,
+    /// What of a box is drawn, and how: `clip-path`, `clip`, a `mask`, a
+    /// `filter`, its `opacity`, how it is blended with what is behind it,
+    /// and rounded corners, which clip what it holds.
+    ClipPath,
+    Clip,
+    Mask,
+    Filter,
+    Opacity,
+    MixBlendMode,
+    BorderRadius,
+    /// Whether it is shown at all: `visibility`, and `display: none`.
+    Visibility,
+    Display,
 }
 
-const PROPERTIES: [Property; 12] = [
+const PROPERTIES: [Property; 24] = [
     Property::Height,
     Property::MaxHeight,
     Property::Width,
@@ -1125,6 +1143,18 @@ const PROPERTIES: [Property; 12] = [
     Property::OverflowX,
     Property::OverflowY,
     Property::Contain,
+    Property::X,
+    Property::Y,
+    Property::OffsetPath,
+    Property::ClipPath,
+    Property::Clip,
+    Property::Mask,
+    Property::Filter,
+    Property::Opacity,
+    Property::MixBlendMode,
+    Property::BorderRadius,
+    Property::Visibility,
+    Property::Display,
 ];
 
 /// The properties that turn, scale or slide a box.
@@ -1133,6 +1163,39 @@ const TURNING: [Property; 4] = [
     Property::Rotate,
     Property::Scale,
     Property::Translate,
+];
+
+/// The properties that draw a box otherwise than as it is: turned or slid,
+/// clipped, masked, filtered, faded, blended, or not at all.
+const DRAWING: [Property; 14] = [
+    Property::Transform,
+    Property::Rotate,
+    Property::Scale,
+    Property::Translate,
+    Property::OffsetPath,
+    Property::ClipPath,
+    Property::Clip,
+    Property::Mask,
+    Property::Filter,
+    Property::Opacity,
+    Property::MixBlendMode,
+    Property::BorderRadius,
+    Property::Visibility,
+    Property::Display,
+];
+
+/// The attributes SVG draws an element by that are CSS properties too: CSS
+/// takes each as a declaration of its property, at no specificity, before
+/// every rule.
+const PRESENTATION_ATTRIBUTES: &[&str] = &[
+    "transform",
+    "clip-path",
+    "clip",
+    "mask",
+    "filter",
+    "opacity",
+    "visibility",
+    "display",
 ];
 
 /// What a property's value does to a box, as far as that matters here.
@@ -1161,9 +1224,11 @@ struct Declaration {
     property: Property,
     value: Value,
     important: bool,
-    /// Whether it may be of another property instead: a logical one, which is
-    /// the box's height or its width as the page is written across or down.
-    logical: bool,
+    /// Whether it may be of another property instead, or is of only a part
+    /// of its own: a logical one, which is the box's height or its width as
+    /// the page is written across or down, or one corner's radius. It never
+    /// settles what its property is.
+    partial: bool,
 }
 
 /// The declarations of a rule's block or a `style` attribute that size or
@@ -1216,7 +1281,7 @@ fn declarations_in(input: &mut Parser<'_, '_>, found: &mut Declarations, depth: 
                         property: Property::Height,
                         value: Value::Unknown,
                         important: false,
-                        logical: false,
+                        partial: false,
                     });
                 } else {
                     let _ = chunk.parse_nested_block(|block| {
@@ -1236,13 +1301,13 @@ fn declarations_in(input: &mut Parser<'_, '_>, found: &mut Declarations, depth: 
     }
 }
 
-/// Read one declaration into `own`, if it is of a property that sizes or
-/// places a box.
+/// Read one declaration into `own`, if it is of a property that sizes,
+/// places or draws a box.
 fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option<()> {
     use Property::*;
     let name = input.expect_ident().ok()?.to_ascii_lowercase();
     input.expect_colon().ok()?;
-    let (properties, logical): (&[Property], bool) = match name.as_str() {
+    let (properties, partial): (&[Property], bool) = match name.as_str() {
         "height" => (&[Height], false),
         "max-height" => (&[MaxHeight], false),
         "width" => (&[Width], false),
@@ -1262,6 +1327,28 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
         "overflow-y" => (&[OverflowY], false),
         "overflow-inline" | "overflow-block" => (&[OverflowX, OverflowY], true),
         "contain" => (&[Contain], false),
+        "x" => (&[X], false),
+        "y" => (&[Y], false),
+        "offset" | "offset-path" => (&[OffsetPath], false),
+        "clip-path" | "-webkit-clip-path" => (&[ClipPath], false),
+        "clip" => (&[Clip], false),
+        // The shorthand sets the image the mask is made of, as does the
+        // longhand.
+        "mask" | "-webkit-mask" | "mask-image" | "-webkit-mask-image" => (&[Mask], false),
+        "filter" | "-webkit-filter" => (&[Filter], false),
+        "opacity" => (&[Opacity], false),
+        "mix-blend-mode" => (&[MixBlendMode], false),
+        "border-radius" | "-webkit-border-radius" => (&[BorderRadius], false),
+        "border-top-left-radius"
+        | "border-top-right-radius"
+        | "border-bottom-right-radius"
+        | "border-bottom-left-radius"
+        | "border-start-start-radius"
+        | "border-start-end-radius"
+        | "border-end-start-radius"
+        | "border-end-end-radius" => (&[BorderRadius], true),
+        "visibility" => (&[Visibility], false),
+        "display" => (&[Display], false),
         _ => return None,
     };
     let start = input.state();
@@ -1272,7 +1359,7 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
             property,
             value,
             important,
-            logical,
+            partial,
         });
     }
     Some(())
@@ -1364,6 +1451,62 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
                 Value::Initial
             }
         }
+        Property::X | Property::Y => {
+            if terms.any_number() || !left_alone(&[]) {
+                Value::Set
+            } else {
+                Value::Initial
+            }
+        }
+        Property::OffsetPath | Property::ClipPath | Property::Mask | Property::Filter => {
+            if left_alone(&["none", "auto", "normal"]) {
+                Value::Initial
+            } else {
+                Value::Set
+            }
+        }
+        Property::Clip => {
+            if left_alone(&["auto"]) {
+                Value::Initial
+            } else {
+                Value::Set
+            }
+        }
+        Property::MixBlendMode => {
+            if left_alone(&["normal"]) {
+                Value::Initial
+            } else {
+                Value::Set
+            }
+        }
+        Property::Opacity => {
+            if left_alone(&[]) && terms.numbers.iter().all(|&number| number >= 1.0) {
+                Value::Initial
+            } else {
+                Value::Set
+            }
+        }
+        Property::BorderRadius => {
+            if left_alone(&[]) && terms.numbers.iter().all(|&number| number == 0.0) {
+                Value::Initial
+            } else {
+                Value::Set
+            }
+        }
+        Property::Visibility => {
+            if said(&["hidden", "collapse"]) {
+                Value::Set
+            } else {
+                Value::Initial
+            }
+        }
+        Property::Display => {
+            if said(&["none", "contents"]) {
+                Value::Set
+            } else {
+                Value::Initial
+            }
+        }
     };
     (value, important)
 }
@@ -1371,8 +1514,11 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
 /// What a value is made of, as far as telling what it does to a box goes.
 #[derive(Debug, Default)]
 struct Terms {
-    /// Its keywords, lowercased, and the names of its functions, with a `(`.
+    /// Its keywords, lowercased, and the names of its functions, with a `(`,
+    /// a url's among them.
     words: Vec<String>,
+    /// Its numbers, a percentage's as a share of one.
+    numbers: Vec<f32>,
     fixed: bool,
     screen: bool,
     percent: bool,
@@ -1396,7 +1542,15 @@ impl Terms {
         let unit_in =
             |units: &[&str], unit: &str| units.iter().any(|known| unit.eq_ignore_ascii_case(known));
         match token {
+            Token::Number { value, .. } | Token::Dimension { value, .. } => {
+                self.numbers.push(*value)
+            }
+            Token::Percentage { unit_value, .. } => self.numbers.push(*unit_value),
+            _ => {}
+        }
+        match token {
             Token::Ident(word) => self.words.push(word.to_ascii_lowercase()),
+            Token::UnquotedUrl(_) => self.words.push("url(".to_string()),
             Token::Function(name) => {
                 let name = name.to_ascii_lowercase();
                 if matches!(name.as_str(), "var" | "env" | "attr") {
@@ -1726,7 +1880,7 @@ impl<'a> Layout<'a> {
             candidates[declaration.property as usize].push(Candidate {
                 rank,
                 value: declaration.value,
-                sure: sure && !declaration.logical,
+                sure: sure && !declaration.partial,
             });
         };
 
@@ -1739,9 +1893,21 @@ impl<'a> Layout<'a> {
                     property: Property::Height,
                     value,
                     important: false,
-                    logical: false,
+                    partial: false,
                 };
                 add(&hint, (false, false, Specificity::default(), 0, 0, 0), true);
+            }
+        }
+        // As are the attributes an SVG and its image are drawn by.
+        if matches!(local_name(element).as_str(), "svg" | "image") {
+            for (place, name) in PRESENTATION_ATTRIBUTES.iter().enumerate() {
+                let Some(value) = element.get_attribute_no_ns(name) else {
+                    continue;
+                };
+                for hint in parse_declarations(&format!("{name}: {value}")).own {
+                    let rank = (false, false, Specificity::default(), 0, 0, place);
+                    add(&hint, rank, true);
+                }
             }
         }
 
@@ -1913,6 +2079,30 @@ impl<'a> Layout<'a> {
                 || own.could_be(Property::MaxHeight, Value::Percent))
                 && self.percent_holds(element);
         page_high && set(Property::Width)
+    }
+
+    /// Could `element` be drawn otherwise than as it is: turned or slid,
+    /// clipped, masked, filtered, faded, blended, or not at all?
+    pub(crate) fn drawn_otherwise(&self, element: &Node) -> bool {
+        let own = self.sizing(element);
+        DRAWING
+            .into_iter()
+            .any(|property| own.could_be_any(property, &[Value::Set, Value::Unknown]))
+    }
+
+    /// Could CSS put `element`, an SVG `<image>`, elsewhere or at another
+    /// size than its attributes do, as SVG 2 lets its `x`, `y`, `width` and
+    /// `height` properties?
+    pub(crate) fn placed_otherwise(&self, element: &Node) -> bool {
+        let own = self.sizing(element);
+        let set = |property| own.could_be_any(property, &[Value::Set, Value::Unknown]);
+        set(Property::X)
+            || set(Property::Y)
+            || set(Property::Width)
+            || own.could_be_any(
+                Property::Height,
+                &[Value::Length, Value::Screen, Value::Percent, Value::Unknown],
+            )
     }
 }
 
@@ -2195,7 +2385,7 @@ mod tests {
         // A logical size is a height or a width.
         let logical = parse_declarations("block-size: 3in").own;
         assert_eq!(logical.len(), 2);
-        assert!(logical.iter().all(|declaration| declaration.logical));
+        assert!(logical.iter().all(|declaration| declaration.partial));
         // A nested rule's are kept apart, a rule too deep to read taken to
         // set what may be anything.
         let nested = parse_declarations("height: auto; & img { height: 2em } color: red");
@@ -2289,6 +2479,91 @@ mod tests {
             "#frame { transform: rotate(90deg) } #frame { transform: none }"
         ));
         assert!(!framed("#frame { rotate: 90deg } #frame { rotate: none }"));
+    }
+
+    #[test]
+    fn declarations_say_how_they_draw_a_box() {
+        let one = |text: &str| parse_declarations(text).own[0];
+        for (text, value) in [
+            ("clip-path: url(#crop)", Value::Set),
+            ("clip-path: inset(0 50% 0 0)", Value::Set),
+            ("clip-path: none", Value::Initial),
+            ("-webkit-mask-image: url(fade.png)", Value::Set),
+            ("mask: none", Value::Initial),
+            ("filter: grayscale(1)", Value::Set),
+            ("filter: none", Value::Initial),
+            ("clip: rect(0 10px 10px 0)", Value::Set),
+            ("clip: auto", Value::Initial),
+            ("opacity: .5", Value::Set),
+            ("opacity: 50%", Value::Set),
+            ("opacity: 1", Value::Initial),
+            ("opacity: 100%", Value::Initial),
+            ("opacity: var(--fade)", Value::Unknown),
+            ("mix-blend-mode: multiply", Value::Set),
+            ("mix-blend-mode: normal", Value::Initial),
+            ("border-radius: 50%", Value::Set),
+            ("border-radius: 0", Value::Initial),
+            ("visibility: hidden", Value::Set),
+            ("visibility: visible", Value::Initial),
+            ("display: none", Value::Set),
+            ("display: block", Value::Initial),
+            ("offset-path: path('M 0 0 L 100 0')", Value::Set),
+            ("x: -500px", Value::Set),
+        ] {
+            assert_eq!(one(text).value, value, "{text}");
+        }
+        // A corner's radius is of a part of what `border-radius` sets.
+        assert!(one("border-top-left-radius: 0").partial);
+        assert!(!one("border-radius: 0").partial);
+    }
+
+    /// An SVG's presentation attributes are declarations at no specificity,
+    /// before every rule, which any rule that sets the same takes the place
+    /// of; its style and the rules that match it draw it too.
+    #[test]
+    fn what_draws_an_svg_otherwise_is_cascaded() {
+        let content = document(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" id="plain" viewBox="0 0 10 10"><image id="image" width="10" height="10" href="a.png"/></svg><svg xmlns="http://www.w3.org/2000/svg" id="faded" opacity="0.25" viewBox="0 0 10 10"/>"#,
+        );
+        let laid_out = |css: &str, id: &str| {
+            let sheet = sheet(css);
+            let styles = [(&sheet, Tri::Yes)];
+            let budget = Cell::new(u64::MAX);
+            let reshaping = Reshaping::default();
+            let layout = Layout::new(&styles, &reshaping, &budget);
+            let node = element(&content, id);
+            (
+                layout.drawn_otherwise(&node),
+                layout.placed_otherwise(&node),
+            )
+        };
+        let drawn = |css: &str, id: &str| laid_out(css, id).0;
+        assert!(!drawn("", "plain"));
+        assert!(drawn("", "faded"));
+        assert!(!drawn("svg { opacity: 1 }", "faded"));
+        assert!(drawn("svg { rotate: 90deg }", "plain"));
+        assert!(drawn(
+            "@media (min-width: 600px) { svg { filter: blur(2px) } }",
+            "plain"
+        ));
+        assert!(!drawn(
+            "@media print { svg { filter: blur(2px) } }",
+            "plain"
+        ));
+        assert!(!drawn(
+            "svg { border-radius: 4px; border-radius: 0 }",
+            "plain"
+        ));
+        assert!(drawn(
+            "svg { border-radius: 4px; border-top-left-radius: 0 }",
+            "plain"
+        ));
+
+        let placed = |css: &str| laid_out(css, "image").1;
+        assert!(!placed(""));
+        assert!(placed("image { x: 5px }"));
+        assert!(placed("svg image { width: 50% }"));
+        assert!(!placed("image { width: auto }"));
     }
 
     /// A percentage of the height of a box whose own height grows with what it
