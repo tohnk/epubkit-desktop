@@ -361,6 +361,17 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         chapters.push(path);
     }
 
+    // A stylesheet a chapter or SVG document reaches but the manifest leaves
+    // out is followed all the same: its references are rewritten with the
+    // rest, and one too large to read leaves every image as it is, as any
+    // document left unread does.
+    let reachable = {
+        let mut documents: Vec<&Path> = chapters.clone();
+        documents.extend(svg_documents(&content));
+        structure::reachable_stylesheets(work_dir, &opf_dir, &documents)?
+    };
+    left_unread |= reachable.too_large;
+
     // --- images (15-60%) -------------------------------------------------
     // Light Novel mode reshapes an image only where it is shown as a page of
     // its own, so first it looks at how each is shown.
@@ -427,7 +438,17 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for path in svg_documents(&content) {
             structure::update_svg_references(path, &renames).ok();
         }
-        for path in &content.css {
+        // Every stylesheet the manifest lists, and every one a document
+        // reaches that it leaves out, each rewritten once.
+        let mut stylesheets: Vec<&Path> = content.css.iter().map(PathBuf::as_path).collect();
+        stylesheets.extend(
+            reachable
+                .readable
+                .iter()
+                .filter(|path| !content.css.contains(path))
+                .map(PathBuf::as_path),
+        );
+        for path in stylesheets {
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
             }

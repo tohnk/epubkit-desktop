@@ -223,6 +223,116 @@ pub fn resolve_href(root: &Path, base: &Path, href: &str) -> Option<PathBuf> {
     )
 }
 
+/// The stylesheets the documents at `paths` reach — those a `<link>` or an
+/// `<?xml-stylesheet?>` names, and those those `@import`, to any depth —
+/// resolved inside the book. `readable` are the ones that could be read, for
+/// their references to be rewritten as a manifest stylesheet's are; `too_large`
+/// is whether any was too large to read, so what it names and imports cannot
+/// be known, and the book's images are left as they are.
+///
+/// A well-formed book lists every stylesheet in its manifest, so this adds
+/// nothing. A malformed one may `<link>` a stylesheet the manifest leaves
+/// out, or `@import` one; its references would otherwise never be rewritten,
+/// and an image it names would lose them when it was converted.
+#[derive(Default)]
+pub struct ReachableStylesheets {
+    pub readable: Vec<PathBuf>,
+    pub too_large: bool,
+}
+
+pub fn reachable_stylesheets(
+    root: &Path,
+    opf_dir: &Path,
+    documents: &[&Path],
+) -> Result<ReachableStylesheets> {
+    let mut result = ReachableStylesheets::default();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+
+    for &path in documents {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(doc) = xml::parse_file(path) else {
+            continue;
+        };
+        let base = path.parent().unwrap_or(opf_dir);
+        // Those a `<link rel=stylesheet>` names.
+        for node in xml::find_nodes(&doc, &format!("//{}", xml::local("link")))? {
+            let rel = node.get_attribute_no_ns("rel").unwrap_or_default();
+            if !rel
+                .split_ascii_whitespace()
+                .any(|w| w.eq_ignore_ascii_case("stylesheet"))
+            {
+                continue;
+            }
+            if let Some(href) = node.get_attribute_no_ns("href") {
+                queue.extend(target_of(root, base, &decode(&href)));
+            }
+        }
+        // Those an `<?xml-stylesheet?>` instruction names.
+        for instruction in stylesheet_instructions(&doc) {
+            let attributes = pseudo_attributes(&instruction.get_content());
+            let is_css = attributes
+                .get("type")
+                .is_none_or(|t| t.eq_ignore_ascii_case("text/css"));
+            if is_css {
+                if let Some(href) = attributes.get("href") {
+                    queue.extend(target_of(root, base, &decode(href)));
+                }
+            }
+        }
+    }
+
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) || !path.is_file() {
+            continue;
+        }
+        if crate::too_large_to_read(&path) {
+            result.too_large = true;
+            continue;
+        }
+        let Ok(css) = css::read_stylesheet(&path) else {
+            continue;
+        };
+        let base = path.parent().unwrap_or(opf_dir);
+        for import in css_imports(&css) {
+            queue.extend(target_of(root, base, &import));
+        }
+        result.readable.push(path);
+    }
+    Ok(result)
+}
+
+/// The urls the `@import` rules at the start of `css` name, each as written.
+fn css_imports(css: &str) -> Vec<String> {
+    css::rules(css, 0)
+        .into_iter()
+        .filter_map(|rule| match rule.kind {
+            css::RuleKind::At { name, prelude, .. } if name == "import" => {
+                first_url_or_string(&css[prelude])
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The url an `@import` prelude leads with: a quoted string, a bare url, or a
+/// `url(...)`.
+fn first_url_or_string(prelude: &str) -> Option<String> {
+    let mut input = ParserInput::new(prelude);
+    let mut parser = CssParser::new(&mut input);
+    match parser.next().ok()?.clone() {
+        Token::QuotedString(url) | Token::UnquotedUrl(url) => Some(url.to_string()),
+        Token::Function(name) if name.eq_ignore_ascii_case("url") => parser
+            .parse_nested_block(|inner| {
+                Ok::<_, ParseError<()>>(inner.expect_string().ok().map(|url| url.to_string()))
+            })
+            .ok()?,
+        _ => None,
+    }
+}
+
 /// Classify every manifest entry by what the pipeline needs to do with it.
 /// `root` is where the book was unpacked; an entry that leads out of it is
 /// left out.

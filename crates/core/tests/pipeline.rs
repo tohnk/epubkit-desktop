@@ -2677,3 +2677,70 @@ fn an_image_claiming_impossible_dimensions_is_skipped() {
     assert_eq!(report.images_unconverted, 1);
     assert!(work.path().join("OEBPS/images/huge.tif").is_file());
 }
+
+/// A stylesheet a chapter reaches — linked or imported — but the manifest
+/// leaves out is still followed. A small one is rewritten when the image it
+/// names is converted, so its reference keeps leading to the image; one too
+/// large to read could name anything, so every image in the book is left as
+/// it is, as with any document left unread.
+#[test]
+fn an_unlisted_stylesheet_that_names_an_image_is_not_broken() {
+    let png = solid(image::ImageFormat::Png, 0);
+
+    // Small: the unlisted stylesheet is rewritten, the image converted.
+    {
+        let files = [
+            ("images/art.png", "image/png", png.clone()),
+            (
+                "styles/extra.css",
+                UNDECLARED,
+                br#".x { background: url("../images/art.png") }"#.to_vec(),
+            ),
+        ];
+        let head = r#"<link rel="stylesheet" type="text/css" href="../styles/extra.css"/>"#;
+        let (work, report) = optimize_files(
+            &files,
+            "",
+            head,
+            "<p>Text.</p>",
+            &ProcessingOptions::default(),
+        );
+        assert!(
+            !work.path().join("OEBPS/images/art.png").is_file(),
+            "art.png should be converted and renamed"
+        );
+        assert!(
+            work.path().join("OEBPS/images/art.jpg").is_file(),
+            "art.jpg"
+        );
+        let css = fs::read_to_string(work.path().join("OEBPS/styles/extra.css")).unwrap();
+        assert!(css.contains("art.jpg") && !css.contains("art.png"), "{css}");
+        assert_eq!(report.images_converted, 1);
+    }
+
+    // Large: the unlisted stylesheet is left unread, so every image stays.
+    {
+        let big = format!(
+            r#".x {{ background: url("../images/art.png") }}{}"#,
+            "/* pad */".repeat(32 * 1024 * 1024 / 9 + 1)
+        );
+        let files = [
+            ("images/art.png", "image/png", png.clone()),
+            ("styles/extra.css", UNDECLARED, big.into_bytes()),
+        ];
+        let head = r#"<link rel="stylesheet" type="text/css" href="../styles/extra.css"/>"#;
+        let (work, report) = optimize_files(
+            &files,
+            "",
+            head,
+            "<p>Text.</p>",
+            &ProcessingOptions::default(),
+        );
+        assert!(
+            work.path().join("OEBPS/images/art.png").is_file(),
+            "art.png should be kept as it is"
+        );
+        assert_eq!(report.images_converted, 0);
+        assert_eq!(report.images_unconverted, 1);
+    }
+}
