@@ -407,10 +407,15 @@ struct Footprint {
     quarter_turn: bool,
 }
 
-/// What a page holds once resampled, as it is made grey, dithered and coded:
-/// at most 1024 x 1024 at sixteen bits a channel, its grey and RGB copies,
-/// and the JPEG rewritten, which held 17 MB for a page that size.
-const PAGE_MEMORY: u64 = 32 << 20;
+/// What a page holds once resampled, as it is made grey, dithered and coded.
+/// It is at most 1024 x 1024, at as much as twelve bytes a pixel, and is let
+/// go once it is made grey or RGB; the RGB is coded, the JPEG written into a
+/// buffer up to twice its size and rewritten with optimal Huffman tables,
+/// both held at once; and in Light Novel mode the half of a split spread
+/// coded first is held as the second is. Noise, which codes as densely as any
+/// content tried, held 20.5 MiB of this at most: in colour at quality 100,
+/// coding the second half of a spread split in two.
+pub const PAGE_MEMORY: u64 = 32 << 20;
 
 impl Footprint {
     /// Reckoned from the `header` of an image whose file is `file` bytes
@@ -1174,8 +1179,12 @@ pub fn process_image(
             image.crop_imm(x, y, before_w, before_h)
         };
 
+        // The page goes once it is grey or RGB, before that is coded: coding
+        // holds the JPEG twice over, as written and as rewritten, and a page
+        // in floating point is four times the RGB it comes to.
         let rgb = if options.grayscale {
             let mut gray = to_gray_601(&page);
+            drop(page);
 
             if options.contrast_boost {
                 // Stretching the histogram first gives the quantizer a full
@@ -1202,7 +1211,7 @@ pub fn process_image(
 
             gray_to_rgb(&gray)
         } else {
-            let mut rgb = page.to_rgb8();
+            let mut rgb = page.into_rgb8();
             if options.contrast_boost {
                 adjust_contrast_rgb(&mut rgb, options.contrast_factor);
                 details.push(format!("contrast {}x", options.contrast_factor));

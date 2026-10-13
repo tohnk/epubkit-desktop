@@ -432,6 +432,14 @@ symbols. No dequantization and no IDCT are involved, so nothing is
 approximated; SOF, DQT, scan header, component order and every DCT coefficient
 are copied through byte for byte. It is what `jpegtran -optimize` does.
 
+The scan is decoded a block at a time, three times over, to count, to code and
+to check, so the rewrite holds the file it writes and little else. It decoded
+the whole scan into a list of its symbols, copied that to code the padding
+afresh, as below, and decoded the rewritten file into another to check it: ten
+times the JPEG at once, 51 MB for a 1024 x 1024 page of colour noise at
+quality 100. Codes are looked up ten bits ahead, as libjpeg looks them up, so
+the three passes take less time than the two did.
+
 One more thing changes, as libjpeg would have it. An interleaved scan codes
 whole MCUs, so where an image's luma does not fill out the last one, 4:2:0
 greyscale being the case here, blocks past the image's edge are coded that no
@@ -632,6 +640,17 @@ out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
 794 MB. Floating-point RGB, which a TIFF can be, is shrunk where it lies as
 eight- and sixteen-bit images are; it was copied whole first, which a 3000 x
 5000 one held 9 MiB past what was set aside for.
+
+A page, at most 1024 x 1024, is reckoned to hold 32 MiB beside the image as it
+is made grey or RGB and coded: the page, at as much as twelve bytes a pixel,
+let go once it is grey or RGB; the JPEG, in a buffer up to twice its size, and
+the JPEG rewritten with optimal Huffman tables; and in Light Novel mode the
+first half of a split spread as the second is coded. Noise in colour at quality
+100, which codes as densely as any content tried, holds 20.5 MiB of that at
+most. Before the Huffman tables were made optimal a block at a time, such a
+page held 69 MiB to convert where 38 were set aside, and a worker held to that
+left it unconverted; and a page in floating point, four times the RGB it comes
+to, was kept until it was coded, past the 32 MiB.
 
 Reading the header holds little, and that is set aside too while it is read.
 A JPEG's is read marker by marker, passing over every segment but its frame

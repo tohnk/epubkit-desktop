@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use epubkit_core::image::{
     is_raster_image, memory_needed, process_image, thumbnail, ImageOptions, HEADER_MEMORY,
+    PAGE_MEMORY,
 };
 use epubkit_core::memory::MemoryBudget;
 use image::ImageEncoder;
@@ -493,6 +494,120 @@ fn a_floating_point_image_is_shrunk_without_a_copy() {
     assert!(converted.is_ok());
     let held = (bytes.len() + peak) as u64;
     assert!(held <= needed, "{held} held, {needed} set aside");
+}
+
+/// Noise, `width` x `height`: each pixel one of the eight corners of the RGB
+/// cube, at random, which in colour codes denser than any other content
+/// tried, at quality 100 nearly five bytes a pixel.
+fn noise(width: u32, height: u32) -> image::RgbImage {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state >> 40
+    };
+    image::RgbImage::from_fn(width, height, |_, _| {
+        let corner = next();
+        image::Rgb([0, 1, 2].map(|bit| if corner >> bit & 1 == 0 { 0 } else { 255 }))
+    })
+}
+
+/// Options that keep a page in colour, at `quality`, or make it grey and
+/// dither it as a Kindle's are.
+fn page_options(grayscale: bool, quality: u8) -> ImageOptions {
+    ImageOptions {
+        max_width: 1024,
+        max_height: 1024,
+        grayscale,
+        eink_quantize: grayscale,
+        contrast_boost: grayscale,
+        quality,
+        ..ImageOptions::default()
+    }
+}
+
+/// A page is coded with its Huffman tables made optimal for it, which read
+/// the whole scan into a list of its symbols, then copied it to code the
+/// padding afresh, then read the rewritten file back into another to check
+/// it: ten times the JPEG at once. In colour at 1024 x 1024, the most a page
+/// may be, noise held 69 MiB to convert at quality 100 where 38 were set
+/// aside, and 56 at quality 70, so a worker held to that skipped it. The scan
+/// is read a block at a time now, and converting holds no more than is set
+/// aside, in colour or in grey, at any quality: 22 MiB at quality 100.
+#[test]
+fn a_page_of_noise_at_the_largest_size_converts_within_what_is_set_aside() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let mut bmp = Vec::new();
+    image::DynamicImage::ImageRgb8(noise(1024, 1024))
+        .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .unwrap();
+    let path = dir.path().join("noise.bmp");
+    std::fs::write(&path, &bmp).unwrap();
+
+    for (grayscale, quality) in [(false, 70), (false, 95), (false, 100), (true, 100)] {
+        let options = page_options(grayscale, quality);
+        let needed = memory_needed(&path, &options);
+        let (converted, peak) = peak_of(|| process_image(&bmp, "noise.bmp", &options));
+        assert!(converted.is_ok(), "grey {grayscale}, quality {quality}");
+        let held = (bmp.len() + peak) as u64;
+        assert!(
+            held <= needed,
+            "grey {grayscale}, quality {quality}: {held} held, {needed} set aside"
+        );
+    }
+}
+
+/// Making a JPEG's Huffman tables optimal holds the file it writes, no
+/// larger than the one it reads, and little else: a colour JPEG of noise at
+/// 1024 x 1024 and quality 100 held 51 MB to rewrite, ten times itself.
+#[test]
+fn making_huffman_tables_optimal_holds_little_beside_the_file_it_writes() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let rgb = noise(1024, 1024);
+    let mut jpeg = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 100);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    encoder
+        .encode(rgb.as_raw(), 1024, 1024, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+    drop(rgb);
+
+    let (optimized, peak) = peak_of(|| epubkit_core::jpeg::optimize_huffman(&jpeg));
+    assert!(optimized.is_some(), "the tables were not made optimal");
+    assert!(
+        peak <= jpeg.len() + (1 << 20),
+        "{peak} held to rewrite a JPEG of {}",
+        jpeg.len()
+    );
+}
+
+/// A page is coded once it is grey or RGB, without the page it was made from
+/// beside it. One of floating point is four times the RGB it comes to, and
+/// coding the second half of a split spread of it, with the first half
+/// coded, held 32.5 MiB beside the image, more than the 32 set aside for a
+/// page; only the room reckoned for decoding the image covered it.
+#[test]
+fn a_page_holds_no_more_than_is_set_aside_for_one_beside_its_image() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tiff = Vec::new();
+    let spread = image::DynamicImage::ImageRgb8(noise(2048, 1024)).into_rgb32f();
+    image::DynamicImage::ImageRgb32F(spread)
+        .write_to(&mut Cursor::new(&mut tiff), image::ImageFormat::Tiff)
+        .unwrap();
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..page_options(false, 100)
+    };
+
+    let (converted, peak) = peak_of(|| process_image(&tiff, "spread.tiff", &options));
+    assert_eq!(converted.unwrap().len(), 2, "the spread is split");
+    let image = 2048 * 1024 * 12;
+    assert!(
+        peak as u64 <= image + PAGE_MEMORY,
+        "{peak} held beside the file, for an image of {image}"
+    );
 }
 
 /// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes

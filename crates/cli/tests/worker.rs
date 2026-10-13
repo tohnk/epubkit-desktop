@@ -245,3 +245,47 @@ fn a_worker_refuses_a_jpeg_in_separate_scans() {
         Converted::Done(_)
     ));
 }
+
+/// A page of colour noise at 1024 x 1024, the most a page may be, converts in
+/// a worker held to just what is reckoned for it. Making its Huffman tables
+/// optimal held ten times its JPEG, which overran that cap at quality 70 as
+/// at 100, and the image was left unconverted.
+#[test]
+fn a_page_of_colour_noise_converts_within_the_memory_reckoned_for_it() {
+    use std::io::Cursor;
+    use_the_cli_as_worker();
+    let dir = tempfile::tempdir().unwrap();
+    // Each pixel one of the eight corners of the RGB cube, at random.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let noise = image::RgbImage::from_fn(1024, 1024, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let corner = state >> 40;
+        image::Rgb([0, 1, 2].map(|bit| if corner >> bit & 1 == 0 { 0 } else { 255 }))
+    });
+    let mut bmp = Vec::new();
+    image::DynamicImage::ImageRgb8(noise)
+        .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .unwrap();
+    let path = dir.path().join("noise.bmp");
+    std::fs::write(&path, &bmp).unwrap();
+
+    for quality in [70, 100] {
+        let options = ImageOptions {
+            max_width: 1024,
+            max_height: 1024,
+            grayscale: false,
+            eink_quantize: false,
+            contrast_boost: false,
+            quality,
+            ..ImageOptions::default()
+        };
+        let cap = epubkit_core::image::memory_needed(&path, &options);
+        let converted = worker::convert(&path, "noise.bmp", &options, cap).unwrap();
+        assert!(
+            matches!(converted, Converted::Done(_)),
+            "quality {quality}: did not convert within the {cap} bytes reckoned for it"
+        );
+    }
+}
