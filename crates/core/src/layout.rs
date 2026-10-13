@@ -1607,7 +1607,6 @@ fn harmless(name: &str, terms: &Terms) -> bool {
     let any_value = [
         "color",
         "background",
-        "padding",
         "font",
         "text-",
         "line-height",
@@ -1635,9 +1634,23 @@ fn harmless(name: &str, terms: &Terms) -> bool {
         return true;
     }
     match name {
-        _ if name.starts_with("border") => !name.ends_with("radius"),
+        // Padding, a border or a margin that is there at all makes the image's
+        // box larger than the wrapper's was, for a box around it that hides
+        // what overflows it to cut off; only none of each is harmless, and
+        // a border's colour. Rounded corners clip, and a border image draws
+        // over the box.
+        _ if name.starts_with("border") && name.ends_with("-color") => true,
+        _ if name.starts_with("border") && (name.ends_with("radius") || name.contains("image")) => {
+            false
+        }
+        _ if name.starts_with("border") => {
+            only(&["none", "hidden"]) && terms.numbers.iter().all(|&number| number == 0.0)
+        }
+        _ if name.starts_with("padding") => {
+            only(&[]) && terms.numbers.iter().all(|&number| number == 0.0)
+        }
         _ if name.starts_with("margin") => {
-            only(&["auto"]) && terms.numbers.iter().all(|&number| number >= 0.0)
+            only(&["auto"]) && terms.numbers.iter().all(|&number| number == 0.0)
         }
         "width" | "height" | "inline-size" | "block-size" => only(&["auto"]) && !terms.any_number(),
         "min-width" | "min-height" | "min-inline-size" | "min-block-size" => {
@@ -2294,6 +2307,9 @@ impl<'a> Layout<'a> {
             own.iter().any(|own| {
                 name.strip_prefix(own.as_str())
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+                    // `border` sets every side's width, style and colour, and
+                    // its image, but not the rounding of its corners.
+                    && !(own == "border" && name.ends_with("radius"))
             })
         };
         let keys = keys_of(element);

@@ -858,15 +858,19 @@ a reader has them. And
 as no list of what draws an image otherwise can foresee what a rule for
 images may do, `img { width: 0 }` say, which left nothing of the cover, a
 wrapper stays wherever a rule that may style its `<img>` sets anything but
-colours, fonts and how text is laid out, borders without rounded corners,
-backgrounds, padding, where pages break, margins that are not negative,
-sizes left to the image, `box-sizing: content-box`, or that it is visible.
-What the `<img>`'s own style sets, its size, its margins, that it is a block
-and `box-sizing: content-box`, a rule does not unless it is important. That
-pinned `content-box` matters: padding or a border with `box-sizing:
+colours, fonts and how text is laid out, a border's colour, backgrounds,
+where pages break, no padding, no border and no margin, sizes left to the
+image, `box-sizing: content-box`, or that it is visible. What the `<img>`'s
+own style sets, its size, its margins, that it is a block, `box-sizing:
+content-box`, no padding and no border, a rule does not unless it is
+important. Those pins matter. Padding or a border with `box-sizing:
 border-box` and the `<img>`'s `max-width: 100%` would leave no content box
-and so no picture, so an important `border-box` keeps the wrapper. A chapter styled by a stylesheet too large to read
-keeps its wrappers. Light Novel mode keeps such an image whole, and asks the
+and so no picture; and padding, a border or a margin at all make the
+`<img>`'s box larger than the SVG's was, so a box around it that hides what
+overflows it cuts the picture off. So an important one of any of them keeps
+the wrapper; the rounding of a border's corners, which the `border` shorthand
+does not set, keeps it whether important or not. A chapter styled by a
+stylesheet too large to read keeps its wrappers. Light Novel mode keeps such an image whole, and asks the
 same of the pages that would take a wrapper's place.
 
 ### A document too large to read whole is left as it is

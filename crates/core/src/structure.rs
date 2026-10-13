@@ -66,8 +66,8 @@ const HREF_ESCAPE: &AsciiSet = &CONTROLS
     .add(b'%');
 
 /// How an image that replaces an SVG wrapper fills the page.
-const FULL_PAGE_STYLE: &str =
-    "max-width:100%;max-height:100%;display:block;margin:auto;box-sizing:content-box";
+const FULL_PAGE_STYLE: &str = "max-width:100%;max-height:100%;display:block;margin:auto;\
+     box-sizing:content-box;padding:0;border:0";
 
 /// Elements that run in a line of text rather than making a block of their
 /// own, so that an image in one is in the line around it.

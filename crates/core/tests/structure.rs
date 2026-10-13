@@ -778,8 +778,12 @@ fn svg_wrapped_covers_become_plain_images() {
     );
     // The `<img>` pins `box-sizing: content-box`, so a chapter's
     // `box-sizing: border-box` cannot combine with padding or a border to
-    // collapse its content box to nothing.
+    // collapse its content box to nothing; and no padding and no border, so
+    // a chapter's cannot make it larger than the SVG was, for a box that hides
+    // what overflows it to cut off.
     assert!(out.contains("box-sizing:content-box"), "{out}");
+    assert!(out.contains("padding:0"), "{out}");
+    assert!(out.contains("border:0"), "{out}");
 }
 
 /// An SVG holding several images is an illustration, not a cover wrapper.
@@ -1836,6 +1840,25 @@ fn an_svg_whose_img_a_rule_would_style_beyond_harmless_styling_is_not_unwrapped(
         // `content-box`, and with padding or a border can leave no content
         // box, so the wrapper stays.
         ("img { box-sizing: border-box !important }", false),
+        // Important padding, a border or margins beat the `<img>`'s pinned
+        // ones, and make it larger than the SVG was, for a box that hides what
+        // overflows it to cut off: the wrapper stays. None of them, important
+        // or not, is harmless.
+        (
+            "div { overflow: hidden; height: 300px } img { padding: 1em !important }",
+            false,
+        ),
+        ("img { border: 4px solid black !important }", false),
+        ("img { margin: 1em !important }", false),
+        (
+            "img { padding: 0 !important; margin: 0 !important; border: none !important }",
+            true,
+        ),
+        // Not important, they are the pinned style's to override.
+        (
+            "div { overflow: hidden; height: 300px } img { padding: 1em; border: 2px solid; margin: 1em }",
+            true,
+        ),
         (
             "img { max-width: 100%; height: auto; border: none; color: red; font-size: 2em; \
              text-align: center; page-break-inside: avoid; background: white; padding: 1em }",
