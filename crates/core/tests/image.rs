@@ -1041,3 +1041,59 @@ fn the_memory_a_webp_or_gif_needs_counts_what_its_decoder_keeps() {
     let bomb = gif_claiming((1, 1), (65535, 65535));
     assert!(process_image(&bomb, "bomb.gif", &options).is_err());
 }
+
+/// A WebP of 2 x 1 saying in an EXIF chunk that it is turned a quarter, the
+/// chunk `gap` bytes past the end of its container, where nothing names it.
+fn webp_with_exif_after(gap: usize) -> Vec<u8> {
+    use image::ImageEncoder;
+    let mut simple = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut simple)
+        .write_image(
+            &[200, 100, 50, 10, 20, 30],
+            2,
+            1,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    // A canvas of 2 x 1, with no EXIF flagged, which the decoder would
+    // otherwise insist on finding.
+    let header = [0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+    let mut body = b"WEBP".to_vec();
+    body.extend(riff_chunk(b"VP8X", &header));
+    // The image's own chunk, after RIFF, its size and WEBP.
+    body.extend_from_slice(&simple[12..]);
+    let mut webp = b"RIFF".to_vec();
+    webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    webp.extend(body);
+    webp.resize(webp.len() + gap, 0);
+    // TIFF's little-endian form: one entry, an orientation of 6.
+    let exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+    webp.extend(riff_chunk(b"EXIF", exif));
+    webp
+}
+
+/// A WebP's EXIF is looked for where its decoder looks for it: among the
+/// chunks it takes its container to hold, which it reckons to run on ten
+/// bytes past the container's end. EXIF further on does not turn the image,
+/// as zeroes standing for empty chunks lead the decoder no further; it did,
+/// and an image of 2 x 1 came out 1 x 2.
+#[test]
+fn a_webp_is_turned_only_by_exif_its_decoder_finds() {
+    use image::ImageDecoder;
+    for (gap, turned) in [(0, true), (8, true), (64, false)] {
+        let webp = webp_with_exif_after(gap);
+        let orientation = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&webp))
+            .and_then(|mut decoder| decoder.orientation())
+            .unwrap();
+        assert_eq!(
+            orientation != image::metadata::Orientation::NoTransforms,
+            turned,
+            "the decoder, {gap} bytes on"
+        );
+
+        let converted = process_image(&webp, "turned.webp", &ImageOptions::default()).unwrap();
+        let page = image::load_from_memory(&converted[0].bytes).unwrap();
+        let shape = if turned { (1, 2) } else { (2, 1) };
+        assert_eq!((page.width(), page.height()), shape, "{gap} bytes on");
+    }
+}

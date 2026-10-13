@@ -705,30 +705,50 @@ enum WebpKind {
 
 /// Where the EXIF of the WebP `reader` holds lies, as its decoder finds it:
 /// the first EXIF chunk of an extended WebP. A simple one has none.
+///
+/// The decoder walks the chunks after the extended header while one starts
+/// before where it takes the container to end: as far on from the header's
+/// end as the container's size, less its first twelve bytes. That runs past
+/// the container's true end by the header's own size, ten bytes as a rule,
+/// and EXIF past that is not found.
 fn webp_exif(reader: &mut (impl Read + Seek)) -> Option<std::ops::Range<u64>> {
     let mut riff = [0u8; 12];
     reader.read_exact(&mut riff).ok()?;
     if &riff[..4] != b"RIFF" || &riff[8..] != b"WEBP" {
         return None;
     }
-    let mut first = true;
-    loop {
-        let mut chunk = [0u8; 8];
-        reader.read_exact(&mut chunk).ok()?;
-        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        if first && &chunk[..4] != b"VP8X" {
-            return None;
-        }
-        first = false;
-        let start = reader.stream_position().ok()?;
-        if &chunk[..4] == b"EXIF" {
-            return Some(start..start + u64::from(size));
-        }
-        // Chunks are padded to an even size.
-        reader
-            .seek(SeekFrom::Current(i64::from(size) + i64::from(size & 1)))
-            .ok()?;
+    let riff_size = u32::from_le_bytes([riff[4], riff[5], riff[6], riff[7]]);
+    let (name, _, padded) = riff_chunk(reader)?;
+    if &name != b"VP8X" {
+        return None;
     }
+    let mut position = 20 + padded;
+    let end = position + u64::from(riff_size).saturating_sub(12);
+    while position < end {
+        reader.seek(SeekFrom::Start(position)).ok()?;
+        let (name, size, padded) = riff_chunk(reader)?;
+        let start = position + 8;
+        if &name == b"EXIF" {
+            return Some(start..start + size);
+        }
+        position = start + padded;
+    }
+    None
+}
+
+/// The name of the RIFF chunk `reader` is at, its size, and that size padded
+/// to an even one as the WebP decoder pads it, never past the largest a size
+/// can be.
+fn riff_chunk(reader: &mut impl Read) -> Option<([u8; 4], u64, u64)> {
+    let mut header = [0u8; 8];
+    reader.read_exact(&mut header).ok()?;
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let name = [header[0], header[1], header[2], header[3]];
+    Some((
+        name,
+        u64::from(size),
+        u64::from(size.saturating_add(size & 1)),
+    ))
 }
 
 /// How much of a WebP's EXIF is read to tell how it turns the image: the

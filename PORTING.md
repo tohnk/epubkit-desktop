@@ -622,8 +622,9 @@ aside. A larger profile, which nothing here uses, is let go of unread, and an
 image with more text than that is left as it is and counted. Decoding it
 holds the same, and that is reckoned in what it needs. A WebP's decoder is
 held to no limit, and reads the whole of its EXIF to say how it is turned, so
-that is read here instead: the first 64 KiB of it, where the turn is, and a
-WebP whose EXIF is longer and does not say within them is reckoned as
+that is read here instead, from the chunk the decoder would find, among those
+it takes the container to hold: the first 64 KiB of it, where the turn is,
+and a WebP whose EXIF is longer and does not say within them is reckoned as
 turned. Converting one reads the turn where it lies in the file. A JPEG that
 a thumbnail of a book's cover or a check of the file had copied whole,
 comments and all, before anything was set aside, is read now for a few
