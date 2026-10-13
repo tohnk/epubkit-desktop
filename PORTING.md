@@ -812,8 +812,14 @@ is if `encryption.xml` is that large, which could hide anything.
 Since no reference in such a document is rewritten, an image it might name
 keeps its name and stays as it is. The document is read as bytes, a megabyte
 at a time, for each image's file name, as it is, percent-escaped, and in
-UTF-16; a name found where it is no reference only leaves that image
-unconverted. A chapter nothing can parse is treated the same way. And as
+UTF-16; and again unescaped as a reader unescapes a reference, in the order
+it does: character references and XML's five entities, then CSS's escapes,
+then percent-escapes, so that `%61rt.png`, `&#97;rt.png` and
+`url(\61 rt.png)` all name `art.png`. Any other entity would take HTML's
+table, and stands for a letter beyond ASCII, so a document with one is taken
+to name every image whose name has such a letter. A name found where it is
+no reference only leaves that image unconverted. A chapter nothing can parse
+is treated the same way. And as
 what such a document's markup uses cannot be known, no CSS rule is removed
 as unused in a book that has one.
 
