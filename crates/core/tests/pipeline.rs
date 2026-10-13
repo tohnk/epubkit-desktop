@@ -2744,3 +2744,30 @@ fn an_unlisted_stylesheet_that_names_an_image_is_not_broken() {
         assert_eq!(report.images_unconverted, 1);
     }
 }
+
+/// An unlisted stylesheet linked by a percent-encoded href — a `#` in its
+/// name written `%23` — is found and rewritten, so the image it names still
+/// leads to it once converted.
+#[test]
+fn an_unlisted_stylesheet_linked_by_an_encoded_href_is_rewritten() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let files = [
+        ("images/art.png", "image/png", png),
+        (
+            "styles/#extra.css",
+            UNDECLARED,
+            br#".x { background: url("../images/art.png") }"#.to_vec(),
+        ),
+    ];
+    let head = r#"<link rel="stylesheet" type="text/css" href="../styles/%23extra.css"/>"#;
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        head,
+        "<p>Text.</p>",
+        &ProcessingOptions::default(),
+    );
+    assert_eq!(report.images_converted, 1);
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/#extra.css")).unwrap();
+    assert!(css.contains("art.jpg") && !css.contains("art.png"), "{css}");
+}

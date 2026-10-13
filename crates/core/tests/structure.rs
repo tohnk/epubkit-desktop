@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
-    fix_toc, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs, update_css_references,
-    update_opf, update_opf_remove_fonts, update_xhtml_references, Renames, ReshapedPages,
-    TocOutcome,
+    fix_toc, manifest_items, reachable_stylesheets, resolve_href, show_reshaped_pages, spine_hrefs,
+    update_css_references, update_opf, update_opf_remove_fonts, update_xhtml_references, Renames,
+    ReshapedPages, TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -1952,4 +1952,39 @@ fn an_svg_with_no_view_box_that_its_image_fills_is_unwrapped() {
             "<svg {svg}><image {image}/>, {css}"
         );
     }
+}
+
+/// A stylesheet a document reaches is found by its name as written: a `%23`
+/// in a link's href is a `#` in the file's name, not the start of a fragment,
+/// and a `%2520` is a literal `%20`. Each is decoded once, as a reader decodes
+/// it, whether a `<link>` names it or an `<?xml-stylesheet?>` instruction.
+#[test]
+fn stylesheets_a_document_reaches_are_found_by_their_encoded_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let hash = put(root, "styles/#sheet.css", "p { color: red }");
+    let literal = put(root, "styles/literal%20.css", "p { color: red }");
+    let instruction = put(root, "styles/pi#.css", "p { color: red }");
+    let chapter = put(
+        root,
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="../styles/pi%23.css" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>
+<link rel="stylesheet" type="text/css" href="../styles/%23sheet.css"/>
+<link rel="stylesheet" type="text/css" href="../styles/literal%2520.css"/>
+</head><body><p>Text.</p></body></html>
+"#,
+    );
+
+    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    for sheet in [&hash, &literal, &instruction] {
+        assert!(
+            reachable.readable.contains(sheet),
+            "{} not found among {:?}",
+            sheet.display(),
+            reachable.readable
+        );
+    }
+    assert!(!reachable.too_large);
 }

@@ -891,7 +891,7 @@ as unused in a book that has one.
 A stylesheet counts as a document here even where the manifest leaves it
 out, as long as a chapter or SVG document reaches it: a `<link>`, an
 `<?xml-stylesheet?>` or an `@import` leads to it, to any depth, inside the
-book. Its references are rewritten with the manifest's stylesheets', so an
+book, its reference percent-decoded once, as a reader decodes it. Its references are rewritten with the manifest's stylesheets', so an
 image it names still leads to it once converted; and one too large to read
 leaves every image in the book as it is, as any document left unread does. A
 well-formed book lists all its stylesheets, so this changes nothing there; a

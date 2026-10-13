@@ -266,8 +266,10 @@ pub fn reachable_stylesheets(
             {
                 continue;
             }
+            // `target_of` decodes the reference itself, once, as a reader
+            // does: a `%23` there is a `#` in the name, not a fragment.
             if let Some(href) = node.get_attribute_no_ns("href") {
-                queue.extend(target_of(root, base, &decode(&href)));
+                queue.extend(target_of(root, base, &href));
             }
         }
         // Those an `<?xml-stylesheet?>` instruction names.
@@ -278,7 +280,7 @@ pub fn reachable_stylesheets(
                 .is_none_or(|t| t.eq_ignore_ascii_case("text/css"));
             if is_css {
                 if let Some(href) = attributes.get("href") {
-                    queue.extend(target_of(root, base, &decode(href)));
+                    queue.extend(target_of(root, base, href));
                 }
             }
         }
