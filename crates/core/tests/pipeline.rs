@@ -1188,52 +1188,63 @@ fn a_spread_the_manifest_leaves_out_has_both_pages_declared() {
 
 /// A document too large to read whole, a chapter of more than 32 MiB here,
 /// is left exactly as it is, and counted: parsing one takes some fifteen
-/// times its size. So is every image it might name, which would otherwise
-/// be converted and renamed out from under it, a name written with a
-/// percent-escape included, or with a letter escaped as a reader unescapes
-/// it; one only the rest of the book names is converted as usual.
+/// times its size. Which images it names cannot be known without reading it
+/// as a reader does, escapes and all, so every image in the book is left as
+/// it is, under its own name: one it names with an entity only HTML defines,
+/// with a character reference padded out with zeros, or with a CSS escape
+/// that carries the name on to the next line, and one only the rest of the
+/// book names.
 #[test]
-fn a_document_too_large_to_read_is_left_as_it_is_with_the_images_it_names() {
+fn a_document_too_large_to_read_leaves_every_image_as_it_is() {
     let filler =
         "<p>The long afternoon light was failing, and she said it would be well enough.</p>\n";
     let big = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Big</title></head><body>
-<p><img src="../images/my%20plate.png" alt=""/></p>
-<p><img src="../images/%61rt.png" alt=""/><img src="../images/&#98;at.png" alt=""/></p>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Big</title>
+<style>p {{ background: url("../images/sp\
+lit.png") }}</style></head><body>
+<p><img src="../images/art&period;png" alt=""/></p>
+<p><img src="../images/&#00000000000000000000000000000000000000000098;at.png" alt=""/></p>
 {}</body></html>
 "#,
         filler.repeat(32 * 1024 * 1024 / filler.len() + 1)
     );
     let png = solid(image::ImageFormat::Png, 0);
-    let files = [
-        ("images/my plate.png", "image/png", png.clone()),
-        ("images/art.png", "image/png", png.clone()),
-        ("images/bat.png", "image/png", png.clone()),
-        ("images/other.png", "image/png", png),
-        (
-            "text/big.xhtml",
-            "application/xhtml+xml",
-            big.clone().into_bytes(),
-        ),
-    ];
-    let body = r#"<p><img src="../images/my%20plate.png" alt=""/></p><p><img src="../images/other.png" alt=""/></p>"#;
+    let images = ["art.png", "bat.png", "split.png", "other.png"];
+    let hrefs = images.map(|name| format!("images/{name}"));
+    let mut files: Vec<(&str, &str, Vec<u8>)> = hrefs
+        .iter()
+        .map(|href| (href.as_str(), "image/png", png.clone()))
+        .collect();
+    files.push((
+        "text/big.xhtml",
+        "application/xhtml+xml",
+        big.clone().into_bytes(),
+    ));
+    let body = r#"<p><img src="../images/other.png" alt=""/></p>"#;
     let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
 
     assert!(
         fs::read(work.path().join("OEBPS/text/big.xhtml")).unwrap() == big.as_bytes(),
         "the large chapter changed"
     );
-    for kept in ["my plate.png", "art.png", "bat.png"] {
+    for kept in images {
         let path = work.path().join("OEBPS/images").join(kept);
-        assert!(path.is_file(), "{kept} is gone");
+        assert!(
+            fs::read(&path).is_ok_and(|bytes| bytes == png),
+            "{kept} changed"
+        );
     }
-    assert_eq!(
-        chapter_sources(work.path()),
-        ["../images/my%20plate.png", "../images/other.jpg"]
-    );
+    assert_eq!(chapter_sources(work.path()), ["../images/other.png"]);
     assert_eq!(report.documents_too_large, 1);
-    assert_eq!((report.images_converted, report.images_unconverted), (1, 3));
+    assert_eq!((report.images_converted, report.images_unconverted), (0, 4));
+    assert!(
+        report
+            .image_details
+            .contains(&"other.png: kept as it is (a document left as it is may name it)".into()),
+        "{:?}",
+        report.image_details
+    );
     let summary = report.summary();
     assert!(
         summary.contains("Left 1 document too large to process as it was"),
@@ -1621,34 +1632,69 @@ fn a_stylesheet_in_a_legacy_encoding_does_not_sink_the_book() {
 }
 
 /// A chapter nothing can parse, such as an empty file, is left as it was
-/// rather than failing the whole book, and the report says so.
+/// rather than failing the whole book, and the report says so. A blank one,
+/// as a byte order mark or whitespace, names no image either, so the rest of
+/// the book is done as usual.
 #[test]
 fn an_unreadable_chapter_is_left_alone_and_reported() {
+    for blank in ["", "   \n", "\u{feff}"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let output = dir.path().join("out.epub");
+        demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", blank.as_bytes())]);
+
+        let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
+            .expect("one chapter must not sink the book");
+
+        assert_eq!(report.documents_unreadable, 1, "{blank:?}");
+        assert!(
+            report.summary().contains("1 unreadable document"),
+            "{}",
+            report.summary()
+        );
+
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
+        assert_eq!(
+            fs::read(work.path().join("OEBPS/chapter2.xhtml")).unwrap(),
+            blank.as_bytes()
+        );
+        let one = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+        assert!(
+            one.contains("images/plate.jpg"),
+            "the rest of the book is done ({blank:?}): {one}"
+        );
+    }
+}
+
+/// Which images a chapter nothing can parse names, one whose comment never
+/// ends here, cannot be known, as with a document too large to read: every
+/// image in the book is left as it is, under its own name.
+#[test]
+fn a_chapter_nothing_can_parse_leaves_every_image_as_it_is() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
-    demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", b"")]);
+    let broken = b"<!-- a comment that never ends\n<html><body><p>A plate.</p></body></html>\n";
+    demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", broken)]);
 
     let report = process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {})
         .expect("one chapter must not sink the book");
 
     assert_eq!(report.documents_unreadable, 1);
-    assert!(
-        report.summary().contains("1 unreadable document"),
-        "{}",
-        report.summary()
-    );
-
+    assert_eq!((report.images_converted, report.images_unconverted), (0, 2));
     let work = tempfile::tempdir().unwrap();
     package::extract_epub(&output, work.path()).unwrap();
-    assert!(fs::read(work.path().join("OEBPS/chapter2.xhtml"))
-        .unwrap()
-        .is_empty());
-    let one = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
-    assert!(
-        one.contains("images/plate.jpg"),
-        "the rest of the book is done: {one}"
+    assert_eq!(
+        fs::read(work.path().join("OEBPS/chapter2.xhtml")).unwrap(),
+        broken
     );
+    for image in ["cover.png", "plate.png"] {
+        let path = work.path().join("OEBPS/images").join(image);
+        assert!(path.is_file(), "{image} is gone");
+    }
+    let one = fs::read_to_string(work.path().join("OEBPS/chapter1.xhtml")).unwrap();
+    assert!(one.contains("images/plate.png"), "{one}");
 }
 
 // ------------------------------------------------------------ output names
@@ -2435,8 +2481,8 @@ fn light_novel_mode_reads_the_stylesheets_a_chapter_links() {
     );
 }
 
-/// A stylesheet too large to read could frame anything, and the images of a
-/// chapter it styles keep their shape.
+/// A stylesheet too large to read could frame anything, or name any image,
+/// so in a book with one every image is left as it is, which keeps its shape.
 #[test]
 fn light_novel_mode_keeps_the_shape_of_an_image_a_stylesheet_too_large_to_read_styles() {
     let rule = ".other { color: black }\n";
@@ -2450,8 +2496,10 @@ fn light_novel_mode_keeps_the_shape_of_an_image_a_stylesheet_too_large_to_read_s
         r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#,
         r#"<div><img src="../images/plate.png" alt=""/></div>"#,
     );
-    assert_eq!(chapter_sources(work.path()), ["../images/plate.jpg"]);
-    assert_shape_kept(work.path(), "OEBPS/images/plate.jpg");
+    assert_eq!(chapter_sources(work.path()), ["../images/plate.png"]);
+    assert!(
+        fs::read(work.path().join("OEBPS/images/plate.png")).is_ok_and(|bytes| bytes == spread())
+    );
 }
 
 // --------------------------------------------- images converted in parallel

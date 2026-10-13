@@ -334,9 +334,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(12, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
-    // What the run leaves exactly as it is: chapters nothing can parse, and
-    // documents too large to read whole.
-    let mut left_alone: Vec<PathBuf> = content.too_large.clone();
+    // Whether the run leaves a document exactly as it is that may name an
+    // image: one too large to read whole, or one nothing can parse that is
+    // not blank.
+    let mut left_naming = !content.too_large.is_empty();
     report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
         if !path.is_file() {
@@ -346,7 +347,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         let Ok(repaired) = backend.repair(&bytes) else {
             report.documents_unreadable += 1;
-            left_alone.push(path.clone());
+            left_naming |= !is_blank(&bytes);
             continue;
         };
         if repaired.recovered {
@@ -380,10 +381,16 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         .chain(&undeclared)
         .cloned()
         .collect();
-    // An image a document left as it is may name keeps its name, so the
-    // reference there still leads to it, and stays as it is.
-    let named_where_left = structure::images_named_in(&left_alone, &rasters)?;
-    rasters.retain(|path| !named_where_left.contains(path));
+    // Which images a document left as it is names cannot be known without
+    // reading it as a reader does, escapes and all, and an image it names
+    // must keep its name, so the reference there still leads to it. So where
+    // there is one, every image keeps its name, and stays as it is.
+    let mut kept: Vec<PathBuf> = if left_naming {
+        let rasters = std::mem::take(&mut rasters);
+        rasters.into_iter().filter(|path| path.is_file()).collect()
+    } else {
+        Vec::new()
+    };
     let converted = convert_images(
         &rasters,
         work_dir,
@@ -393,11 +400,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         &mut report,
         &mut progress,
     )?;
-    report.images_total += named_where_left.len();
-    report.images_unconverted += named_where_left.len();
-    let mut kept: Vec<&PathBuf> = named_where_left.iter().collect();
+    report.images_total += kept.len();
+    report.images_unconverted += kept.len();
     kept.sort();
-    for path in kept {
+    for path in &kept {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         report.image_details.push(format!(
             "{name}: kept as it is (a document left as it is may name it)"
@@ -584,6 +590,18 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 }
 
 // ---------------------------------------------------------------- internals
+
+/// Whether a document, as `bytes`, is blank: nothing but whitespace, in UTF-8
+/// or UTF-16, after a byte order mark if it has one. A blank one names no
+/// image.
+fn is_blank(bytes: &[u8]) -> bool {
+    let text = [&b"\xEF\xBB\xBF"[..], b"\xFF\xFE", b"\xFE\xFF"]
+        .iter()
+        .find_map(|mark| bytes.strip_prefix(*mark))
+        .unwrap_or(bytes);
+    text.iter()
+        .all(|&byte| byte.is_ascii_whitespace() || byte == 0)
+}
 
 /// The SVG documents in a book that are there to read.
 fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Path> {

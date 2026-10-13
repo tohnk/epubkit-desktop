@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
-    fix_toc, images_named_in, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs,
-    update_css_references, update_opf, update_opf_remove_fonts, update_xhtml_references, Renames,
-    ReshapedPages, TocOutcome,
+    fix_toc, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs, update_css_references,
+    update_opf, update_opf_remove_fonts, update_xhtml_references, Renames, ReshapedPages,
+    TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -1847,74 +1847,4 @@ fn an_svg_with_no_view_box_that_its_image_fills_is_unwrapped() {
             "<svg {svg}><image {image}/>, {css}"
         );
     }
-}
-
-/// A document the run leaves as it is may name an image in any spelling a
-/// reader unescapes: a character reference, decimal or hex, one of XML's five
-/// entities, a CSS escape, a percent-escape, or one of those spelt with
-/// another, a percent sign as a character reference say; and in UTF-16 as
-/// well as UTF-8, and across where the document is read a piece at a time.
-/// Each such image is found. An entity of another name stands for a letter
-/// beyond ASCII, and might spell any image's name that has one.
-#[test]
-fn images_a_document_names_in_escaped_spellings_are_found() {
-    let dir = tempfile::tempdir().unwrap();
-    let images: Vec<std::path::PathBuf> = [
-        "art.png",
-        "bat.png",
-        "cat.png",
-        "dot.png",
-        "eel.png",
-        "fig.png",
-        "gnu.png",
-        "utf.png",
-        "café.png",
-        "edge.png",
-        "plain.png",
-    ]
-    .iter()
-    .map(|name| dir.path().join("images").join(name))
-    .collect();
-
-    let escaped = put(
-        dir.path(),
-        "escaped.xhtml",
-        r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
-<img src="images/%61rt.png"/><img src="images/&#98;at.png"/>
-<p style="background: url(images/\63 at.png)">x</p>
-<img src="images/&#x25;64ot.png"/><img src="images/e&#X65;l.png"/>
-<img src="images/fig.png"/><img src="images/g&amp;#110;u.png"/>
-<img src="images/caf&eacute;.png"/>
-</body></html>"#,
-    );
-    // An escape where one piece read ends and the next begins.
-    let mut split = vec![b' '; (1 << 20) - 2];
-    split.extend_from_slice(b"%65dge.png");
-    let split = put(dir.path(), "split.xhtml", split);
-    let mut utf16 = vec![0xFF, 0xFE];
-    for unit in r#"<img src="images/%75tf.png"/>"#.encode_utf16() {
-        utf16.extend_from_slice(&unit.to_le_bytes());
-    }
-    let utf16 = put(dir.path(), "utf16.xhtml", utf16);
-
-    let named = images_named_in(&[escaped, split, utf16], &images).unwrap();
-    let mut found: Vec<String> = named
-        .iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
-        .collect();
-    found.sort();
-    assert_eq!(
-        found,
-        [
-            "art.png",
-            "bat.png",
-            "café.png",
-            "cat.png",
-            "dot.png",
-            "edge.png",
-            "eel.png",
-            "fig.png",
-            "utf.png"
-        ]
-    );
 }

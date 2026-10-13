@@ -1096,7 +1096,6 @@ dependencies = [
 name = "epubkit-core"
 version = "0.1.0"
 dependencies = [
- "aho-corasick",
  "cssparser 0.37.0",
  "dirs",
  "encoding_rs",
