@@ -1321,47 +1321,70 @@ fn pseudo_attributes(data: &str) -> HashMap<String, String> {
 
 /// `text`, a pseudo-attribute's value, with its references made what they
 /// stand for, as XML has a reader decode them: character references,
-/// decimal or hex, and the five entities XML predefines. Each is decoded
-/// once, in a single pass, so `&#38;lt;` is `&lt;`, not `<`. A reference that
-/// does not read, or stands for no character, is left as it is.
+/// decimal or hex, however many zeros lead their digits, and the five
+/// entities XML predefines. Each is decoded once, in a single pass, so
+/// `&#38;lt;` is `&lt;`, not `<`. A reference that does not read, or stands
+/// for no character, is left as it is.
+///
+/// The text is read forward once: from one `&` to the next, each looked at
+/// only as far as the reference it might start, so a value of nothing but
+/// ampersands, or of digits no `;` ends, takes time that grows with it.
 fn xml_unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('&') {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 1..];
-        let decoded = after.find(';').and_then(|end| {
-            let name = &after[..end];
-            let character = match name {
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                "amp" => Some('&'),
-                _ => {
-                    let number = name.strip_prefix('#')?;
-                    let value = match number.strip_prefix(['x', 'X']) {
-                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                        None => number.parse::<u32>().ok()?,
-                    };
-                    char::from_u32(value)
-                }
-            }?;
-            Some((character, end))
-        });
-        match decoded {
-            Some((character, end)) => {
+    // What is copied out already, and where the next `&` is looked for from.
+    let (mut copied, mut at) = (0, 0);
+    while let Some(offset) = text[at..].find('&') {
+        let amp = at + offset;
+        match reference_at(&text.as_bytes()[amp + 1..]) {
+            Some((character, length)) => {
+                out.push_str(&text[copied..amp]);
                 out.push(character);
-                rest = &after[end + 1..];
+                at = amp + 1 + length;
+                copied = at;
             }
-            None => {
-                out.push('&');
-                rest = after;
-            }
+            None => at = amp + 1,
         }
     }
-    out.push_str(rest);
+    out.push_str(&text[copied..]);
     out
+}
+
+/// The character the reference at the start of `rest`, what follows an `&`,
+/// stands for, and how many bytes it takes with its `;`: one of XML's five
+/// entities, or `#` and decimal digits, or `#x` and hex digits, then `;`.
+fn reference_at(rest: &[u8]) -> Option<(char, usize)> {
+    for (name, character) in [
+        ("lt;", '<'),
+        ("gt;", '>'),
+        ("amp;", '&'),
+        ("quot;", '"'),
+        ("apos;", '\''),
+    ] {
+        if rest.starts_with(name.as_bytes()) {
+            return Some((character, name.len()));
+        }
+    }
+    let number = rest.strip_prefix(b"#")?;
+    let (first, radix) = match number.first() {
+        Some(b'x' | b'X') => (1, 16),
+        _ => (0, 10),
+    };
+    // The digits, read once; a value past any character's saturates, and
+    // stands for none.
+    let mut value = 0u32;
+    let mut end = first;
+    while let Some(digit) = number
+        .get(end)
+        .and_then(|&byte| char::from(byte).to_digit(radix))
+    {
+        value = value.saturating_mul(radix).saturating_add(digit);
+        end += 1;
+    }
+    if end == first || number.get(end) != Some(&b';') {
+        return None;
+    }
+    // The `#`, the digits and what leads them, and the `;`.
+    Some((char::from_u32(value)?, 1 + end + 1))
 }
 
 /// Whether a stylesheet a chapter names applies where the book is read, by
@@ -2541,6 +2564,27 @@ fn escape_xml_attribute(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pseudo-attribute's references are decoded as XML has a reader decode
+    /// them, each once; what does not read as one is left as it is.
+    #[test]
+    fn pseudo_attribute_references_are_decoded_once() {
+        for (text, decoded) in [
+            ("a&lt;b&gt;c", "a<b>c"),
+            ("&quot;&apos;&amp;", "\"'&"),
+            ("&#104;&#x68;&#X68;", "hhh"),
+            ("&#0000000104;", "h"),
+            ("&#38;lt;", "&lt;"),
+            ("&&amp;&", "&&&"),
+            ("&#;&#x;&#12&unknown;", "&#;&#x;&#12&unknown;"),
+            ("&#1114112;&#55296;&#xD800;", "&#1114112;&#55296;&#xD800;"),
+            ("&#99999999999999999999;", "&#99999999999999999999;"),
+            ("plain", "plain"),
+            ("é&#233;", "éé"),
+        ] {
+            assert_eq!(xml_unescape(text), decoded, "{text}");
+        }
+    }
 
     /// A book in a temporary directory, holding `files`, each a path and
     /// its contents, and a chapter, `text/chapter.xhtml`, with `prolog`

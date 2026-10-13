@@ -919,7 +919,8 @@ out, as long as a chapter or SVG document reaches it: a `<link>`, an
 stylesheet leads to it, to any depth, inside the book, its reference
 percent-decoded once, as a reader decodes it. An instruction's pseudo-
 attributes have their character references, decimal or hex, and XML's five
-entities decoded first, in one pass, as XML has a reader decode them, so
+entities decoded first, in one pass that reads them forward once, as XML has
+a reader decode them, so
 `href="s&#104;eet.css"` names `sheet.css` — for the stylesheets the cascade
 reads as for these. Its references are rewritten with the manifest's stylesheets', so an
 image it names still leads to it once converted; and one too large to read

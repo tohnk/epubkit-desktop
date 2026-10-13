@@ -2044,7 +2044,8 @@ fn a_stylesheet_a_style_element_imports_is_reached() {
 
 /// An `<?xml-stylesheet?>` href may hold character references, decimal or
 /// hex, which a reader decodes before it loads the stylesheet: `s&#104;eet.css`
-/// is `sheet.css`. And a reference is decoded once: `&#38;lt;` is `&lt;`.
+/// is `sheet.css`, however many zeros lead its digits. And a reference is
+/// decoded once: `&#38;lt;` is `&lt;`.
 #[test]
 fn a_stylesheet_instruction_href_with_character_references_is_reached() {
     let dir = tempfile::tempdir().unwrap();
@@ -2052,6 +2053,7 @@ fn a_stylesheet_instruction_href_with_character_references_is_reached() {
     let decimal = put(root, "styles/sheet.css", "p { color: red }");
     let hex = put(root, "styles/hexed.css", "p { color: red }");
     let once = put(root, "styles/a&lt;b.css", "p { color: red }");
+    let zeros = put(root, "styles/zeros.css", "p { color: red }");
     let chapter = put(
         root,
         "text/chapter.xhtml",
@@ -2059,13 +2061,14 @@ fn a_stylesheet_instruction_href_with_character_references_is_reached() {
 <?xml-stylesheet href="../styles/s&#104;eet.css" type="text/css"?>
 <?xml-stylesheet href="../styles/&#x68;exed.css" type="text/css"?>
 <?xml-stylesheet href="../styles/a&#38;lt;b.css" type="text/css"?>
+<?xml-stylesheet href="../styles/zero&#00000000000000115;.css" type="text/css"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>
 <body><p>Text.</p></body></html>
 "#,
     );
 
     let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
-    for sheet in [&decimal, &hex, &once] {
+    for sheet in [&decimal, &hex, &once, &zeros] {
         assert!(
             reachable.readable.contains(sheet),
             "{} not found among {:?}",
@@ -2106,4 +2109,34 @@ fn a_stylesheet_an_instruction_names_by_reference_styles_the_replacement() {
     assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
     let after = fs::read_to_string(&page).unwrap();
     assert!(after.contains(r#"class="cover""#), "{after}");
+}
+
+/// An instruction's pseudo-attributes are decoded in time that grows with
+/// them: each `&` that starts no reference is passed over without searching
+/// all that follows it for a `;`. A value of half a million ampersands took
+/// seconds, in time that grew as their square, before any image was touched.
+#[test]
+fn an_instruction_full_of_ampersands_is_read_in_linear_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let ampersands = "&".repeat(512_000);
+    let chapter = put(
+        &root,
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="{ampersands}" type="text/css"?>
+<?xml-stylesheet href="{ampersands};" type="text/css"?>
+<?xml-stylesheet href="{digits}" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>
+<body><p>Text.</p></body></html>
+"#,
+            digits = "&#1".repeat(200_000),
+        ),
+    );
+
+    let reachable = common::finishes_within(Duration::from_secs(5), move || {
+        reachable_stylesheets(&root, &root, &[chapter.as_path()]).unwrap()
+    });
+    assert!(reachable.readable.is_empty());
 }
