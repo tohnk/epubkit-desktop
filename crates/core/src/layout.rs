@@ -1126,12 +1126,15 @@ enum Property {
     Opacity,
     MixBlendMode,
     BorderRadius,
+    /// Whether a `filter` draws it through an SVG filter, whose region can
+    /// show only part of it, as CSS's own filter functions never do.
+    FilterReference,
     /// Whether it is shown at all: `visibility`, and `display: none`.
     Visibility,
     Display,
 }
 
-const PROPERTIES: [Property; 25] = [
+const PROPERTIES: [Property; 26] = [
     Property::Height,
     Property::MaxHeight,
     Property::Width,
@@ -1155,6 +1158,7 @@ const PROPERTIES: [Property; 25] = [
     Property::Opacity,
     Property::MixBlendMode,
     Property::BorderRadius,
+    Property::FilterReference,
     Property::Visibility,
     Property::Display,
 ];
@@ -1171,11 +1175,12 @@ const TURNING: [Property; 4] = [
 /// a path: an image split into pages under one would show other parts of
 /// itself, or be cut short where it was whole. Rounded corners clip too, an
 /// image's own, and those of a box that hides what overflows it.
-const CLIPPING: [Property; 4] = [
+const CLIPPING: [Property; 5] = [
     Property::ClipPath,
     Property::Clip,
     Property::Mask,
     Property::OffsetPath,
+    Property::FilterReference,
 ];
 
 /// The properties that draw a box otherwise than as it is: turned or slid,
@@ -1347,9 +1352,13 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
         "clip-path" | "-webkit-clip-path" => (&[ClipPath], false),
         "clip" => (&[Clip], false),
         // The shorthand sets the image the mask is made of, as does the
-        // longhand.
+        // longhand. A mask over the border is a mask beside that one.
         "mask" | "-webkit-mask" | "mask-image" | "-webkit-mask-image" => (&[Mask], false),
-        "filter" | "-webkit-filter" => (&[Filter], false),
+        "mask-border"
+        | "mask-border-source"
+        | "-webkit-mask-box-image"
+        | "-webkit-mask-box-image-source" => (&[Mask], true),
+        "filter" | "-webkit-filter" => (&[Filter, FilterReference], false),
         "opacity" => (&[Opacity], false),
         "mix-blend-mode" => (&[MixBlendMode], false),
         "border-radius" | "-webkit-border-radius" => (&[BorderRadius], false),
@@ -1506,6 +1515,13 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
                 Value::Initial
             } else {
                 Value::Set
+            }
+        }
+        Property::FilterReference => {
+            if said(&["url("]) {
+                Value::Set
+            } else {
+                Value::Initial
             }
         }
         Property::Visibility => {

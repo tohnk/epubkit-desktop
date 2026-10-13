@@ -684,10 +684,13 @@ after. A height that is a percentage is one where it holds: where the box it
 is a share of has a height set, or is the page, through every box between.
 A `transform`, or a `rotate`, `scale` or `translate`, which apply beside it,
 or `position: absolute` or `fixed`, on the box or the image turned the pages
-again or laid them over each other. A `clip-path`, `clip`, `mask` or
-`offset-path` on either showed only part of it, which each page would show
-again of itself, as would rounded corners on the image, or on a box that
-hides what overflows it. And the image's own
+again or laid them over each other. A `clip-path`, `clip`, `mask`, a mask
+over the border, or `offset-path` on either showed only part of it, which
+each page would show again of itself, as would a `filter` that draws it
+through an SVG filter, whose region can crop it, and rounded corners on the
+image, or on a box that hides what overflows it. CSS's own filter functions,
+`blur()` or `grayscale()` say, show all of it, and its pages each all of
+theirs. And the image's own
 height, which each page keeps, gave every page its size, as a screen high
 with a set width gave them its proportions. The page's own boxes, `<html>`
 and `<body>`, frame nothing by their height alone, as what they hold runs on

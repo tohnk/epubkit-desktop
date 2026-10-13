@@ -1444,36 +1444,51 @@ fn an_svg_with_no_view_box_around_a_spread_becomes_one_image_per_page() {
 /// around it, shows only part of itself where it is. Its pages would each
 /// keep that, and each show another part, or a box around them clip them
 /// where it clipped it: a spread clipped to its right page was split into
-/// two pages each clipped to its right half. Such an image keeps its shape.
-/// One that is only faded shows all of itself, as its pages would.
+/// two pages each clipped to its right half. Such an image keeps its shape:
+/// so does one drawn through an SVG filter, whose region can crop it, and
+/// one with a mask over its border. One that is only faded, or filtered by
+/// CSS's own functions, shows all of itself, as its pages would.
 #[test]
 fn light_novel_mode_keeps_whole_an_image_something_clips() {
-    let css = ".masked { mask-image: linear-gradient(black, transparent) } .faded { opacity: .9 }";
+    let css = r##".masked { mask-image: linear-gradient(black, transparent) }
+.bordered { -webkit-mask-box-image: url(mask.png) 30 }
+.cropped { -webkit-filter: url("#crop") }
+.faded { opacity: .9 }
+.grey { filter: grayscale(1) blur(1px) }"##;
     let files = [
         ("images/spread.png", "image/png", spread()),
         ("styles/main.css", "text/css", css.as_bytes().to_vec()),
     ];
     let head = r#"<link rel="stylesheet" type="text/css" href="../styles/main.css"/>"#;
+    // A filter whose region is the left half of what it draws.
+    let crop = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><filter id="crop" x="0" y="0" width="0.5" height="1"><feOffset/></filter></svg>"#;
     for body in [
         r#"<p><img style="clip-path: inset(0 0 0 50%)" src="../images/spread.png" alt=""/></p>"#,
         r#"<div style="clip-path: inset(0 0 0 50%)"><p><img src="../images/spread.png" alt=""/></p></div>"#,
         r#"<p><img class="masked" src="../images/spread.png" alt=""/></p>"#,
         r#"<div style="border-radius: 2em; overflow: hidden"><img src="../images/spread.png" alt=""/></div>"#,
+        r#"<p><img style="filter: url(#crop)" src="../images/spread.png" alt=""/></p>"#,
+        r#"<div style="filter: url(#crop)"><p><img src="../images/spread.png" alt=""/></p></div>"#,
+        r#"<p><img class="cropped" src="../images/spread.png" alt=""/></p>"#,
+        r#"<p><img class="bordered" src="../images/spread.png" alt=""/></p>"#,
     ] {
-        let work = light_novel_book(&files, "", head, body);
+        let work = light_novel_book(&files, "", head, &format!("{crop}{body}"));
         assert_shape_kept(work.path(), "OEBPS/images/spread.jpg");
     }
 
-    let work = light_novel_book(
-        &files,
-        "",
-        head,
-        r#"<p><img class="faded" src="../images/spread.png" alt=""/></p>"#,
-    );
-    assert_eq!(
-        chapter_sources(work.path()),
-        ["../images/spread_part1.jpg", "../images/spread_part2.jpg"]
-    );
+    for class in ["faded", "grey"] {
+        let work = light_novel_book(
+            &files,
+            "",
+            head,
+            &format!(r#"<p><img class="{class}" src="../images/spread.png" alt=""/></p>"#),
+        );
+        assert_eq!(
+            chapter_sources(work.path()),
+            ["../images/spread_part1.jpg", "../images/spread_part2.jpg"],
+            "{class}"
+        );
+    }
 }
 
 /// A wrapper that draws its spread otherwise than an `<img>` would, clipped
