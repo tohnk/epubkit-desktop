@@ -386,7 +386,97 @@ fn a_tiffs_directory_is_read_without_its_decoder() {
     assert!(telling <= HEADER_MEMORY as usize, "telling held {telling}");
 }
 
-/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
+/// An uncompressed big-endian RGB TIFF of `width` x `height`, sixteen bits a
+/// sample, in one strip.
+fn tiff_be_rgb16(width: u32, height: u32) -> Vec<u8> {
+    let short = |v: u16| {
+        let b = v.to_be_bytes();
+        [b[0], b[1], 0, 0]
+    };
+    let long = |v: u32| v.to_be_bytes();
+    // The header, then the directory of ten entries, then the three
+    // BitsPerSample values, then the pixels.
+    let bits_at = 8 + 2 + 10 * 12 + 4;
+    let data_at = bits_at + 6;
+    let entries: [(u16, u16, u32, [u8; 4]); 10] = [
+        (256, 4, 1, long(width)),
+        (257, 4, 1, long(height)),
+        (258, 3, 3, long(bits_at)),
+        (259, 3, 1, short(1)),
+        (262, 3, 1, short(2)),
+        (273, 4, 1, long(data_at)),
+        (277, 3, 1, short(3)),
+        (278, 4, 1, long(height)),
+        (279, 4, 1, long(width * height * 6)),
+        (284, 3, 1, short(1)),
+    ];
+    let mut tiff = b"MM".to_vec();
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (tag, kind, count, value) in entries {
+        tiff.extend_from_slice(&tag.to_be_bytes());
+        tiff.extend_from_slice(&kind.to_be_bytes());
+        tiff.extend_from_slice(&count.to_be_bytes());
+        tiff.extend_from_slice(&value);
+    }
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for _ in 0..3 {
+        tiff.extend_from_slice(&16u16.to_be_bytes());
+    }
+    tiff.resize(tiff.len() + (width * height * 6) as usize, 0x55);
+    tiff
+}
+
+/// A TIFF of `width` x `height` in floating-point RGB, or RGBA.
+fn tiff_float(width: u32, height: u32, alpha: bool) -> Vec<u8> {
+    let image = if alpha {
+        image::DynamicImage::ImageRgba32F(image::Rgba32FImage::from_pixel(
+            width,
+            height,
+            image::Rgba([0.3, 0.5, 0.7, 0.9]),
+        ))
+    } else {
+        image::DynamicImage::ImageRgb32F(image::Rgb32FImage::from_pixel(
+            width,
+            height,
+            image::Rgb([0.3, 0.5, 0.7]),
+        ))
+    };
+    let mut out = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Tiff)
+        .unwrap();
+    out
+}
+
+/// A TIFF is reckoned at the depth its decoder decodes it to. Its directory's
+/// entry counts are of 32 bits, and a big-endian one's sixteen-bit RGB was
+/// read as eight-bit, its count taken from the wrong half: one of 4000 x 3000
+/// held 211 MiB where 173 were set aside. And floating-point RGB and RGBA,
+/// which the decoder takes at 32 bits a sample, were reckoned at sixteen: 119
+/// MiB held where 103 were set aside, and 141 where 127 were.
+#[test]
+fn a_deep_tiff_is_reckoned_at_its_depth() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for (name, bytes) in [
+        ("big-endian.tiff", tiff_be_rgb16(4000, 3000)),
+        ("float.tiff", tiff_float(2000, 1500, false)),
+        ("float-alpha.tiff", tiff_float(2000, 1500, true)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let needed = memory_needed(&path, &options);
+        let (converted, peak) = peak_of(|| process_image(&bytes, name, &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (bytes.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+    }
+}
+
+/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
 /// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
 /// held more than was set aside.
 #[test]

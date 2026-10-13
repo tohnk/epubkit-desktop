@@ -105,3 +105,75 @@ fn a_file_that_cannot_be_read_is_an_error() {
         Converted::Done(_)
     ));
 }
+
+/// An uncompressed big-endian RGB TIFF, sixteen bits a sample, in one strip.
+fn tiff_be_rgb16(width: u32, height: u32) -> Vec<u8> {
+    let short = |v: u16| {
+        let b = v.to_be_bytes();
+        [b[0], b[1], 0, 0]
+    };
+    let long = |v: u32| v.to_be_bytes();
+    let bits_at = 8 + 2 + 10 * 12 + 4;
+    let data_at = bits_at + 6;
+    let entries: [(u16, u16, u32, [u8; 4]); 10] = [
+        (256, 4, 1, long(width)),
+        (257, 4, 1, long(height)),
+        (258, 3, 3, long(bits_at)),
+        (259, 3, 1, short(1)),
+        (262, 3, 1, short(2)),
+        (273, 4, 1, long(data_at)),
+        (277, 3, 1, short(3)),
+        (278, 4, 1, long(height)),
+        (279, 4, 1, long(width * height * 6)),
+        (284, 3, 1, short(1)),
+    ];
+    let mut tiff = b"MM".to_vec();
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (tag, kind, count, value) in entries {
+        tiff.extend_from_slice(&tag.to_be_bytes());
+        tiff.extend_from_slice(&kind.to_be_bytes());
+        tiff.extend_from_slice(&count.to_be_bytes());
+        tiff.extend_from_slice(&value);
+    }
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for _ in 0..3 {
+        tiff.extend_from_slice(&16u16.to_be_bytes());
+    }
+    tiff.resize(tiff.len() + (width * height * 6) as usize, 0x55);
+    tiff
+}
+
+/// Deep TIFFs convert in a worker held to just what the pipeline reckons for
+/// them, the cap it uses in production: a big-endian sixteen-bit one, whose
+/// depth was misread as eight bits, and floating-point RGB, reckoned at
+/// sixteen bits a sample, each overran that cap and was left unconverted.
+#[test]
+fn a_deep_tiff_converts_within_the_memory_reckoned_for_it() {
+    use std::io::Cursor;
+    use_the_cli_as_worker();
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let mut float = Vec::new();
+    image::DynamicImage::ImageRgb32F(image::Rgb32FImage::from_pixel(
+        2000,
+        1500,
+        image::Rgb([0.3, 0.5, 0.7]),
+    ))
+    .write_to(&mut Cursor::new(&mut float), image::ImageFormat::Tiff)
+    .unwrap();
+    for (name, bytes) in [
+        ("big-endian.tiff", tiff_be_rgb16(4000, 3000)),
+        ("float.tiff", float),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let cap = epubkit_core::image::memory_needed(&path, &options);
+        let converted = worker::convert(&path, name, &options, cap).unwrap();
+        assert!(
+            matches!(converted, Converted::Done(_)),
+            "{name} did not convert within the {cap} bytes reckoned for it"
+        );
+    }
+}

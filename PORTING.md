@@ -625,7 +625,11 @@ without the decoder, which would hold arrays of whatever counts the directory
 claims — a TIFF claiming five million strips held 234 MiB reading its header;
 its size, its samples and their bits, and its turn are read from the
 directory alone, the colour taken no narrower than the decoder would decode
-it to. Any other
+it to: eight or sixteen bits a sample at that depth, and 32 as the
+floating-point RGB or RGBA the decoder takes it as. An entry's count is of
+32 bits, in either byte order; a BitsPerSample entry that does not read is
+taken at the widest the decoder takes, and only a missing one at TIFF's
+default of a bit. Any other
 image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
 its text and EXIF chunks and unpack of its ICC profile, which with the
 buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set

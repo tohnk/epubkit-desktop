@@ -898,39 +898,62 @@ fn tiff_header(
     }
     let width = width?;
     let height = height?;
-    // The widest a sample is, from the BitsPerSample entry: its values are in
-    // the value field if they fit, or at the offset it holds, read no further
-    // than the samples a pixel has, capped so a crafted count holds nothing.
-    let bits = bits_entry
-        .and_then(|entry| {
-            let n = usize::from(u16_at(&entry[4..6])).min(samples.clamp(1, 16) as usize);
-            let values = if n * 2 <= 4 {
+    // The widest a sample is, from the BitsPerSample entry. Its count is of
+    // 32 bits, as every entry's is; its values, SHORTs or LONGs, are in the
+    // value field if they fit, or at the offset it holds, read no further than
+    // the samples a pixel has, so a crafted count holds nothing. With no entry
+    // a sample is TIFF's default of one bit; with one that does not read, it
+    // is taken at the widest the decoder takes, never the narrowest.
+    let bits = match bits_entry {
+        None => 1,
+        Some(entry) => (|| {
+            let size = match u16_at(&entry[2..4]) {
+                3 => 2,
+                4 => 4,
+                _ => return None,
+            };
+            let n = (u32_at(&entry[4..8]) as usize).min(samples.clamp(1, 16) as usize);
+            let values = if n * size <= 4 {
                 entry[8..12].to_vec()
             } else {
                 reader
                     .seek(SeekFrom::Start(u64::from(u32_at(&entry[8..12]))))
                     .ok()?;
-                let mut values = vec![0u8; n * 2];
+                let mut values = vec![0u8; n * size];
                 reader.read_exact(&mut values).ok()?;
                 values
             };
-            (0..n).filter_map(|i| values.get(2 * i..2 * i + 2).map(u16_at)).max()
-        })
-        .unwrap_or(1);
+            (0..n)
+                .filter_map(|i| {
+                    let value = values.get(size * i..size * (i + 1))?;
+                    Some(if size == 2 {
+                        u32::from(u16_at(value))
+                    } else {
+                        u32_at(value)
+                    })
+                })
+                .max()
+        })()
+        .unwrap_or(32),
+    };
 
-    // The colour the decoder would decode it to, never narrower: a sample is
-    // taken at sixteen bits if it is more than eight, and a pixel at four
-    // samples if it has more. `image` decodes a TIFF to one of these.
-    let deep = bits > 8;
-    let color = match (samples.clamp(1, 4), deep) {
-        (1, false) => image::ColorType::L8,
-        (1, true) => image::ColorType::L16,
-        (2, false) => image::ColorType::La8,
-        (2, true) => image::ColorType::La16,
-        (3, false) => image::ColorType::Rgb8,
-        (3, true) => image::ColorType::Rgb16,
-        (_, false) => image::ColorType::Rgba8,
-        (_, true) => image::ColorType::Rgba16,
+    // The colour the decoder would decode it to, never narrower. `image`
+    // decodes a TIFF of eight or sixteen bits a sample at that depth, and one
+    // of 32 only as floating-point RGB or RGBA; a pixel of more than four
+    // samples is taken at four.
+    let color = match (samples.clamp(1, 4), bits) {
+        (1, ..=8) => image::ColorType::L8,
+        (1, 9..=16) => image::ColorType::L16,
+        (2, ..=8) => image::ColorType::La8,
+        (2, 9..=16) => image::ColorType::La16,
+        (3, ..=8) => image::ColorType::Rgb8,
+        (3, 9..=16) => image::ColorType::Rgb16,
+        (4, ..=8) => image::ColorType::Rgba8,
+        (4, 9..=16) => image::ColorType::Rgba16,
+        // Grey of more than sixteen bits the decoder refuses; it is reckoned
+        // as wide as what it does take.
+        (1..=3, _) => image::ColorType::Rgb32F,
+        _ => image::ColorType::Rgba32F,
     };
     let orientation = if turned {
         Orientation::Rotate90
