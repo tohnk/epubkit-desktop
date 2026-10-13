@@ -1697,6 +1697,31 @@ fn a_chapter_nothing_can_parse_leaves_every_image_as_it_is() {
     assert!(one.contains("images/plate.png"), "{one}");
 }
 
+/// Nor can what a chapter nothing can parse uses be known: a reader that
+/// parses it otherwise may style it with any rule, so none is removed as
+/// unused. A blank one uses nothing.
+#[test]
+fn a_chapter_nothing_can_parse_keeps_every_css_rule() {
+    let broken: &[u8] =
+        b"<!-- a comment that never ends\n<p class=\"never-used-anywhere\">A plate.</p>\n";
+    for (chapter, removed) in [(broken, 0), (b"", 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.epub");
+        let output = dir.path().join("out.epub");
+        demo_epub_with(&input, &[("OEBPS/chapter2.xhtml", chapter)]);
+
+        let report =
+            process_epub(&input, &output, &ProcessingOptions::default(), |_, _| {}).unwrap();
+
+        assert_eq!(report.documents_unreadable, 1);
+        assert_eq!(report.css_rules_removed, removed);
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
+        let css = fs::read_to_string(work.path().join("OEBPS/styles/main.css")).unwrap();
+        assert_eq!(css.contains(".never-used-anywhere"), removed == 0, "{css}");
+    }
+}
+
 // ------------------------------------------------------------ output names
 
 #[test]

@@ -334,10 +334,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(12, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
-    // Whether the run leaves a document exactly as it is that may name an
-    // image: one too large to read whole, or one nothing can parse that is
-    // not blank.
-    let mut left_naming = !content.too_large.is_empty();
+    // Whether the run leaves a document exactly as it is that it has not
+    // read, so that what it names and uses cannot be known: one too large to
+    // read whole, or one nothing can parse that is not blank.
+    let mut left_unread = !content.too_large.is_empty();
     report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
         if !path.is_file() {
@@ -347,7 +347,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         let Ok(repaired) = backend.repair(&bytes) else {
             report.documents_unreadable += 1;
-            left_naming |= !is_blank(&bytes);
+            left_unread |= !is_blank(&bytes);
             continue;
         };
         if repaired.recovered {
@@ -385,7 +385,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // reading it as a reader does, escapes and all, and an image it names
     // must keep its name, so the reference there still leads to it. So where
     // there is one, every image keeps its name, and stays as it is.
-    let mut kept: Vec<PathBuf> = if left_naming {
+    let mut kept: Vec<PathBuf> = if left_unread {
         let rasters = std::mem::take(&mut rasters);
         rasters.into_iter().filter(|path| path.is_file()).collect()
     } else {
@@ -463,9 +463,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
     }
 
-    // What a document too large to read uses cannot be known, so no rule is
-    // known to be unused.
-    if options.remove_unused_css && content.too_large.is_empty() {
+    // What a document left unread uses cannot be known, so no rule is known
+    // to be unused.
+    if options.remove_unused_css && !left_unread {
         progress(76, "Removing unused CSS...");
         let mut used = css::UsedSelectors::default();
         for &path in &chapters {
