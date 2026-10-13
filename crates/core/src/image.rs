@@ -29,7 +29,10 @@
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use image::error::{DecodingError, ImageError, ImageFormatHint, LimitError, LimitErrorKind};
+use image::error::{
+    DecodingError, ImageError, ImageFormatHint, LimitError, LimitErrorKind, UnsupportedError,
+    UnsupportedErrorKind,
+};
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{
@@ -605,7 +608,24 @@ struct JpegFrame {
     progressive: bool,
     /// How each of its components is sampled, across and down.
     sampling: Vec<(u8, u8)>,
+    /// How many of its components its first scan holds.
+    first_scan: u8,
     orientation: Orientation,
+}
+
+impl JpegFrame {
+    /// Would the JPEG decoder here decode it wrongly? It lays the blocks of a
+    /// sequential scan that does not hold every component, as libjpeg reads
+    /// one, in the order of a scan that does, which is the same order only
+    /// where every component is sampled in full. A 4:2:0 JPEG with each
+    /// component in a scan of its own came out off by 117 of 255 in every
+    /// channel on average; a 4:2:2 one whose luma and blue share a scan, by
+    /// 103. A progressive JPEG goes another way, and comes out right.
+    fn decoded_wrongly(&self) -> bool {
+        !self.progressive
+            && usize::from(self.first_scan) < self.sampling.len()
+            && self.sampling.iter().any(|&sampling| sampling != (1, 1))
+    }
 }
 
 /// The frame of the JPEG `reader` holds, found by stepping over the markers
@@ -624,7 +644,7 @@ fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
     let mut orientation = Orientation::NoTransforms;
     let mut byte = [0u8; 1];
     let mut last = 0;
-    loop {
+    let first_scan = loop {
         reader.read_exact(&mut byte).ok()?;
         let mut marker = byte[0];
         // Fill bytes after a marker's 0xFF, or a zero stuffed after it.
@@ -642,8 +662,13 @@ fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
         }
         last = marker;
         match marker {
-            // The scan, which the frame comes before.
-            0xDA => break,
+            // The scan, which the frame comes before: its length, then how
+            // many components it holds.
+            0xDA => {
+                let mut scan = [0u8; 3];
+                reader.read_exact(&mut scan).ok()?;
+                break scan[2];
+            }
             0xD9 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCC..=0xCF | 0xDC => return None,
             _ => {}
         }
@@ -668,15 +693,17 @@ fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
                 height: u16::from_be_bytes([*data.get(1)?, *data.get(2)?]),
                 progressive: marker == 0xC2,
                 sampling,
+                first_scan: 0,
                 orientation: Orientation::NoTransforms,
             });
         } else if data.len() > 6 && data.starts_with(b"Exif\0\0") {
             orientation =
                 Orientation::from_exif_chunk(&data[6..]).unwrap_or(Orientation::NoTransforms);
         }
-    }
+    };
     let mut frame = frame?;
     frame.orientation = orientation;
+    frame.first_scan = first_scan;
     Some(frame)
 }
 
@@ -1422,6 +1449,22 @@ fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
                 LimitErrorKind::DimensionError,
             )));
         }
+    }
+    // A JPEG the decoder here would decode wrongly is refused, and so left as
+    // it is, rather than converted into something else.
+    if format == Some(ImageFormat::Jpeg)
+        && jpeg_frame(&mut Cursor::new(bytes)).is_some_and(|frame| frame.decoded_wrongly())
+    {
+        return Err(ImageError::Unsupported(
+            UnsupportedError::from_format_and_kind(
+                ImageFormat::Jpeg.into(),
+                UnsupportedErrorKind::GenericFeature(
+                    "a sequential JPEG whose components are in separate scans, one of them \
+                     subsampled, which the decoder here decodes wrongly"
+                        .into(),
+                ),
+            ),
+        ));
     }
     reader.limits(header_limits());
     let mut decoder = reader.into_decoder()?;

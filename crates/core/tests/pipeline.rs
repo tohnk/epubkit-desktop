@@ -2821,3 +2821,42 @@ fn an_unlisted_stylesheet_a_style_element_imports_is_not_broken() {
     );
     assert_eq!((report.images_converted, report.images_unconverted), (0, 1));
 }
+
+/// A baseline JPEG whose components are in separate scans, one subsampled,
+/// which the decoder here decodes wrongly, was converted all the same and its
+/// original replaced by a picture of something else. It is left as it is
+/// now, byte for byte, and counted with those that could not be converted.
+#[test]
+fn a_jpeg_the_decoder_would_decode_wrongly_is_left_as_it_is() {
+    let (width, height) = (96u32, 64u32);
+    let rgb = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([
+            (x * 255 / width) as u8,
+            (y * 255 / height) as u8,
+            ((x + y) * 2) as u8,
+        ])
+    });
+    let mut split = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut split, 90);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    // Optimized tables make `jpeg-encoder` write each component in a scan
+    // of its own.
+    encoder.set_optimized_huffman_tables(true);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+
+    let files = [("images/photo.jpg", "image/jpeg", split.clone())];
+    let body = r#"<p><img src="../images/photo.jpg" alt=""/></p>"#;
+    let (work, report) = optimize_files(&files, "", "", body, &ProcessingOptions::default());
+    assert!(
+        fs::read(work.path().join("OEBPS/images/photo.jpg")).unwrap() == split,
+        "the JPEG was rewritten"
+    );
+    assert_eq!((report.images_converted, report.images_unconverted), (0, 1));
+}

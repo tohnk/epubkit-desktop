@@ -508,6 +508,20 @@ in the book as it was, and the summary counts it. TIFF is not among the image
 types EPUB requires a reader to show, and few readers decode arithmetic-coded
 JPEG either.
 
+One kind the `image` crate's JPEG decoder (zune-jpeg) reads, but reads
+wrongly: a sequential JPEG whose components are in separate scans, with one of
+them subsampled. It lays such a scan's blocks in the order of a scan that
+holds every component, which is the same order only where every component is
+sampled in full, so a 4:2:0 JPEG with each component in a scan of its own
+came out off by 117 of 255 in every channel on average, where libjpeg read it
+right; and it was converted all the same, the original replaced.
+`jpeg-encoder` writes JPEGs that way when its Huffman tables are optimized,
+and `jpegtran` can rewrite one so. The port refuses such a JPEG, and leaves it
+as it is; one whose components are all sampled in full, progressive ones, and
+the usual JPEG with all its components in one scan, it converts as before.
+Two 4:2:2 layouts the decoder happens to read right are refused with the
+rest, which costs nothing but their conversion.
+
 Both refuse an image of more than 178,956,970 pixels as a likely
 decompression bomb. The `image` crate on its own refuses one whose decoded
 pixels take more than 512 MiB, which left a 12000 x 12000 RGBA image, 144

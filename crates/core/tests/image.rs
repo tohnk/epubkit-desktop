@@ -1131,3 +1131,77 @@ fn a_real_tiff_is_read_by_the_bounded_walk() {
         assert_eq!((page.width(), page.height()), (w, h), "{w}x{h}");
     }
 }
+
+/// A colour photo of `width` x `height` as a baseline JPEG sampled as
+/// `sampling` says, its components in one scan or, with Huffman tables
+/// optimized, as `jpeg-encoder` writes them then, each in a scan of its own.
+fn baseline_jpeg(
+    width: u32,
+    height: u32,
+    sampling: jpeg_encoder::SamplingFactor,
+    separate_scans: bool,
+) -> (RgbImage, Vec<u8>) {
+    let rgb = RgbImage::from_fn(width, height, |x, y| {
+        Rgb([
+            (x * 255 / width) as u8,
+            (y * 255 / height) as u8,
+            ((x + y) * 2) as u8,
+        ])
+    });
+    let mut out = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut out, 90);
+    encoder.set_sampling_factor(sampling);
+    encoder.set_optimized_huffman_tables(separate_scans);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+    (rgb, out)
+}
+
+/// A baseline JPEG whose components are in separate scans, with one of them
+/// subsampled, is decoded wrongly by the JPEG decoder here — a 4:2:0 one came
+/// out with every channel off by 117 of 255 on average, libjpeg decoding it
+/// right — and was converted all the same, the original replaced. Such a
+/// JPEG is refused, for conversion and for a thumbnail, and so left as it is.
+/// One with every component sampled in full is decoded right, and converts.
+#[test]
+fn a_baseline_jpeg_in_separate_scans_that_is_subsampled_is_refused() {
+    let (_, split) = baseline_jpeg(96, 64, jpeg_encoder::SamplingFactor::F_2_2, true);
+    assert!(
+        process_image(&split, "split.jpg", &ImageOptions::default()).is_err(),
+        "a 4:2:0 JPEG in separate scans was converted"
+    );
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    assert!(
+        epubkit_core::image::thumbnail(&split, 48, 48, &budget).is_err(),
+        "a thumbnail was made of it"
+    );
+
+    let options = ImageOptions {
+        grayscale: false,
+        eink_quantize: false,
+        contrast_boost: false,
+        ..ImageOptions::default()
+    };
+    let (source, full) = baseline_jpeg(96, 64, jpeg_encoder::SamplingFactor::F_1_1, true);
+    let converted = process_image(&full, "full.jpg", &options).unwrap();
+    let page = image::load_from_memory(&converted[0].bytes)
+        .unwrap()
+        .to_rgb8();
+    let error: u64 = page
+        .as_raw()
+        .iter()
+        .zip(source.as_raw())
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum();
+    let mean = error as f64 / source.as_raw().len() as f64;
+    assert!(
+        mean < 8.0,
+        "a 4:4:4 JPEG in separate scans came out {mean} off"
+    );
+}
