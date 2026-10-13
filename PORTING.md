@@ -829,7 +829,10 @@ would draw otherwise than the SVG, which they style apart from it: under
 `img { visibility: hidden }` a cover in plain sight was hidden once it was
 an `<img>`. The `<img>` is put where the SVG is, as it will be, and the
 cascade asked of it too, where it takes after the box it is in as the SVG
-need not: hidden in a hidden `<div>`, where the SVG was made `visible`. And
+need not: hidden in a hidden `<div>`, where the SVG was made `visible`.
+Visibility inherits, so `unset`, `revert` and `revert-layer` on it take the
+box's visibility rather than the initial `visible`, hidden in a hidden box as
+a reader has them. And
 as no list of what draws an image otherwise can foresee what a rule for
 images may do, `img { width: 0 }` say, which left nothing of the cover, a
 wrapper stays wherever a rule that may style its `<img>` sets anything but

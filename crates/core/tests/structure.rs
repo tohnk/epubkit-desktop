@@ -1799,6 +1799,24 @@ fn an_svg_whose_img_a_rule_would_style_beyond_harmless_styling_is_not_unwrapped(
             false,
         ),
         ("div { visibility: hidden }", false),
+        // Visibility inherits, so a reset keyword on the img, inside a hidden
+        // box but beside an SVG kept visible, takes the box's hidden, not the
+        // initial visible: the cover would vanish, so the wrapper stays.
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: unset }",
+            false,
+        ),
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: revert }",
+            false,
+        ),
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: revert-layer }",
+            false,
+        ),
+        // With nothing hiding the box around it, a reset is the visible
+        // default, and the cover is unwrapped.
+        ("svg { visibility: visible } img { visibility: unset }", true),
         ("img { width: 0 }", false),
         ("div > * { height: 1px }", false),
         ("img { zoom: 0.1 }", false),

@@ -1545,6 +1545,10 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
         Property::Visibility => {
             if said(&["hidden", "collapse"]) {
                 Value::Set
+            } else if said(&["unset", "revert", "revert-layer"]) {
+                // Visibility inherits, so its reset keywords take the box it is
+                // in, not the initial `visible`: in a hidden box, hidden.
+                Value::Inherit
             } else {
                 Value::Initial
             }
