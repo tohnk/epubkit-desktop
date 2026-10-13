@@ -206,3 +206,41 @@ fn a_file_larger_than_the_cap_is_an_overrun_not_an_error() {
         Converted::Done(_)
     ));
 }
+
+/// A sequential JPEG with each component in a scan of its own, all sampled
+/// in full, converts in a worker held to just what the pipeline reckons for
+/// it: its decoder keeps every coefficient, which was reckoned only for a
+/// progressive JPEG, so one of 4000 x 3000 overran that cap and was skipped.
+#[test]
+fn a_jpeg_in_separate_scans_converts_within_the_memory_reckoned_for_it() {
+    use_the_cli_as_worker();
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let (width, height) = (4000u32, 3000u32);
+    let rgb = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+    });
+    let mut jpeg = Vec::new();
+    // Optimized tables make `jpeg-encoder` write each component in a scan of
+    // its own.
+    let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 85);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    encoder.set_optimized_huffman_tables(true);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+    let path = dir.path().join("separate.jpg");
+    std::fs::write(&path, &jpeg).unwrap();
+
+    let cap = epubkit_core::image::memory_needed(&path, &options);
+    let converted = worker::convert(&path, "separate.jpg", &options, cap).unwrap();
+    assert!(
+        matches!(converted, Converted::Done(_)),
+        "it did not convert within the {cap} bytes reckoned for it"
+    );
+}

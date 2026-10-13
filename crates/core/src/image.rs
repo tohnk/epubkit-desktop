@@ -583,9 +583,12 @@ fn resample_buffer(width: u32, height: u32, options: &ImageOptions) -> u64 {
 
 /// What the decoder of the JPEG whose frame is `frame` keeps beside the
 /// image: for a progressive one, every coefficient, two bytes each, of each
-/// component at the size its sampling makes it; for one in one scan, nothing.
+/// component at the size its sampling makes it; so too for a sequential one
+/// whose first scan does not hold every component, which it decodes whole
+/// before it makes any pixels, as no row has all its components till the last
+/// scan; for one in one scan, nothing.
 fn jpeg_coefficients(frame: &JpegFrame) -> u64 {
-    if !frame.progressive {
+    if !frame.progressive && usize::from(frame.first_scan) >= frame.sampling.len() {
         return 0;
     }
     let most =
@@ -1803,21 +1806,41 @@ mod tests {
     fn a_progressive_jpeg_keeps_two_bytes_a_coefficient() {
         let (width, height) = (160u16, 96u16);
         let rgb = vec![128u8; usize::from(width) * usize::from(height) * 3];
-        for (progressive, sampling, expected) in [
-            (false, jpeg_encoder::SamplingFactor::F_2_2, 0),
-            (true, jpeg_encoder::SamplingFactor::F_2_2, 160 * 96 * 3),
-            (true, jpeg_encoder::SamplingFactor::F_1_1, 160 * 96 * 6),
+        // Optimized Huffman tables make `jpeg-encoder` write a sequential
+        // JPEG with each component in a scan of its own, which the decoder
+        // keeps every coefficient of as it does a progressive one's.
+        for (progressive, separate_scans, sampling, expected) in [
+            (false, false, jpeg_encoder::SamplingFactor::F_2_2, 0),
+            (
+                true,
+                false,
+                jpeg_encoder::SamplingFactor::F_2_2,
+                160 * 96 * 3,
+            ),
+            (
+                true,
+                false,
+                jpeg_encoder::SamplingFactor::F_1_1,
+                160 * 96 * 6,
+            ),
+            (
+                false,
+                true,
+                jpeg_encoder::SamplingFactor::F_1_1,
+                160 * 96 * 6,
+            ),
         ] {
             let mut jpeg = Vec::new();
             let mut encoder = JpegEncoder::new(&mut jpeg, 80);
             encoder.set_progressive(progressive);
+            encoder.set_optimized_huffman_tables(separate_scans);
             encoder.set_sampling_factor(sampling);
             encoder.encode(&rgb, width, height, ColorType::Rgb).unwrap();
             let frame = jpeg_frame(&mut Cursor::new(&jpeg)).unwrap();
             assert_eq!(
                 jpeg_coefficients(&frame),
                 expected,
-                "{progressive} {sampling:?}"
+                "{progressive} {separate_scans} {sampling:?}"
             );
         }
     }

@@ -495,6 +495,45 @@ fn a_floating_point_image_is_shrunk_without_a_copy() {
     assert!(held <= needed, "{held} held, {needed} set aside");
 }
 
+/// A sequential JPEG with each component in a scan of its own, all sampled
+/// in full, is decoded into every coefficient of every component before any
+/// is made pixels, as a progressive one is, which only a progressive one was
+/// reckoned to: one of 4000 x 3000 held 109 MB where 93 were set aside.
+#[test]
+fn a_jpeg_in_separate_scans_is_reckoned_with_its_coefficients() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let (width, height) = (4000u16, 3000u16);
+    let rgb: Vec<u8> = (0..usize::from(width) * usize::from(height))
+        .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8])
+        .collect();
+    let mut jpeg = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 85);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    // Optimized tables make `jpeg-encoder` write each component in a scan of
+    // its own.
+    encoder.set_optimized_huffman_tables(true);
+    encoder
+        .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+    drop(rgb);
+    let path = dir.path().join("separate.jpg");
+    std::fs::write(&path, &jpeg).unwrap();
+
+    let needed = memory_needed(&path, &options);
+    let (converted, peak) = peak_of(|| process_image(&jpeg, "separate.jpg", &options));
+    assert!(converted.is_ok());
+    let held = (jpeg.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+
+    let budget = MemoryBudget::new(needed);
+    assert!(
+        thumbnail(&jpeg, 480, 720, &budget).is_ok(),
+        "a thumbnail within what conversion sets aside was refused"
+    );
+}
+
 /// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
 /// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
 /// held more than was set aside.

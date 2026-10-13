@@ -605,7 +605,9 @@ finished in.
 What an image needs is reckoned from its header before its file is read, by
 what each step of converting it holds at once, measured for each format: the
 file; the image decoded at its own depth, with what its decoder keeps beside
-it, every coefficient of a progressive JPEG say, a JPEG decoder's copy of the
+it, every coefficient of a progressive JPEG say, or of a sequential one
+whose components are in separate scans, which it decodes whole before making
+any pixels, a JPEG decoder's copy of the
 file and of the segments it reads, a PNG decoder's of its chunks, a TIFF
 decoder's own copy, a WebP decoder's luma and chroma and the RGBA it decodes
 a lossless image without alpha or an alpha plane in, or a GIF decoder's
