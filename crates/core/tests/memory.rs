@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use epubkit_core::image::{
-    is_raster_image, memory_needed, process_image, ImageOptions, HEADER_MEMORY,
+    is_raster_image, memory_needed, process_image, thumbnail, ImageOptions, HEADER_MEMORY,
 };
+use epubkit_core::memory::MemoryBudget;
 use image::ImageEncoder;
 
 /// The system's allocator, counting what is live and the most that was.
@@ -217,4 +218,79 @@ fn a_webps_exif_is_read_no_further_than_its_turn() {
     assert!(held <= needed, "{held} held, {needed} set aside");
     let page = image::load_from_memory(&converted.unwrap()[0].bytes).unwrap();
     assert_eq!((page.width(), page.height()), (1, 2));
+}
+
+/// A GIF whose canvas is `canvas` and whose one frame, of one colour, is
+/// `frame`, each width by height: an encoder's GIF of the frame's size, its
+/// canvas then made smaller.
+fn gif_with_frame(canvas: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+    let mut gif = Vec::new();
+    let pixels = usize::from(frame.0) * usize::from(frame.1);
+    image::codecs::gif::GifEncoder::new(&mut gif)
+        .encode(
+            &[90, 120, 150, 255].repeat(pixels),
+            u32::from(frame.0),
+            u32::from(frame.1),
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    gif[6..8].copy_from_slice(&canvas.0.to_le_bytes());
+    gif[8..10].copy_from_slice(&canvas.1.to_le_bytes());
+    gif
+}
+
+/// A GIF's decoder decodes a frame that does not lie across its canvas in
+/// RGBA of the frame's own size. One of 4000 x 3000 on a canvas of one pixel
+/// was reckoned at the canvas's size: 32 MiB set aside, 57 MiB held, and a
+/// thumbnail of it made past a budget too small for it.
+#[test]
+fn a_gif_frame_larger_than_its_canvas_is_reckoned_at_its_own_size() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frame.gif");
+    std::fs::write(&path, gif_with_frame((1, 1), (4000, 3000))).unwrap();
+    let options = ImageOptions::default();
+
+    let needed = memory_needed(&path, &options);
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "frame.gif", &options));
+    assert!(converted.is_ok());
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+
+    let budget = MemoryBudget::new(40 << 20);
+    let (made, peak) = peak_of(|| thumbnail(&file, 480, 720, &budget));
+    assert!(
+        made.is_err() || peak <= 40 << 20,
+        "a thumbnail held {peak} of 40 MiB"
+    );
+}
+
+/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
+/// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
+/// held more than was set aside.
+#[test]
+fn an_opaque_lossless_webp_is_reckoned_with_its_rgba() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opaque.webp");
+    let (width, height) = (2000u32, 10000u32);
+    let mut webp = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+        .write_image(
+            &[90, 120, 150].repeat((width * height) as usize),
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    std::fs::write(&path, webp).unwrap();
+    let options = ImageOptions::default();
+
+    let needed = memory_needed(&path, &options);
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "opaque.webp", &options));
+    assert!(converted.is_ok());
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
 }

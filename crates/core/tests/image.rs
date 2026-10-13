@@ -924,3 +924,120 @@ fn an_image_with_no_pixels_is_refused_not_panicked_on() {
         }
     }
 }
+
+/// `body` as a RIFF chunk named `fourcc`, padded to an even length.
+fn riff_chunk(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut chunk = fourcc.to_vec();
+    chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        chunk.push(0);
+    }
+    chunk
+}
+
+/// A WebP that says it is `width` x `height`, coded as `coding` says, with
+/// nothing to decode: lossless, with or without alpha; lossy with an alpha
+/// plane, which takes an extended WebP; or an animation of one lossy frame.
+fn webp_claiming(width: u32, height: u32, coding: &str) -> Vec<u8> {
+    let three = |n: u32| n.to_le_bytes()[..3].to_vec();
+    let extended = |flags: u8| [vec![flags, 0, 0, 0], three(width - 1), three(height - 1)].concat();
+    // A key frame's tag, the start code, and its size.
+    let lossy = [
+        vec![0, 0, 0, 0x9d, 0x01, 0x2a],
+        (width as u16).to_le_bytes().to_vec(),
+        (height as u16).to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let chunks = match coding {
+        "lossless" | "lossless with alpha" => {
+            let alpha = u32::from(coding.ends_with("alpha"));
+            let header = (width - 1) | (height - 1) << 14 | alpha << 28;
+            riff_chunk(
+                b"VP8L",
+                &[vec![0x2f], header.to_le_bytes().to_vec()].concat(),
+            )
+        }
+        "lossy with alpha" => [
+            riff_chunk(b"VP8X", &extended(0x10)),
+            riff_chunk(b"ALPH", &[0]),
+            riff_chunk(b"VP8 ", &lossy),
+        ]
+        .concat(),
+        "animated" => {
+            let frame = [
+                vec![0; 6],
+                three(width - 1),
+                three(height - 1),
+                vec![0; 4],
+                riff_chunk(b"VP8 ", &lossy),
+            ]
+            .concat();
+            [
+                riff_chunk(b"VP8X", &extended(0x02)),
+                riff_chunk(b"ANIM", &[0; 6]),
+                riff_chunk(b"ANMF", &frame),
+            ]
+            .concat()
+        }
+        _ => unreachable!("{coding}"),
+    };
+    let body = [b"WEBP".to_vec(), chunks].concat();
+    [
+        b"RIFF".to_vec(),
+        (body.len() as u32).to_le_bytes().to_vec(),
+        body,
+    ]
+    .concat()
+}
+
+/// A GIF whose canvas is `canvas` and whose first frame is `frame`, each
+/// width by height, with nothing to decode.
+fn gif_claiming(canvas: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+    let mut gif = b"GIF89a".to_vec();
+    gif.extend_from_slice(&canvas.0.to_le_bytes());
+    gif.extend_from_slice(&canvas.1.to_le_bytes());
+    // Two colours, black and white.
+    gif.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF]);
+    gif.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
+    gif.extend_from_slice(&frame.0.to_le_bytes());
+    gif.extend_from_slice(&frame.1.to_le_bytes());
+    gif.extend_from_slice(&[0, 2, 2, 0x44, 0x01, 0, 0x3B]);
+    gif
+}
+
+/// What a WebP's decoder holds beside the image depends on how the image is
+/// coded: a lossless one without alpha is decoded in RGBA beside the RGB it
+/// comes out as; a lossy one keeps its luma and chroma, and with alpha
+/// decodes that plane in RGBA beside them; an animation keeps a canvas, and
+/// decodes a frame beside it. A GIF's first frame, where it does not lie
+/// across its canvas, is decoded in RGBA at its own size, however small the
+/// canvas. Each was reckoned at a byte or two a pixel.
+#[test]
+fn the_memory_a_webp_or_gif_needs_counts_what_its_decoder_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let (width, height) = (4000u32, 4000u32);
+    let pixels = u64::from(width) * u64::from(height);
+    for (coding, holds) in [
+        ("lossless", pixels * (3 + 4)),
+        ("lossless with alpha", pixels * 4),
+        ("lossy with alpha", pixels * (8 + 13) / 2),
+        ("animated", pixels * (3 + 15)),
+    ] {
+        let path = dir.path().join(format!("{coding}.webp"));
+        std::fs::write(&path, webp_claiming(width, height, coding)).unwrap();
+        let needed = epubkit_core::image::memory_needed(&path, &options);
+        let file = std::fs::metadata(&path).unwrap().len();
+        assert!(needed >= file + holds, "{coding}: {needed}");
+    }
+
+    let path = dir.path().join("frame.gif");
+    std::fs::write(&path, gif_claiming((1, 1), (4000, 3000))).unwrap();
+    let needed = epubkit_core::image::memory_needed(&path, &options);
+    assert!(needed >= 4000 * 3000 * 4, "{needed}");
+    // A frame larger than Pillow converts is refused, as a canvas that large
+    // is.
+    let bomb = gif_claiming((1, 1), (65535, 65535));
+    assert!(process_image(&bomb, "bomb.gif", &options).is_err());
+}

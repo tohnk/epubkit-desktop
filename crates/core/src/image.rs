@@ -246,6 +246,8 @@ struct Header {
     jpeg: Option<JpegFrame>,
     /// How a WebP is coded, which tells the same.
     webp: Option<WebpKind>,
+    /// A GIF's first frame, which tells the same.
+    gif: Option<GifFrame>,
 }
 
 impl Header {
@@ -273,8 +275,16 @@ impl Header {
                 orientation: frame.orientation,
                 jpeg: Some(frame),
                 webp: None,
+                gif: None,
             });
         }
+        let gif = if format == ImageFormat::Gif {
+            let frame = gif_frame(&mut inner);
+            inner.seek(SeekFrom::Start(0)).ok()?;
+            frame
+        } else {
+            None
+        };
 
         // A WebP's decoder reads the whole of its EXIF to say how it is
         // turned, held to no limit, so that is read here too.
@@ -303,6 +313,7 @@ impl Header {
             orientation,
             jpeg: None,
             webp,
+            gif,
         })
     }
 }
@@ -361,9 +372,10 @@ impl Footprint {
             orientation,
             jpeg,
             webp,
+            gif,
         } = header;
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_PIXELS {
+        if pixels > MAX_PIXELS || gif.is_some_and(|frame| frame.pixels() > MAX_PIXELS) {
             return None;
         }
 
@@ -400,17 +412,28 @@ impl Footprint {
             // The chunks it keeps, and the ICC profile it unpacks.
             ImageFormat::Png => HEADER_MEMORY,
             ImageFormat::Bmp => 0,
-            // The indices of a frame, beside its colours.
-            ImageFormat::Gif => pixels,
+            // The indices of a frame, beside its colours; and a frame that does
+            // not lie across the canvas decoded in RGBA of its own size, to be
+            // laid on it.
+            ImageFormat::Gif => match gif {
+                Some(frame) if !frame.lies_across(width, height) => pixels + frame.pixels() * 5,
+                _ => pixels,
+            },
             // Its copy of the file, and of each segment it knows, beside it;
             // and every coefficient of a progressive scan, kept to its end.
             ImageFormat::Jpeg => file * 2 + jpeg.as_ref().map_or(0, jpeg_coefficients),
             ImageFormat::WebP => match webp {
-                // Luma and quarter-size chroma.
+                // Luma and quarter-size chroma; and an alpha plane decoded in
+                // RGBA, then kept a byte a pixel, beside them.
+                Some(WebpKind::Lossy) if color.has_alpha() => pixels * 13 / 2,
                 Some(WebpKind::Lossy) => pixels * 3 / 2,
-                // Decoded where it lies; a byte a pixel to spare.
-                Some(WebpKind::Lossless) => pixels,
-                _ => decoded,
+                // With alpha, decoded where it lies, a byte a pixel to spare;
+                // without, decoded in RGBA beside the RGB it comes out as.
+                Some(WebpKind::Lossless) if color.has_alpha() => pixels,
+                Some(WebpKind::Lossless) => pixels * 4,
+                // A canvas in RGBA, and a frame decoded in any of those ways
+                // beside it.
+                _ => pixels * 15,
             },
             // The TIFF decoder's own buffer, copied into the image.
             _ => decoded,
@@ -602,6 +625,74 @@ fn jpeg_frame(reader: &mut (impl Read + Seek)) -> Option<JpegFrame> {
     let mut frame = frame?;
     frame.orientation = orientation;
     Some(frame)
+}
+
+/// A GIF's first frame: where on the canvas its decoder lays it, and its
+/// size.
+#[derive(Debug, Clone, Copy)]
+struct GifFrame {
+    left: u16,
+    top: u16,
+    width: u16,
+    height: u16,
+}
+
+impl GifFrame {
+    fn pixels(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// Does it lie across a canvas `width` x `height` from its left edge, as
+    /// its decoder decodes a frame where it lies?
+    fn lies_across(&self, width: u32, height: u32) -> bool {
+        self.left == 0
+            && u32::from(self.width) == width
+            && u32::from(self.top) + u32::from(self.height) <= height
+    }
+}
+
+/// The first frame of the GIF `reader` holds, found by stepping over its
+/// colour table and the extensions before the frame, a block of data at a
+/// time.
+fn gif_frame(reader: &mut (impl Read + Seek)) -> Option<GifFrame> {
+    let mut screen = [0u8; 13];
+    reader.read_exact(&mut screen).ok()?;
+    if &screen[..3] != b"GIF" {
+        return None;
+    }
+    if screen[10] & 0x80 != 0 {
+        let colours = 3 * (2i64 << (screen[10] & 7));
+        reader.seek(SeekFrom::Current(colours)).ok()?;
+    }
+    let mut byte = [0u8; 1];
+    loop {
+        reader.read_exact(&mut byte).ok()?;
+        match byte[0] {
+            // An extension: its label, then blocks up to an empty one.
+            0x21 => {
+                reader.read_exact(&mut byte).ok()?;
+                loop {
+                    reader.read_exact(&mut byte).ok()?;
+                    if byte[0] == 0 {
+                        break;
+                    }
+                    reader.seek(SeekFrom::Current(i64::from(byte[0]))).ok()?;
+                }
+            }
+            0x2C => {
+                let mut descriptor = [0u8; 8];
+                reader.read_exact(&mut descriptor).ok()?;
+                let word = |at: usize| u16::from_le_bytes([descriptor[at], descriptor[at + 1]]);
+                return Some(GifFrame {
+                    left: word(0),
+                    top: word(2),
+                    width: word(4),
+                    height: word(6),
+                });
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// How a WebP is coded.
@@ -1052,7 +1143,11 @@ fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
             "the image has no pixels",
         )));
     }
-    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+    // A GIF's first frame is decoded at its own size where it does not lie
+    // across the canvas, and is held to the same limit.
+    let frame_too_large = format == Some(ImageFormat::Gif)
+        && gif_frame(&mut Cursor::new(bytes)).is_some_and(|frame| frame.pixels() > MAX_PIXELS);
+    if u64::from(width) * u64::from(height) > MAX_PIXELS || frame_too_large {
         return Err(ImageError::Limits(LimitError::from_kind(
             LimitErrorKind::DimensionError,
         )));

@@ -592,8 +592,11 @@ What an image needs is reckoned from its header before its file is read, by
 what each step of converting it holds at once, measured for each format: the
 file; the image decoded at its own depth, with what its decoder keeps beside
 it, every coefficient of a progressive JPEG say, a JPEG decoder's copy of the
-file and of the segments it reads, a PNG decoder's of its chunks, or a TIFF
-decoder's own copy; a copy made to flatten a deeper image's alpha; a copy turned as the
+file and of the segments it reads, a PNG decoder's of its chunks, a TIFF
+decoder's own copy, a WebP decoder's luma and chroma and the RGBA it decodes
+a lossless image without alpha or an alpha plane in, or a GIF decoder's
+first frame at its own size, where that does not lie across the canvas; a
+copy made to flatten a deeper image's alpha; a copy turned as the
 EXIF data says, or as Light Novel mode might; and the buffer resampling it
 holds, four `f32` for every source column at each row of the result. Never
 less than the conversion takes, and some 32 MB more. The 1 GiB is shared by
