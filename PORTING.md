@@ -619,7 +619,13 @@ read block by block to its first frame, as its decoder collects an ICC
 profile and XMP on the way as it is made, to 50 MB each, held to no limit of
 the image step's; what those come to, twice what is collected as the buffer
 doubles as it grows, is reckoned in what decoding it holds, and a GIF too
-large to decode is refused before its decoder is made. Any other
+large to decode is refused before its decoder is made. A TIFF's is read from
+its image file directory, as its decoder reads it when it is made, but
+without the decoder, which would hold arrays of whatever counts the directory
+claims — a TIFF claiming five million strips held 234 MiB reading its header;
+its size, its samples and their bits, and its turn are read from the
+directory alone, the colour taken no narrower than the decoder would decode
+it to. Any other
 image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
 its text and EXIF chunks and unpack of its ICC profile, which with the
 buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set

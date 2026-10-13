@@ -332,7 +332,61 @@ fn a_gifs_profile_and_xmp_are_reckoned() {
     }
 }
 
-/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
+/// A TIFF (little-endian) whose directory claims `strips` strips of one row,
+/// so a decoder reading its StripOffsets and StripByteCounts up front holds
+/// arrays that size. The strip data need not exist.
+fn tiff_with_strips(strips: u32) -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(b"II");
+    t.extend_from_slice(&42u16.to_le_bytes());
+    t.extend_from_slice(&8u32.to_le_bytes());
+    let entries: [(u16, u16, u32, u32); 9] = [
+        (256, 3, 1, 16),
+        (257, 4, 1, strips),
+        (258, 3, 1, 8),
+        (259, 3, 1, 1),
+        (262, 3, 1, 1),
+        (273, 4, strips, 1000),
+        (277, 3, 1, 1),
+        (278, 4, 1, 1),
+        (279, 4, strips, 2000),
+    ];
+    t.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, ty, count, value) in entries {
+        t.extend_from_slice(&tag.to_le_bytes());
+        t.extend_from_slice(&ty.to_le_bytes());
+        t.extend_from_slice(&count.to_le_bytes());
+        t.extend_from_slice(&value.to_le_bytes());
+    }
+    t.extend_from_slice(&0u32.to_le_bytes());
+    t.resize(3_000 + strips as usize * 4, 0);
+    t
+}
+
+/// A TIFF's decoder reads its image file directory as it is made, holding
+/// arrays of whatever counts it claims, held to no limit of the image step's.
+/// A TIFF claiming five million strips held 234 MiB while its header was read,
+/// where 16 MiB were set aside. Its header is read now without the decoder,
+/// from the directory alone.
+#[test]
+fn a_tiffs_directory_is_read_without_its_decoder() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let path = dir.path().join("strips.tiff");
+    std::fs::write(&path, tiff_with_strips(5_000_000)).unwrap();
+
+    let (_needed, reckoning) = peak_of(|| memory_needed(&path, &options));
+    assert!(
+        reckoning <= HEADER_MEMORY as usize,
+        "reckoning held {reckoning}"
+    );
+    let (raster, telling) = peak_of(|| is_raster_image(&path));
+    assert!(raster, "a 16 x 5,000,000 TIFF is still an image");
+    assert!(telling <= HEADER_MEMORY as usize, "telling held {telling}");
+}
+
+/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
 /// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
 /// held more than was set aside.
 #[test]

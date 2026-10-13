@@ -8,8 +8,9 @@
 use std::collections::BTreeSet;
 
 use epubkit_core::image::{
-    adjust_contrast, autocontrast, device, floyd_steinberg, luma_601, process_image, to_gray_601,
-    ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS, X3, X4,
+    adjust_contrast, autocontrast, device, floyd_steinberg, is_raster_image, luma_601,
+    memory_needed, process_image, to_gray_601, ImageOptions, MAX_IMAGE_DIMENSION, SSD1677_LEVELS,
+    X3, X4,
 };
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 
@@ -1095,5 +1096,38 @@ fn a_webp_is_turned_only_by_exif_its_decoder_finds() {
         let page = image::load_from_memory(&converted[0].bytes).unwrap();
         let shape = if turned { (1, 2) } else { (2, 1) };
         assert_eq!((page.width(), page.height()), shape, "{gap} bytes on");
+    }
+}
+
+/// A real TIFF is read by the bounded directory walk the same as the decoder
+/// would: its size and depth are right, so it is still known for an image,
+/// reckoned, and converted. A grey TIFF and an RGB one, each a size whose
+/// width and height differ, so a walk that swapped them would be caught.
+#[test]
+fn a_real_tiff_is_read_by_the_bounded_walk() {
+    use std::io::Cursor;
+    for (w, h, color) in [(40u32, 24u32, false), (24u32, 40u32, true)] {
+        let mut png = Vec::new();
+        let image = if color {
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, Rgb([80, 120, 160])))
+        } else {
+            DynamicImage::ImageLuma8(GrayImage::from_pixel(w, h, Luma([120])))
+        };
+        image
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        let bytes = tiff(&png);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.tiff");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(is_raster_image(&path), "{w}x{h} TIFF is an image");
+        assert!(
+            memory_needed(&path, &ImageOptions::default()) >= bytes.len() as u64,
+            "reckoned at least its file"
+        );
+        let converted = process_image(&bytes, "x.tiff", &ImageOptions::default()).unwrap();
+        let page = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((page.width(), page.height()), (w, h), "{w}x{h}");
     }
 }

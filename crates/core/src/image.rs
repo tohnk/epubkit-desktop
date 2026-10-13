@@ -316,6 +316,24 @@ impl Header {
                 gif: Some(start),
             });
         }
+        if format == ImageFormat::Tiff {
+            // A TIFF's decoder reads its image file directory as it is made,
+            // and a crafted one — many strips, say — makes it hold arrays of
+            // whatever counts the directory claims, held to no limit of ours.
+            // Its size and depth are read here from the directory instead,
+            // without the decoder.
+            let (width, height, color, orientation) = tiff_header(&mut inner)?;
+            return Some(Header {
+                format,
+                width,
+                height,
+                color,
+                orientation,
+                jpeg: None,
+                webp: None,
+                gif: None,
+            });
+        }
 
         // A WebP's decoder reads the whole of its EXIF to say how it is
         // turned, held to no limit, so that is read here too.
@@ -805,6 +823,121 @@ fn gif_start(reader: &mut (impl Read + Seek)) -> Option<GifStart> {
         metadata: 2 * (largest[PROFILE] + largest[XMP]),
         frame,
     })
+}
+
+/// The size, depth and turn of the TIFF `reader`, read from its first image
+/// file directory as its decoder reads it when it is made, but without the
+/// decoder, so none of the arrays a crafted directory could claim are held.
+/// `None` for one this does not read: another byte order, BigTIFF, or a
+/// directory that does not hold the width and height.
+///
+/// The depth is read from the samples a pixel has and the bits a sample has,
+/// and taken as the widest a sample is, so the colour is never reckoned
+/// smaller than the decoder decodes it to. The turn is only whether it is a
+/// quarter, which is all the footprint asks.
+fn tiff_header(
+    reader: &mut (impl Read + Seek),
+) -> Option<(u32, u32, image::ColorType, Orientation)> {
+    let mut head = [0u8; 8];
+    reader.read_exact(&mut head).ok()?;
+    let big_endian = match &head[..2] {
+        b"II" => false,
+        b"MM" => true,
+        _ => return None,
+    };
+    let u16_at = |b: &[u8]| {
+        if big_endian {
+            u16::from_be_bytes([b[0], b[1]])
+        } else {
+            u16::from_le_bytes([b[0], b[1]])
+        }
+    };
+    let u32_at = |b: &[u8]| {
+        if big_endian {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        }
+    };
+    // 42 marks a classic TIFF; 43 is BigTIFF, which this does not read.
+    if u16_at(&head[2..4]) != 42 {
+        return None;
+    }
+    reader
+        .seek(SeekFrom::Start(u64::from(u32_at(&head[4..8]))))
+        .ok()?;
+    let mut count = [0u8; 2];
+    reader.read_exact(&mut count).ok()?;
+
+    // What a tag whose value is a single number holds, from the entry's value
+    // field, by its type: a SHORT or a LONG.
+    let number = |entry: &[u8; 12]| -> Option<u32> {
+        match u16_at(&entry[2..4]) {
+            3 => Some(u32::from(u16_at(&entry[8..10]))),
+            4 => Some(u32_at(&entry[8..12])),
+            _ => None,
+        }
+    };
+
+    let (mut width, mut height) = (None, None);
+    let mut samples = 1u32;
+    let mut bits_entry = None;
+    let mut turned = false;
+    for _ in 0..u16_at(&count) {
+        let mut entry = [0u8; 12];
+        reader.read_exact(&mut entry).ok()?;
+        match u16_at(&entry[0..2]) {
+            256 => width = number(&entry),
+            257 => height = number(&entry),
+            277 => samples = number(&entry).unwrap_or(1),
+            258 => bits_entry = Some(entry),
+            // A quarter turn, 90 or 270 degrees, is EXIF orientation 5 to 8.
+            274 => turned = matches!(number(&entry), Some(5..=8)),
+            _ => {}
+        }
+    }
+    let width = width?;
+    let height = height?;
+    // The widest a sample is, from the BitsPerSample entry: its values are in
+    // the value field if they fit, or at the offset it holds, read no further
+    // than the samples a pixel has, capped so a crafted count holds nothing.
+    let bits = bits_entry
+        .and_then(|entry| {
+            let n = usize::from(u16_at(&entry[4..6])).min(samples.clamp(1, 16) as usize);
+            let values = if n * 2 <= 4 {
+                entry[8..12].to_vec()
+            } else {
+                reader
+                    .seek(SeekFrom::Start(u64::from(u32_at(&entry[8..12]))))
+                    .ok()?;
+                let mut values = vec![0u8; n * 2];
+                reader.read_exact(&mut values).ok()?;
+                values
+            };
+            (0..n).filter_map(|i| values.get(2 * i..2 * i + 2).map(u16_at)).max()
+        })
+        .unwrap_or(1);
+
+    // The colour the decoder would decode it to, never narrower: a sample is
+    // taken at sixteen bits if it is more than eight, and a pixel at four
+    // samples if it has more. `image` decodes a TIFF to one of these.
+    let deep = bits > 8;
+    let color = match (samples.clamp(1, 4), deep) {
+        (1, false) => image::ColorType::L8,
+        (1, true) => image::ColorType::L16,
+        (2, false) => image::ColorType::La8,
+        (2, true) => image::ColorType::La16,
+        (3, false) => image::ColorType::Rgb8,
+        (3, true) => image::ColorType::Rgb16,
+        (_, false) => image::ColorType::Rgba8,
+        (_, true) => image::ColorType::Rgba16,
+    };
+    let orientation = if turned {
+        Orientation::Rotate90
+    } else {
+        Orientation::NoTransforms
+    };
+    Some((width, height, color, orientation))
 }
 
 /// How a WebP is coded.
