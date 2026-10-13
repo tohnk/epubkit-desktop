@@ -11,6 +11,14 @@
 pub mod commands;
 
 pub fn run() {
+    // A copy of this binary launched as a decode worker serves requests and
+    // never returns here; it must not reach the window. The parent then runs
+    // every image decode in such a worker, held to a memory cap.
+    epubkit_core::worker::serve_if_asked();
+    if let Ok(exe) = std::env::current_exe() {
+        epubkit_core::worker::enable(exe);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

@@ -24,6 +24,7 @@ pub mod preview;
 pub mod settings;
 pub mod structure;
 pub mod text;
+pub mod worker;
 pub mod xml;
 
 pub use error::{Error, Result};

@@ -15,3 +15,7 @@ anyhow.workspace = true
 clap.workspace = true
 epubkit-core.workspace = true
 tempfile.workspace = true
+
+[dev-dependencies]
+epubkit-core.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }

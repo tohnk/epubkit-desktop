@@ -642,6 +642,21 @@ A thumbnail for the desktop's book list is reckoned the same way, out of
 512 MiB for all of them, and one that would need more is not made: the book
 is shown without its cover.
 
+What a decoder holds is reckoned from an image's header, but a crafted image
+can make one allocate far past what its size or its pixels suggest, past any
+limit the decoder takes: a lossless WebP names up to 65,536 groups of five
+Huffman tables, and a few-megabyte file can ask for gigabytes, a
+few-megabyte one for more than the little a one-pixel image reckons. So the
+work that decodes an image — converting it, or making a thumbnail — is done
+in a worker process, under a counting allocator held to the memory set aside
+for that image. One that asks for more is stopped by the allocator, and the
+image is left as it is, or the cover is not made; the book, the other images
+and the program go on untouched. The CLI and the desktop each serve as their
+own worker, re-run with a hidden argument that is handled before anything
+else; run as a library, or in the tests, decoding is done in the same process
+as before, with no cap. The worker decodes with the very code the pipeline
+would have run, so a book comes out identical whether or not it was used.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book

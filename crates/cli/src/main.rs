@@ -128,7 +128,19 @@ fn settings_path() -> Result<PathBuf> {
     Settings::default_path().context("could not locate a configuration directory")
 }
 
+/// Images are decoded in worker processes, held to a hard memory cap, so a
+/// crafted image cannot make a decoder allocate wildly: this counts what each
+/// worker holds and refuses to let it pass the cap.
+#[global_allocator]
+static ALLOCATOR: epubkit_core::worker::CappedAllocator = epubkit_core::worker::CappedAllocator;
+
 fn main() -> Result<()> {
+    // First of all: a copy of this binary launched as a worker serves decode
+    // requests and never returns here.
+    epubkit_core::worker::serve_if_asked();
+    if let Ok(exe) = std::env::current_exe() {
+        epubkit_core::worker::enable(exe);
+    }
     match Cli::parse().command {
         Command::Info { path } => info(&path),
         Command::Validate { path } => validate(&path),

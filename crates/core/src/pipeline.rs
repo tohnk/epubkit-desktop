@@ -22,7 +22,7 @@ use crate::html::{self, HtmlRepair};
 use crate::image::{self, DeviceProfile, ImageOptions};
 use crate::metadata::{self, FilenameFormat, FilenameOptions, MetadataEdits};
 use crate::text::{TextCleanOptions, TextCleanReport};
-use crate::{css, package, structure, xml, Error, Result};
+use crate::{css, package, structure, worker, xml, Error, Result};
 
 /// Everything the user can turn on or off for a run.
 #[derive(Debug, Clone, PartialEq)]
@@ -701,11 +701,17 @@ fn convert_images<P: FnMut(u8, &str)>(
             }
             let _held = IMAGE_MEMORY.hold(needed);
             let bytes = fs::read(job.path).map_err(|e| Error::io(job.path, e))?;
-            // A single unreadable image must not sink the whole book.
-            Ok(match image::process_image(&bytes, &job.name, job.options) {
-                Ok(outputs) => Converted::Done(outputs),
-                Err(_) => Converted::Undecodable,
-            })
+            // Decoded in a worker held to `needed` bytes, where workers are on,
+            // so an image crafted to make a decoder allocate wildly cannot;
+            // a single image that will not decode, or overruns the worker,
+            // must not sink the whole book.
+            Ok(
+                match worker::convert(bytes, &job.name, job.options, needed) {
+                    worker::Converted::Done(outputs) => Converted::Done(outputs),
+                    worker::Converted::Undecodable => Converted::Undecodable,
+                    worker::Converted::Overran => Converted::Overran(needed),
+                },
+            )
         },
         |finished| {
             let percent = START + SPAN * (finished as f64 / jobs.len() as f64);
@@ -724,6 +730,10 @@ fn convert_images<P: FnMut(u8, &str)>(
                     "converting it would take {} MB, more than the {} MB set aside",
                     needed >> 20,
                     IMAGE_MEMORY.total() >> 20
+                ),
+                Converted::Overran(needed) => format!(
+                    "could not be decoded within the {} MB set aside for it",
+                    needed >> 20
                 ),
             };
             report.images_unconverted += 1;
@@ -747,6 +757,9 @@ enum Converted {
     /// Not tried: converting it would need this much memory, more than there
     /// is to set aside.
     TooLarge(u64),
+    /// The worker could not decode it within this much memory, set aside for
+    /// it, and was stopped, or died before it could answer.
+    Overran(u64),
 }
 
 /// One image the image step tries to convert.

@@ -98,7 +98,7 @@ pub fn device(id: &str) -> Option<DeviceProfile> {
     DEVICES.iter().copied().find(|d| d.id == id)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImageOptions {
     pub max_width: u32,
     pub max_height: u32,
@@ -167,22 +167,41 @@ pub fn thumbnail(
     max_height: u32,
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
-    let failed = |e: ImageError| Error::Image(e.to_string());
-    let needed = {
-        let _reading = budget.hold(HEADER_MEMORY);
-        Header::read(Cursor::new(bytes))
-            .and_then(|header| Footprint::of(header, bytes.len() as u64))
-            .map_or(0, |footprint| footprint.thumbnail())
-    };
+    let needed = thumbnail_needed(bytes, budget);
     if needed > budget.total() {
-        return Err(Error::Image(format!(
-            "making a thumbnail would take {} MB, more than the {} MB set aside",
-            needed >> 20,
-            budget.total() >> 20
-        )));
+        return Err(thumbnail_oversize_error(needed, budget.total()));
     }
     let _held = budget.hold(needed);
+    thumbnail_decode(bytes, max_width, max_height)
+}
 
+/// About as much memory as making a thumbnail of the image in `bytes` holds
+/// at once, reckoned from its header, which is read holding [`HEADER_MEMORY`]
+/// of `budget`. Zero for one whose header does not read, which fails as it is
+/// decoded.
+pub(crate) fn thumbnail_needed(bytes: &[u8], budget: &MemoryBudget) -> u64 {
+    let _reading = budget.hold(HEADER_MEMORY);
+    Header::read(Cursor::new(bytes))
+        .and_then(|header| Footprint::of(header, bytes.len() as u64))
+        .map_or(0, |footprint| footprint.thumbnail())
+}
+
+/// The error a thumbnail that would take `needed` bytes, more than the
+/// `total` set aside, is refused with.
+pub(crate) fn thumbnail_oversize_error(needed: u64, total: u64) -> Error {
+    Error::Image(format!(
+        "making a thumbnail would take {} MB, more than the {} MB set aside",
+        needed >> 20,
+        total >> 20
+    ))
+}
+
+/// Make the thumbnail itself, the memory it needs set aside already: see
+/// [`thumbnail`]. Decoding it is held to no budget here, so a caller that
+/// must bound it, against an image crafted to make a decoder allocate wildly,
+/// runs this where it can stop it (see [`crate::worker`]).
+pub(crate) fn thumbnail_decode(bytes: &[u8], max_width: u32, max_height: u32) -> Result<Vec<u8>> {
+    let failed = |e: ImageError| Error::Image(e.to_string());
     // At eight bits a channel, which is all a thumbnail has: the block sums
     // of a deeper image overflow.
     let (decoded, orientation) = decode(bytes).map_err(failed)?;

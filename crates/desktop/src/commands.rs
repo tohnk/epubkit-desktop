@@ -12,7 +12,7 @@ use epubkit_core::memory::MemoryBudget;
 use epubkit_core::metadata::{self, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingReport};
 use epubkit_core::settings::Settings;
-use epubkit_core::{image, package, preview, Error};
+use epubkit_core::{image, package, preview, worker, Error};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -379,14 +379,12 @@ fn cover_data_url(cover: &preview::Cover) -> Option<String> {
     // Shared by every book being read, however many are dropped at once.
     static PREVIEW_MEMORY: MemoryBudget = MemoryBudget::new(512 << 20);
 
-    // The cover is the book's to make of what it likes, and an image decoder
-    // that panics on it leaves this one book without a cover, not every book
-    // dropped with it.
-    let thumbnail = std::panic::catch_unwind(|| {
-        image::thumbnail(&cover.bytes, THUMBNAIL.0, THUMBNAIL.1, &PREVIEW_MEMORY)
-    })
-    .ok()?
-    .ok()?;
+    // The cover is the book's to make of what it likes. Decoding it in a
+    // worker held to a memory cap leaves one that is crafted to make a decoder
+    // allocate wildly, or that simply will not decode, as this one book
+    // without a cover, not every book dropped with it, and not the app.
+    let thumbnail =
+        worker::thumbnail(&cover.bytes, THUMBNAIL.0, THUMBNAIL.1, &PREVIEW_MEMORY).ok()?;
     Some(format!(
         "data:image/jpeg;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(thumbnail)
