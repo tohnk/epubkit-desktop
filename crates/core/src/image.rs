@@ -1700,6 +1700,14 @@ fn resize_region(
             height,
             filter,
         )),
+        // Floating-point RGB, a TIFF's, is all that comes here flat and
+        // deeper; read where it lies too, as a copy of it is as large again.
+        DynamicImage::ImageRgb32F(buffer) => DynamicImage::ImageRgb32F(resize(
+            &*crop_imm(buffer, x, y, w, h),
+            width,
+            height,
+            filter,
+        )),
         other => other
             .crop_imm(x, y, w, h)
             .resize_exact(width, height, filter),

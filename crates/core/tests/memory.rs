@@ -476,6 +476,25 @@ fn a_deep_tiff_is_reckoned_at_its_depth() {
     }
 }
 
+/// A floating-point RGB TIFF is shrunk where it lies, as an eight- or
+/// sixteen-bit image is. It was copied whole first, the copy as large as the
+/// image: one of 3000 x 5000 held 556 MiB where 547 were set aside.
+#[test]
+fn a_floating_point_image_is_shrunk_without_a_copy() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let bytes = tiff_float(3000, 5000, false);
+    let path = dir.path().join("float.tiff");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let needed = memory_needed(&path, &options);
+    let (converted, peak) = peak_of(|| process_image(&bytes, "float.tiff", &options));
+    assert!(converted.is_ok());
+    let held = (bytes.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+}
+
 /// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
 /// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
 /// held more than was set aside.

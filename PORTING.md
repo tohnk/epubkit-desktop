@@ -624,7 +624,9 @@ To need less, an image of eight bits a channel is flattened where it lies,
 not copied, and turned only once flat; and a split spread's pages are read
 from the image where they lie, not cut out of it first. The same image comes
 out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
-794 MB.
+794 MB. Floating-point RGB, which a TIFF can be, is shrunk where it lies as
+eight- and sixteen-bit images are; it was copied whole first, which a 3000 x
+5000 one held 9 MiB past what was set aside for.
 
 Reading the header holds little, and that is set aside too while it is read.
 A JPEG's is read marker by marker, passing over every segment but its frame
