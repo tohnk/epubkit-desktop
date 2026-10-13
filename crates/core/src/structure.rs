@@ -1313,16 +1313,55 @@ fn pseudo_attributes(data: &str) -> HashMap<String, String> {
         let Some(end) = value[1..].find(quote) else {
             break;
         };
-        let text = value[1..1 + end]
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&");
-        found.insert(name, text);
+        found.insert(name, xml_unescape(&value[1..1 + end]));
         rest = &value[1 + end + 1..];
     }
     found
+}
+
+/// `text`, a pseudo-attribute's value, with its references made what they
+/// stand for, as XML has a reader decode them: character references,
+/// decimal or hex, and the five entities XML predefines. Each is decoded
+/// once, in a single pass, so `&#38;lt;` is `&lt;`, not `<`. A reference that
+/// does not read, or stands for no character, is left as it is.
+fn xml_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let decoded = after.find(';').and_then(|end| {
+            let name = &after[..end];
+            let character = match name {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                _ => {
+                    let number = name.strip_prefix('#')?;
+                    let value = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => number.parse::<u32>().ok()?,
+                    };
+                    char::from_u32(value)
+                }
+            }?;
+            Some((character, end))
+        });
+        match decoded {
+            Some((character, end)) => {
+                out.push(character);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether a stylesheet a chapter names applies where the book is read, by
