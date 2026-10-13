@@ -586,7 +586,8 @@ fn resample_buffer(width: u32, height: u32, options: &ImageOptions) -> u64 {
 /// component at the size its sampling makes it; so too for a sequential one
 /// whose first scan does not hold every component, which it decodes whole
 /// before it makes any pixels, as no row has all its components till the last
-/// scan; for one in one scan, nothing.
+/// scan, though such a JPEG is refused before it is decoded (see
+/// [`JpegFrame::decoded_wrongly`]); for one in one scan, nothing.
 fn jpeg_coefficients(frame: &JpegFrame) -> u64 {
     if !frame.progressive && usize::from(frame.first_scan) >= frame.sampling.len() {
         return 0;
@@ -617,17 +618,20 @@ struct JpegFrame {
 }
 
 impl JpegFrame {
-    /// Would the JPEG decoder here decode it wrongly? It lays the blocks of a
-    /// sequential scan that does not hold every component, as libjpeg reads
-    /// one, in the order of a scan that does, which is the same order only
-    /// where every component is sampled in full. A 4:2:0 JPEG with each
-    /// component in a scan of its own came out off by 117 of 255 in every
-    /// channel on average; a 4:2:2 one whose luma and blue share a scan, by
-    /// 103. A progressive JPEG goes another way, and comes out right.
+    /// Would the JPEG decoder here decode it wrongly? A sequential JPEG whose
+    /// first scan does not hold every component it decodes a way of its own,
+    /// which libjpeg's reading of the same file shows wrong in more ways than
+    /// one: it lays a scan's blocks in the order of a scan holding every
+    /// component, wrong wherever a component is subsampled (a 4:2:0 JPEG with
+    /// each component in a scan of its own came out off by 117 of 255 in
+    /// every channel on average); and with every component sampled in full it
+    /// still went wrong, an illustration's white bottom rows coming out black,
+    /// and restart markers at some intervals throwing it off by up to 46. So
+    /// every such JPEG is taken to be decoded wrongly. A progressive JPEG goes
+    /// another way, and comes out right, as does one with every component in
+    /// one scan, restart markers or not.
     fn decoded_wrongly(&self) -> bool {
-        !self.progressive
-            && usize::from(self.first_scan) < self.sampling.len()
-            && self.sampling.iter().any(|&sampling| sampling != (1, 1))
+        !self.progressive && usize::from(self.first_scan) < self.sampling.len()
     }
 }
 
@@ -1462,8 +1466,8 @@ fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
             UnsupportedError::from_format_and_kind(
                 ImageFormat::Jpeg.into(),
                 UnsupportedErrorKind::GenericFeature(
-                    "a sequential JPEG whose components are in separate scans, one of them \
-                     subsampled, which the decoder here decodes wrongly"
+                    "a sequential JPEG whose components are in separate scans, which the \
+                     decoder here decodes wrongly"
                         .into(),
                 ),
             ),

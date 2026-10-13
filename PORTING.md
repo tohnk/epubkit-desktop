@@ -509,18 +509,21 @@ types EPUB requires a reader to show, and few readers decode arithmetic-coded
 JPEG either.
 
 One kind the `image` crate's JPEG decoder (zune-jpeg) reads, but reads
-wrongly: a sequential JPEG whose components are in separate scans, with one of
-them subsampled. It lays such a scan's blocks in the order of a scan that
-holds every component, which is the same order only where every component is
-sampled in full, so a 4:2:0 JPEG with each component in a scan of its own
-came out off by 117 of 255 in every channel on average, where libjpeg read it
-right; and it was converted all the same, the original replaced.
-`jpeg-encoder` writes JPEGs that way when its Huffman tables are optimized,
-and `jpegtran` can rewrite one so. The port refuses such a JPEG, and leaves it
-as it is; one whose components are all sampled in full, progressive ones, and
-the usual JPEG with all its components in one scan, it converts as before.
-Two 4:2:2 layouts the decoder happens to read right are refused with the
-rest, which costs nothing but their conversion.
+wrongly: a sequential JPEG whose components are in separate scans. It decodes
+those a way of its own, and libjpeg's reading of the same files shows it
+wrong in more than one way. It lays a scan's blocks in the order of a scan
+that holds every component, wrong wherever a component is subsampled: a
+4:2:0 JPEG with each component in a scan of its own came out off by 117 of
+255 in every channel on average. And with every component sampled in full it
+still went wrong: an illustration on white came out with its bottom eight
+rows black, and the same illustration rewritten by `jpegtran` into one scan a
+component, with restart markers at some intervals, came out off by up to 46.
+Each was converted all the same, the original replaced. `jpeg-encoder` writes
+JPEGs that way when its Huffman tables are optimized, and `jpegtran` can
+rewrite one so. The port refuses every such JPEG, however its components are
+sampled, and leaves it as it is; progressive JPEGs, which zune-jpeg decodes
+another way, and the usual JPEG with all its components in one scan, restart
+markers or not, it converts as before, true to libjpeg's pixels.
 
 Both refuse an image of more than 178,956,970 pixels as a likely
 decompression bomb. The `image` crate on its own refuses one whose decoded

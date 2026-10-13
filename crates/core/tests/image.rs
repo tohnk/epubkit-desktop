@@ -1132,76 +1132,157 @@ fn a_real_tiff_is_read_by_the_bounded_walk() {
     }
 }
 
-/// A colour photo of `width` x `height` as a baseline JPEG sampled as
-/// `sampling` says, its components in one scan or, with Huffman tables
-/// optimized, as `jpeg-encoder` writes them then, each in a scan of its own.
-fn baseline_jpeg(
-    width: u32,
-    height: u32,
+/// An illustration on white, 96 x 64: a block of colour in the middle and
+/// white margins, the bottom eight rows among them.
+fn illustration() -> RgbImage {
+    RgbImage::from_fn(96, 64, |x, y| {
+        if (16..80).contains(&x) && (12..44).contains(&y) {
+            Rgb([(x * 3) as u8, 90, (y * 5) as u8])
+        } else {
+            Rgb([255, 255, 255])
+        }
+    })
+}
+
+/// `rgb` as a JPEG sampled as `sampling` says: progressive, or sequential
+/// with its components in one scan or, with Huffman tables optimized, as
+/// `jpeg-encoder` writes them then, each in a scan of its own; with a restart
+/// marker every `restart` MCUs, or none.
+fn jpeg_of(
+    rgb: &RgbImage,
     sampling: jpeg_encoder::SamplingFactor,
+    progressive: bool,
     separate_scans: bool,
-) -> (RgbImage, Vec<u8>) {
-    let rgb = RgbImage::from_fn(width, height, |x, y| {
-        Rgb([
-            (x * 255 / width) as u8,
-            (y * 255 / height) as u8,
-            ((x + y) * 2) as u8,
-        ])
-    });
+    restart: u16,
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut encoder = jpeg_encoder::Encoder::new(&mut out, 90);
     encoder.set_sampling_factor(sampling);
+    encoder.set_progressive(progressive);
     encoder.set_optimized_huffman_tables(separate_scans);
+    encoder.set_restart_interval(restart);
     encoder
         .encode(
             rgb.as_raw(),
-            width as u16,
-            height as u16,
+            rgb.width() as u16,
+            rgb.height() as u16,
             jpeg_encoder::ColorType::Rgb,
         )
         .unwrap();
-    (rgb, out)
+    out
 }
 
-/// A baseline JPEG whose components are in separate scans, with one of them
-/// subsampled, is decoded wrongly by the JPEG decoder here — a 4:2:0 one came
-/// out with every channel off by 117 of 255 on average, libjpeg decoding it
-/// right — and was converted all the same, the original replaced. Such a
-/// JPEG is refused, for conversion and for a thumbnail, and so left as it is.
-/// One with every component sampled in full is decoded right, and converts.
+/// A sequential JPEG whose components are in separate scans is decoded
+/// wrongly by the JPEG decoder here, however they are sampled, where libjpeg
+/// decodes it right: a 4:2:0 one came out off by 117 of 255 in every channel
+/// on average; an illustration on white in 4:4:4 with its bottom eight rows
+/// black; and the same illustration rewritten by `jpegtran` into one scan a
+/// component with a restart every three rows of MCUs, 31 off (the fixture
+/// `separate-scans-restarts.jpg`; libjpeg decodes it within half a level of
+/// the illustration). Each was converted all the same, the original
+/// replaced. Such a JPEG is refused, for conversion and for a thumbnail, and
+/// so left as it is.
 #[test]
-fn a_baseline_jpeg_in_separate_scans_that_is_subsampled_is_refused() {
-    let (_, split) = baseline_jpeg(96, 64, jpeg_encoder::SamplingFactor::F_2_2, true);
-    assert!(
-        process_image(&split, "split.jpg", &ImageOptions::default()).is_err(),
-        "a 4:2:0 JPEG in separate scans was converted"
+fn a_sequential_jpeg_in_separate_scans_is_refused() {
+    let gradient = RgbImage::from_fn(96, 64, |x, y| {
+        Rgb([
+            (x * 255 / 96) as u8,
+            (y * 255 / 64) as u8,
+            ((x + y) * 2) as u8,
+        ])
+    });
+    let restarts = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/separate-scans-restarts.jpg"
+    ))
+    .unwrap();
+    // The fixture is what it says: three scans, and restart markers.
+    assert_eq!(
+        restarts.windows(2).filter(|w| w == &[0xFF, 0xDA]).count(),
+        3
     );
-    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
-    assert!(
-        epubkit_core::image::thumbnail(&split, 48, 48, &budget).is_err(),
-        "a thumbnail was made of it"
-    );
+    assert!(restarts.windows(2).any(|w| w == [0xFF, 0xDD]));
 
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    for (name, jpeg) in [
+        (
+            "4:2:0",
+            jpeg_of(
+                &gradient,
+                jpeg_encoder::SamplingFactor::F_2_2,
+                false,
+                true,
+                0,
+            ),
+        ),
+        (
+            "4:4:4 on white",
+            jpeg_of(
+                &illustration(),
+                jpeg_encoder::SamplingFactor::F_1_1,
+                false,
+                true,
+                0,
+            ),
+        ),
+        ("4:4:4 with restarts", restarts),
+    ] {
+        assert!(
+            process_image(&jpeg, "split.jpg", &ImageOptions::default()).is_err(),
+            "{name}: a JPEG in separate scans was converted"
+        );
+        assert!(
+            epubkit_core::image::thumbnail(&jpeg, 48, 48, &budget).is_err(),
+            "{name}: a thumbnail was made of it"
+        );
+    }
+}
+
+/// The JPEGs the decoder reads right still convert, true to their pixels: the
+/// same illustration on white with its components in one scan, or
+/// progressive, each with restart markers and without. The white below the
+/// colour stays white, as it did not in separate scans.
+#[test]
+fn a_jpeg_in_one_scan_or_progressive_converts_true_to_its_pixels() {
+    let source = illustration();
     let options = ImageOptions {
         grayscale: false,
         eink_quantize: false,
         contrast_boost: false,
         ..ImageOptions::default()
     };
-    let (source, full) = baseline_jpeg(96, 64, jpeg_encoder::SamplingFactor::F_1_1, true);
-    let converted = process_image(&full, "full.jpg", &options).unwrap();
-    let page = image::load_from_memory(&converted[0].bytes)
-        .unwrap()
-        .to_rgb8();
-    let error: u64 = page
-        .as_raw()
-        .iter()
-        .zip(source.as_raw())
-        .map(|(a, b)| u64::from(a.abs_diff(*b)))
-        .sum();
-    let mean = error as f64 / source.as_raw().len() as f64;
-    assert!(
-        mean < 8.0,
-        "a 4:4:4 JPEG in separate scans came out {mean} off"
-    );
+    for (progressive, restart) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let jpeg = jpeg_of(
+            &source,
+            jpeg_encoder::SamplingFactor::F_1_1,
+            progressive,
+            false,
+            restart,
+        );
+        let converted = process_image(&jpeg, "art.jpg", &options).unwrap();
+        let page = image::load_from_memory(&converted[0].bytes)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(page.dimensions(), source.dimensions());
+        let error: u64 = page
+            .as_raw()
+            .iter()
+            .zip(source.as_raw())
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        let mean = error as f64 / source.as_raw().len() as f64;
+        assert!(
+            mean < 8.0,
+            "progressive {progressive}, restart {restart}: {mean} off"
+        );
+        let bottom = (56..64).flat_map(|y| (0..96).map(move |x| (x, y)));
+        let darkest = bottom
+            .flat_map(|(x, y)| page.get_pixel(x, y).0)
+            .min()
+            .unwrap();
+        assert!(
+            darkest >= 240,
+            "progressive {progressive}, restart {restart}: the white came out {darkest}"
+        );
+    }
 }
