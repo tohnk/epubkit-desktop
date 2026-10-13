@@ -1167,6 +1167,17 @@ const TURNING: [Property; 4] = [
     Property::Translate,
 ];
 
+/// The properties that show only part of what a box holds, or move it along
+/// a path: an image split into pages under one would show other parts of
+/// itself, or be cut short where it was whole. Rounded corners clip too, an
+/// image's own, and those of a box that hides what overflows it.
+const CLIPPING: [Property; 4] = [
+    Property::ClipPath,
+    Property::Clip,
+    Property::Mask,
+    Property::OffsetPath,
+];
+
 /// The properties that draw a box otherwise than as it is: turned or slid,
 /// clipped, masked, filtered, faded, blended, or not at all.
 const DRAWING: [Property; 14] = [
@@ -2047,23 +2058,26 @@ impl<'a> Layout<'a> {
 
     /// Could the box `element` is in, one level up or more, not take its pages
     /// where it took it: a box of a set height or shape, one the book turns,
-    /// or lays over the page? The page's own, `<html>` and `<body>`, runs on
-    /// onto the pages after; only one that hides what overflows it frames.
+    /// clips or lays over the page? The page's own, `<html>` and `<body>`,
+    /// runs on onto the pages after; only one that hides what overflows it
+    /// frames by its size.
     pub(crate) fn frames(&self, element: &Node) -> bool {
         let own = self.sizing(element);
         let set = |property| own.could_be_any(property, &[Value::Set, Value::Unknown]);
-        if TURNING.into_iter().any(set) {
+        let hides = set(Property::OverflowX) || set(Property::OverflowY);
+        if TURNING.into_iter().chain(CLIPPING).any(set) || set(Property::BorderRadius) && hides {
             return true;
         }
         if matches!(local_name(element).as_str(), "html" | "body") {
-            return self.capped(element) && (set(Property::OverflowX) || set(Property::OverflowY));
+            return self.capped(element) && hides;
         }
         self.capped(element) || set(Property::Position)
     }
 
     /// Would `element`, a page of an image, keeping the style it has, take a
     /// size or proportions of its own: a height, or a screen high with a
-    /// width, a ratio; or would it be turned, or laid over the others?
+    /// width, a ratio; or would it be turned, clipped, or laid over the
+    /// others?
     pub(crate) fn frames_itself(&self, element: &Node) -> bool {
         let own = self.sizing(element);
         let set = |property| own.could_be_any(property, &[Value::Set, Value::Unknown]);
@@ -2072,7 +2086,8 @@ impl<'a> Layout<'a> {
             || own.could_be_any(Property::MaxHeight, &of_its_own)
             || set(Property::AspectRatio)
             || set(Property::Position)
-            || TURNING.into_iter().any(set)
+            || TURNING.into_iter().chain(CLIPPING).any(set)
+            || set(Property::BorderRadius)
             || set(Property::Contain)
         {
             return true;
@@ -2592,6 +2607,29 @@ mod tests {
         assert!(sized("svg { max-inline-size: 30em }"));
         assert!(sized("svg { aspect-ratio: 2 }"));
         assert!(sized("svg { height: 50vh }"));
+    }
+
+    /// A box that clips what it holds, or moves it along a path, frames it,
+    /// and so do rounded corners where the box hides what overflows it; an
+    /// image clipped or rounded itself frames itself. A fade frames nothing.
+    #[test]
+    fn what_clips_an_image_frames_it() {
+        let content = document(r#"<div id="frame"><img id="image" src="a.png" alt=""/></div>"#);
+        let framing =
+            |css: &str, id: &str| laid_out(css, &element(&content, id), &Reshaping::default());
+        for css in [
+            "#frame { clip-path: inset(10%) }",
+            "#frame { -webkit-mask-image: url(m.png) }",
+            "#frame { offset-path: path('M 0 0 L 9 9') }",
+            "#frame { border-radius: 1em; overflow: hidden }",
+        ] {
+            assert!(framing(css, "frame").0, "{css}");
+        }
+        assert!(!framing("#frame { border-radius: 1em }", "frame").0);
+        assert!(!framing("#frame { opacity: .5; filter: blur(1px) }", "frame").0);
+        assert!(framing("#image { clip-path: inset(0 50% 0 0) }", "image").1);
+        assert!(framing("#image { border-radius: 4px }", "image").1);
+        assert!(!framing("#image { opacity: .5 }", "image").1);
     }
 
     /// A percentage of the height of a box whose own height grows with what it
