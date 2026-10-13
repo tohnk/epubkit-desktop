@@ -813,7 +813,16 @@ stylesheets can put the image elsewhere or at another size, as SVG 2 lets
 would draw otherwise than the SVG, which they style apart from it: under
 `img { visibility: hidden }` a cover in plain sight was hidden once it was
 an `<img>`. The `<img>` is put where the SVG is, as it will be, and the
-cascade asked of it too. A chapter styled by a stylesheet too large to read
+cascade asked of it too, where it takes after the box it is in as the SVG
+need not: hidden in a hidden `<div>`, where the SVG was made `visible`. And
+as no list of what draws an image otherwise can foresee what a rule for
+images may do, `img { width: 0 }` say, which left nothing of the cover, a
+wrapper stays wherever a rule that may style its `<img>` sets anything but
+colours, fonts and how text is laid out, borders without rounded corners,
+backgrounds, padding, where pages break, margins that are not negative,
+sizes left to the image, or that it is visible. What the `<img>`'s own
+style sets, its size, its margins and that it is a block, a rule does not
+unless it is important. A chapter styled by a stylesheet too large to read
 keeps its wrappers. Light Novel mode keeps such an image whole, and asks the
 same of the pages that would take a wrapper's place.
 

@@ -1388,7 +1388,7 @@ fn free_images(
         };
         for (svg, image, page) in &stand_ins {
             if !layout.frames_itself(page)
-                && !layout.drawn_otherwise(page)
+                && shown_whole(&layout, page)
                 && !framed_around(svg)
                 && drawn_as_it_is(&layout, svg, image)
             {
@@ -1527,8 +1527,7 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
                 .collect();
             let layout = Layout::new(&sheets, &reshaping, &budget);
             for (svg, image, img) in candidates {
-                let unwrapped =
-                    drawn_as_it_is(&layout, &svg, &image) && !layout.drawn_otherwise(&img);
+                let unwrapped = drawn_as_it_is(&layout, &svg, &image) && shown_whole(&layout, &img);
                 wrappers.push((svg, img, unwrapped));
             }
         }
@@ -1654,6 +1653,13 @@ fn wrapped_image(svg: &Node) -> Option<Node> {
 
     let image = image?;
     shows_whole(svg, &image).then_some(image)
+}
+
+/// Would `img`, an image that takes a wrapper's place, show the whole of
+/// its picture, as the wrapper did: drawn as it is, where what it is in would
+/// show it, and styled by no rule beyond what leaves it so?
+fn shown_whole(layout: &Layout, img: &Node) -> bool {
+    !layout.drawn_otherwise(img) && !layout.styled_beyond_harmless(img)
 }
 
 /// Does `svg` draw `image`, the image it wraps, as an `<img>` of it would?

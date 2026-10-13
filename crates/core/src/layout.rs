@@ -1202,6 +1202,10 @@ const DRAWING: [Property; 14] = [
     Property::Display,
 ];
 
+/// The properties a box takes after the box it is in, but for those it is
+/// given of its own.
+const INHERITED: [Property; 1] = [Property::Visibility];
+
 /// The attributes SVG draws an element by that are CSS properties too: CSS
 /// takes each as a declaration of its property, at no specificity, before
 /// every rule.
@@ -1249,14 +1253,26 @@ struct Declaration {
     partial: bool,
 }
 
+/// A declaration that may style an image beyond what leaves it as it would
+/// be shown, as [`harmless`] tells: the name of its property, and whether it
+/// is important.
+#[derive(Debug, Clone)]
+struct Beyond {
+    name: String,
+    important: bool,
+}
+
 /// The declarations of a rule's block or a `style` attribute that size or
-/// place a box.
+/// place a box, and those that may style an image beyond what leaves it as
+/// it would be shown.
 #[derive(Debug, Default)]
 struct Declarations {
     own: Vec<Declaration>,
     /// Those of the rules nested in the block, whose selectors are not
     /// worked out.
     nested: Vec<Declaration>,
+    beyond: Vec<Beyond>,
+    nested_beyond: Vec<Beyond>,
 }
 
 /// The units that are shares of the screen.
@@ -1301,6 +1317,10 @@ fn declarations_in(input: &mut Parser<'_, '_>, found: &mut Declarations, depth: 
                         important: false,
                         partial: false,
                     });
+                    inner.beyond.push(Beyond {
+                        name: String::new(),
+                        important: true,
+                    });
                 } else {
                     let _ = chunk.parse_nested_block(|block| {
                         declarations_in(block, &mut inner, depth - 1);
@@ -1309,22 +1329,33 @@ fn declarations_in(input: &mut Parser<'_, '_>, found: &mut Declarations, depth: 
                 }
                 found.nested.extend(inner.own);
                 found.nested.extend(inner.nested);
+                found.nested_beyond.extend(inner.beyond);
+                found.nested_beyond.extend(inner.nested_beyond);
             }
             if !nested {
                 chunk.reset(&start);
-                declaration(chunk, &mut found.own);
+                declaration(chunk, found);
             }
             Ok::<_, ParseError<()>>(())
         });
     }
 }
 
-/// Read one declaration into `own`, if it is of a property that sizes,
-/// places or draws a box.
-fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option<()> {
+/// Read one declaration into `found`: as one that sizes, places or draws a
+/// box, if it is of such a property; and as one that may style an image
+/// beyond what leaves it as it would be shown, if it may.
+fn declaration(input: &mut Parser<'_, '_>, found: &mut Declarations) -> Option<()> {
     use Property::*;
     let name = input.expect_ident().ok()?.to_ascii_lowercase();
     input.expect_colon().ok()?;
+    let start = input.state();
+    let (terms, important) = terms_of(input);
+    if !harmless(&name, &terms) {
+        found.beyond.push(Beyond {
+            name: name.clone(),
+            important,
+        });
+    }
     let (properties, partial): (&[Property], bool) = match name.as_str() {
         "height" => (&[Height], false),
         "max-height" => (&[MaxHeight], false),
@@ -1372,13 +1403,12 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
         | "border-end-end-radius" => (&[BorderRadius], true),
         "visibility" => (&[Visibility], false),
         "display" => (&[Display], false),
-        _ => return None,
+        _ => return Some(()),
     };
-    let start = input.state();
     for &property in properties {
         input.reset(&start);
         let (value, important) = value_of(property, input);
-        own.push(Declaration {
+        found.own.push(Declaration {
             property,
             value,
             important,
@@ -1391,19 +1421,7 @@ fn declaration(input: &mut Parser<'_, '_>, own: &mut Vec<Declaration>) -> Option
 /// What the value `input` holds does to a box for `property`, and whether
 /// it is `!important`.
 fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
-    let mut terms = Terms::default();
-    let mut important = false;
-    while let Ok(token) = input.next() {
-        let token = token.clone();
-        if matches!(token, Token::Delim('!')) {
-            important = input
-                .try_parse(|i| i.expect_ident_matching("important"))
-                .is_ok();
-        } else {
-            terms.take(input, &token, true, MAX_VALUE_NESTING);
-        }
-    }
-
+    let (terms, important) = terms_of(input);
     let said = |words: &[&str]| {
         terms
             .words
@@ -1542,6 +1560,116 @@ fn value_of(property: Property, input: &mut Parser<'_, '_>) -> (Value, bool) {
     (value, important)
 }
 
+/// What the value `input` holds is made of, and whether it is `!important`.
+fn terms_of(input: &mut Parser<'_, '_>) -> (Terms, bool) {
+    let mut terms = Terms::default();
+    let mut important = false;
+    while let Ok(token) = input.next() {
+        let token = token.clone();
+        if matches!(token, Token::Delim('!')) {
+            important = input
+                .try_parse(|i| i.expect_ident_matching("important"))
+                .is_ok();
+        } else {
+            terms.take(input, &token, true, MAX_VALUE_NESTING);
+        }
+    }
+    (terms, important)
+}
+
+/// The keywords that leave a property as it would be.
+const RESETS: [&str; 4] = ["initial", "unset", "revert", "revert-layer"];
+
+/// Whether a declaration of the property `name`, of a value made of
+/// `terms`, leaves an image as it would be shown, sized as its image is:
+/// it sets a colour, a font or how text is laid out, a border but for its
+/// corners, a background, padding, where pages break, or how boxes are
+/// sized and their content measured; a margin that is not negative; a size
+/// that is left to the image; or that the image is visible. A custom
+/// property sets nothing itself. Anything else may hide the image, size it
+/// otherwise, move it or draw it otherwise, whatever it is.
+fn harmless(name: &str, terms: &Terms) -> bool {
+    let name = ["-webkit-", "-moz-", "-ms-", "-o-", "-epub-"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name);
+    let only = |words: &[&str]| {
+        !terms.unknown
+            && terms
+                .words
+                .iter()
+                .all(|word| words.contains(&word.as_str()) || RESETS.contains(&word.as_str()))
+    };
+    let any_value = [
+        "color",
+        "background",
+        "padding",
+        "font",
+        "text-",
+        "line-height",
+        "letter-spacing",
+        "word-spacing",
+        "white-space",
+        "hyphens",
+        "word-break",
+        "overflow-wrap",
+        "word-wrap",
+        "vertical-align",
+        "page-break-",
+        "break-",
+        "column-break-",
+        "orphans",
+        "widows",
+        "box-sizing",
+        "image-rendering",
+        "--",
+    ];
+    let starts = |start: &&str| {
+        name.strip_prefix(*start)
+            .is_some_and(|rest| start.ends_with('-') || rest.is_empty() || rest.starts_with('-'))
+    };
+    if any_value.iter().any(starts) {
+        return true;
+    }
+    match name {
+        _ if name.starts_with("border") => !name.ends_with("radius"),
+        _ if name.starts_with("margin") => {
+            only(&["auto"]) && terms.numbers.iter().all(|&number| number >= 0.0)
+        }
+        "width" | "height" | "inline-size" | "block-size" => only(&["auto"]) && !terms.any_number(),
+        "min-width" | "min-height" | "min-inline-size" | "min-block-size" => {
+            only(&["auto"]) && terms.numbers.iter().all(|&number| number == 0.0)
+        }
+        "visibility" => only(&["visible"]),
+        // As much as the image that takes a wrapper's place has of its own.
+        "max-width" | "max-height" | "max-inline-size" | "max-block-size" => {
+            only(&["none"])
+                && (!terms.any_number()
+                    || !terms.fixed
+                        && !terms.screen
+                        && !terms.other
+                        && terms.numbers.iter().all(|&number| number == 1.0))
+        }
+        _ => false,
+    }
+}
+
+/// The names of the properties the declarations in `style` set, lowercased.
+fn declared_names(style: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut input = ParserInput::new(style);
+    let mut parser = Parser::new(&mut input);
+    while !parser.is_exhausted() {
+        let _ = parser.parse_until_after(Delimiter::Semicolon, |chunk| {
+            if let Ok(name) = chunk.expect_ident() {
+                names.push(name.to_ascii_lowercase());
+            }
+            Ok::<_, ParseError<()>>(())
+        });
+    }
+    names
+}
+
 /// What a value is made of, as far as telling what it does to a box goes.
 #[derive(Debug, Default)]
 struct Terms {
@@ -1643,6 +1771,9 @@ struct SheetRule {
     /// the rest.
     applies: Tri,
     declarations: Vec<Declaration>,
+    /// Those that may style an image beyond what leaves it as it would be
+    /// shown.
+    beyond: Vec<Beyond>,
 }
 
 impl Sheet {
@@ -1692,18 +1823,22 @@ impl Sheet {
                         return None;
                     }
                     let found = parse_declarations(declarations);
-                    let mut cost = found.own.len() + found.nested.len();
-                    if !found.own.is_empty() {
+                    let mut cost = found.own.len()
+                        + found.nested.len()
+                        + found.beyond.len()
+                        + found.nested_beyond.len();
+                    if !found.own.is_empty() || !found.beyond.is_empty() {
                         let selectors = &css[selectors];
                         if selectors.len() > left.saturating_sub(cost) {
                             return None;
                         }
                         let selectors = parse_selectors(selectors);
                         cost += pieces(&selectors);
-                        self.push(selectors, applies, found.own);
+                        self.push(selectors, applies, found.own, found.beyond);
                     }
-                    if !found.nested.is_empty() {
-                        self.push(vec![Complex::anything()], applies, found.nested);
+                    if !found.nested.is_empty() || !found.nested_beyond.is_empty() {
+                        let anything = vec![Complex::anything()];
+                        self.push(anything, applies, found.nested, found.nested_beyond);
                     }
                     *left = left.checked_sub(cost)?;
                 }
@@ -1724,7 +1859,13 @@ impl Sheet {
         Some(())
     }
 
-    fn push(&mut self, selectors: Vec<Complex>, applies: Tri, declarations: Vec<Declaration>) {
+    fn push(
+        &mut self,
+        selectors: Vec<Complex>,
+        applies: Tri,
+        declarations: Vec<Declaration>,
+        beyond: Vec<Beyond>,
+    ) {
         if applies == Tri::No {
             return;
         }
@@ -1742,6 +1883,7 @@ impl Sheet {
             selectors,
             applies,
             declarations,
+            beyond,
         });
     }
 
@@ -1949,6 +2091,9 @@ impl<'a> Layout<'a> {
             }
             for rule_index in sheet.rules_for(&keys) {
                 let rule = &sheet.rules[rule_index];
+                if rule.declarations.is_empty() {
+                    continue;
+                }
                 let applies = applies.and(rule.applies);
                 let (mut sure, mut perhaps) = (None, None);
                 for selector in &rule.selectors {
@@ -2014,7 +2159,11 @@ impl<'a> Layout<'a> {
                 }
             }
             if !settled {
-                values.push(Value::Initial);
+                values.push(if INHERITED.contains(&property) {
+                    Value::Inherit
+                } else {
+                    Value::Initial
+                });
             }
             for value in values {
                 found.values[property as usize] |= if value == Value::Inherit {
@@ -2123,6 +2272,45 @@ impl<'a> Layout<'a> {
         DRAWING
             .into_iter()
             .any(|property| own.could_be_any(property, &[Value::Set, Value::Unknown]))
+    }
+
+    /// Could a rule style `element`, an image that takes another's place,
+    /// beyond what leaves it as it would be shown, as [`harmless`] tells?
+    /// What its own `style` sets, which is taken to be as it should be, a
+    /// rule does not, unless the rule's is important: a shorthand there sets
+    /// every longhand it stands for.
+    pub(crate) fn styled_beyond_harmless(&self, element: &Node) -> bool {
+        let own = element
+            .get_attribute_no_ns("style")
+            .map_or_else(Vec::new, |style| declared_names(&style));
+        let overridden = |name: &str| {
+            own.iter().any(|own| {
+                name.strip_prefix(own.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            })
+        };
+        let keys = keys_of(element);
+        for (sheet, applies) in self.styles {
+            if *applies == Tri::No {
+                continue;
+            }
+            for rule_index in sheet.rules_for(&keys) {
+                let rule = &sheet.rules[rule_index];
+                let styles = rule
+                    .beyond
+                    .iter()
+                    .any(|beyond| beyond.important || !overridden(&beyond.name));
+                if styles
+                    && rule
+                        .selectors
+                        .iter()
+                        .any(|selector| selector.matches(element, self.matching) != Tri::No)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Could CSS give `element` a size of its own, beside what its attributes
@@ -2346,10 +2534,12 @@ mod tests {
         let css: String = (0..1000)
             .map(|i| format!(".a{i} {{ height: 0; width: 0 }} p {{ color: red }}\n"))
             .collect();
-        let mut left = 4000;
+        // Each rule's selector, and its two declarations, each of which
+        // also sizes an image beyond what leaves it as it would be shown.
+        let mut left = 6000;
         assert!(Sheet::parse(&css, &mut left).is_some());
         assert_eq!(left, 1000);
-        let mut left = 2000;
+        let mut left = 4000;
         assert!(Sheet::parse(&css, &mut left).is_none());
         assert_eq!(pieces(&parse_selectors("a b, :is(.c, d > e):not(f)")), 7);
     }

@@ -1781,6 +1781,85 @@ fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
     }
 }
 
+/// The `<img>` that takes a wrapper's place takes after what it is in as the
+/// SVG did not: hidden as the box around it is, where the SVG was shown,
+/// `visible` by a rule of its own. And a rule for images may style it beyond
+/// any list of what draws an image otherwise: sized to nothing, zoomed,
+/// floated, its content replaced. A wrapper stays as it is where a rule that
+/// may style its `<img>` sets anything but colours, fonts, borders without
+/// rounded corners, backgrounds, padding, how text is aligned, where pages
+/// break, margins that are not negative, and sizes left to the image. What
+/// the `<img>`'s own style sets, its size and margins and that it is a
+/// block, a rule cannot, unless it is important.
+#[test]
+fn an_svg_whose_img_a_rule_would_style_beyond_harmless_styling_is_not_unwrapped() {
+    let cases = [
+        (
+            "div { visibility: hidden } svg { visibility: visible }",
+            false,
+        ),
+        ("div { visibility: hidden }", false),
+        ("img { width: 0 }", false),
+        ("div > * { height: 1px }", false),
+        ("img { zoom: 0.1 }", false),
+        ("img { float: left }", false),
+        ("img { content: url(other.png) }", false),
+        ("img { border-radius: 50% }", false),
+        ("img { margin-top: -100% !important }", false),
+        ("img { display: none !important }", false),
+        ("img { max-width: 50% !important }", false),
+        ("img { width: var(--w) }", false),
+        ("* { box-sizing: border-box; margin: 0; padding: 0 }", true),
+        (
+            "img { max-width: 100%; height: auto; border: none; color: red; font-size: 2em; \
+             text-align: center; page-break-inside: avoid; background: white; padding: 1em }",
+            true,
+        ),
+        (
+            "img { width: auto; min-height: 0; max-width: none !important }",
+            true,
+        ),
+        // What its own style sets.
+        (
+            "img { display: inline; max-height: 50%; margin: -1em }",
+            true,
+        ),
+        (
+            "div { visibility: hidden } div > * { visibility: visible }",
+            true,
+        ),
+    ];
+
+    for (css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(
+            dir.path(),
+            "page.xhtml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="cover" viewBox="0 0 600 800"><image width="600" height="800" xlink:href="images/cover.png"/></svg></div>
+</body>
+</html>
+"#,
+        );
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(fixed == 1, unwrapped, "{css}: {after}");
+        assert_eq!(after.contains(r#"class="cover""#), !unwrapped, "{css}");
+    }
+}
+
 /// An SVG with no viewBox draws its image at the size it gives it, unscaled,
 /// in a box of the SVG's own width and height. An image of that very size at
 /// its origin is all it shows, and the SVG is unwrapped, as one with a viewBox
