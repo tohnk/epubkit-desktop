@@ -25,7 +25,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use crate::image::{self, ImageOptions, ProcessedImage};
@@ -49,6 +49,8 @@ pub struct CappedAllocator;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// The most that may be live. `usize::MAX` is no limit.
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Whether an allocation has been refused since the limit was last set.
+static REFUSED: AtomicBool = AtomicBool::new(false);
 
 // SAFETY: every method forwards to the system allocator for a layout of
 // non-zero size, as `GlobalAlloc` requires, and only keeps a tally beside it.
@@ -89,16 +91,20 @@ unsafe impl GlobalAlloc for CappedAllocator {
 }
 
 /// Add `size` to what is live, unless that would pass the limit, in which case
-/// leave the tally as it was and refuse. A refused allocation returns null,
-/// which makes the standard library abort the process — the worker dying is
-/// how a decode that would overrun its cap is stopped.
+/// leave the tally as it was, note the refusal, and refuse. A refused
+/// allocation returns null, which makes the standard library abort the
+/// process — the worker dying is how a decode that would overrun its cap is
+/// stopped — unless the allocation was a fallible one, such as reading a
+/// file, which then fails with an error the worker reports as an overrun.
 fn reserve(size: usize) -> bool {
     let mut live = LIVE.load(Ordering::Relaxed);
     loop {
         let Some(new) = live.checked_add(size) else {
+            REFUSED.store(true, Ordering::Relaxed);
             return false;
         };
         if new > LIMIT.load(Ordering::Relaxed) {
+            REFUSED.store(true, Ordering::Relaxed);
             return false;
         }
         match LIVE.compare_exchange_weak(live, new, Ordering::Relaxed, Ordering::Relaxed) {
@@ -111,6 +117,7 @@ fn reserve(size: usize) -> bool {
 /// Hold everything the process allocates from here to [`clear_limit`] within
 /// `cap` bytes more than is live now.
 fn set_limit(cap: u64) {
+    REFUSED.store(false, Ordering::Relaxed);
     let live = LIVE.load(Ordering::Relaxed);
     let limit = usize::try_from(cap)
         .ok()
@@ -119,9 +126,10 @@ fn set_limit(cap: u64) {
     LIMIT.store(limit, Ordering::Relaxed);
 }
 
-/// Take the limit off again.
-fn clear_limit() {
+/// Take the limit off again, and say whether anything was refused under it.
+fn clear_limit() -> bool {
     LIMIT.store(usize::MAX, Ordering::Relaxed);
+    REFUSED.load(Ordering::Relaxed)
 }
 
 // --------------------------------------------------------------- the parent
@@ -175,6 +183,7 @@ pub fn convert(path: &Path, filename: &str, options: &ImageOptions, cap: u64) ->
     match with_worker(|worker| worker.convert(path, filename, options, cap)) {
         Some(Reply::Done(outputs)) => Ok(Converted::Done(outputs)),
         Some(Reply::Undecodable) => Ok(Converted::Undecodable),
+        Some(Reply::Overran) => Ok(Converted::Overran),
         Some(Reply::Unreadable(message)) => {
             Err(Error::Image(format!("{}: {message}", path.display())))
         }
@@ -244,11 +253,15 @@ const OP_THUMBNAIL: u8 = 2;
 const STATUS_OK: u8 = 0;
 const STATUS_UNDECODABLE: u8 = 1;
 const STATUS_UNREADABLE: u8 = 2;
+/// The cap refused an allocation the work could not do without, and the work
+/// failed for it, without the worker being stopped.
+const STATUS_OVERRAN: u8 = 3;
 
 /// What a worker replied to a convert request.
 enum Reply {
     Done(Vec<ProcessedImage>),
     Undecodable,
+    Overran,
     /// The file could not be read; the message says why.
     Unreadable(String),
 }
@@ -295,6 +308,7 @@ impl Worker {
                 }
                 Ok(Reply::Done(outputs))
             }
+            STATUS_OVERRAN => Ok(Reply::Overran),
             STATUS_UNREADABLE => Ok(Reply::Unreadable(
                 String::from_utf8_lossy(&read_block(&mut self.stdout)?).into_owned(),
             )),
@@ -398,7 +412,7 @@ fn serve_one(input: &mut impl Read, output: &mut impl Write) -> io::Result<bool>
                     }
                     Err(error) => Err(Some(error.to_string())),
                 };
-            clear_limit();
+            let refused = clear_limit();
 
             match reply {
                 Ok(outputs) => {
@@ -408,6 +422,10 @@ fn serve_one(input: &mut impl Read, output: &mut impl Write) -> io::Result<bool>
                         write_processed_image(output, image)?;
                     }
                 }
+                // Work that failed after the cap refused it something, a
+                // fallible allocation reading the file or decoding it, overran
+                // the cap: the file is not unreadable, nor the image broken.
+                Err(_) if refused => output.write_all(&[STATUS_OVERRAN])?,
                 Err(None) => output.write_all(&[STATUS_UNDECODABLE])?,
                 Err(Some(message)) => {
                     output.write_all(&[STATUS_UNREADABLE])?;
@@ -422,12 +440,19 @@ fn serve_one(input: &mut impl Read, output: &mut impl Write) -> io::Result<bool>
 
             set_limit(cap);
             let made = image::thumbnail_decode(&bytes, max_width, max_height);
-            clear_limit();
+            let refused = clear_limit();
 
             match made {
                 Ok(jpeg) => {
                     output.write_all(&[STATUS_OK])?;
                     write_block(output, &jpeg)?;
+                }
+                Err(_) if refused => {
+                    output.write_all(&[STATUS_OVERRAN])?;
+                    write_block(
+                        output,
+                        b"making the thumbnail would take more than the memory set aside",
+                    )?;
                 }
                 Err(error) => {
                     output.write_all(&[STATUS_UNDECODABLE])?;

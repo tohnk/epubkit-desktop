@@ -674,7 +674,10 @@ tiny image padded to a large file no longer sits in two buffers at once. A
 cover thumbnail has no file to name, so its bytes are sent to the worker, and
 the memory set aside counts that copy. A file that cannot be read fails the
 book, as reading it in the parent once did; one that will not decode leaves
-its image alone.
+its image alone. And where the cap refuses an allocation that fails with an
+error rather than stopping the worker — reading the file allocates that way,
+as some decoders do — the image is left as one that overran, not taken for a
+file that cannot be read or an image that will not decode.
 
 ### Light Novel mode keeps every page it makes
 

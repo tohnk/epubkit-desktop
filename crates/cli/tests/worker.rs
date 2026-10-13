@@ -177,3 +177,32 @@ fn a_deep_tiff_converts_within_the_memory_reckoned_for_it() {
         );
     }
 }
+
+/// A readable file larger than the cap is an overrun, not a file that cannot
+/// be read: reading it allocates fallibly, so the cap's refusal comes back as
+/// an error rather than stopping the worker, and must not fail the book.
+#[test]
+fn a_file_larger_than_the_cap_is_an_overrun_not_an_error() {
+    use_the_cli_as_worker();
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = std::fs::read(png_file(dir.path())).unwrap();
+    bytes.resize(4 << 20, 0);
+    let path = dir.path().join("padded.png");
+    std::fs::write(&path, bytes).unwrap();
+
+    let converted = worker::convert(&path, "padded.png", &ImageOptions::default(), 1 << 20);
+    assert!(
+        matches!(converted, Ok(Converted::Overran)),
+        "a refused read came back as {:?}",
+        converted
+            .as_ref()
+            .map(|c| matches!(c, Converted::Overran))
+            .map_err(|e| e.to_string())
+    );
+    // The worker lives on, or is replaced, for the next request.
+    let path = png_file(dir.path());
+    assert!(matches!(
+        worker::convert(&path, "plate.png", &ImageOptions::default(), 256 << 20).unwrap(),
+        Converted::Done(_)
+    ));
+}
