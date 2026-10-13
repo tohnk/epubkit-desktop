@@ -224,7 +224,8 @@ pub fn resolve_href(root: &Path, base: &Path, href: &str) -> Option<PathBuf> {
 }
 
 /// The stylesheets the documents at `paths` reach — those a `<link>` or an
-/// `<?xml-stylesheet?>` names, and those those `@import`, to any depth —
+/// `<?xml-stylesheet?>` names, or a `<style>` element imports, and those
+/// those `@import`, to any depth —
 /// resolved inside the book. `readable` are the ones that could be read, for
 /// their references to be rewritten as a manifest stylesheet's are; `too_large`
 /// is whether any was too large to read, so what it names and imports cannot
@@ -270,6 +271,12 @@ pub fn reachable_stylesheets(
             // does: a `%23` there is a `#` in the name, not a fragment.
             if let Some(href) = node.get_attribute_no_ns("href") {
                 queue.extend(target_of(root, base, &href));
+            }
+        }
+        // Those the document's own `<style>` elements import.
+        for node in xml::find_nodes(&doc, &format!("//{}", xml::local("style")))? {
+            for import in css_imports(&node.get_content()) {
+                queue.extend(target_of(root, base, &import));
             }
         }
         // Those an `<?xml-stylesheet?>` instruction names.

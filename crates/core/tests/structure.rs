@@ -1988,3 +1988,33 @@ fn stylesheets_a_document_reaches_are_found_by_their_encoded_names() {
     }
     assert!(!reachable.too_large);
 }
+
+/// A document's own `<style>` element can import a stylesheet, which is
+/// reached as one a `<link>` names is, in either way an import is written.
+#[test]
+fn a_stylesheet_a_style_element_imports_is_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let quoted = put(root, "styles/quoted.css", "p { color: red }");
+    let url = put(root, "styles/url.css", "p { color: red }");
+    let chapter = put(
+        root,
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>
+<style type="text/css">@import "../styles/quoted.css";</style>
+<style type="text/css">@import url(../styles/url.css); p { margin: 0 }</style>
+</head><body><p>Text.</p></body></html>
+"#,
+    );
+
+    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    for sheet in [&quoted, &url] {
+        assert!(
+            reachable.readable.contains(sheet),
+            "{} not found among {:?}",
+            sheet.display(),
+            reachable.readable
+        );
+    }
+}

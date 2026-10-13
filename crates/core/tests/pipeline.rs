@@ -2771,3 +2771,53 @@ fn an_unlisted_stylesheet_linked_by_an_encoded_href_is_rewritten() {
     let css = fs::read_to_string(work.path().join("OEBPS/styles/#extra.css")).unwrap();
     assert!(css.contains("art.jpg") && !css.contains("art.png"), "{css}");
 }
+
+/// A stylesheet a chapter's `<style>` element imports, but the manifest
+/// leaves out, is followed as a linked one is: a small one is rewritten when
+/// the image it names is converted, and one too large to read leaves every
+/// image as it is.
+#[test]
+fn an_unlisted_stylesheet_a_style_element_imports_is_not_broken() {
+    let png = solid(image::ImageFormat::Png, 0);
+    let head = r#"<style type="text/css">@import "../styles/imported.css";</style>"#;
+
+    let files = [
+        ("images/art.png", "image/png", png.clone()),
+        (
+            "styles/imported.css",
+            UNDECLARED,
+            br#".x { background: url("../images/art.png") }"#.to_vec(),
+        ),
+    ];
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        head,
+        "<p>Text.</p>",
+        &ProcessingOptions::default(),
+    );
+    assert_eq!(report.images_converted, 1);
+    let css = fs::read_to_string(work.path().join("OEBPS/styles/imported.css")).unwrap();
+    assert!(css.contains("art.jpg") && !css.contains("art.png"), "{css}");
+
+    let big = format!(
+        r#".x {{ background: url("../images/art.png") }}{}"#,
+        "/* pad */".repeat(32 * 1024 * 1024 / 9 + 1)
+    );
+    let files = [
+        ("images/art.png", "image/png", png),
+        ("styles/imported.css", UNDECLARED, big.into_bytes()),
+    ];
+    let (work, report) = optimize_files(
+        &files,
+        "",
+        head,
+        "<p>Text.</p>",
+        &ProcessingOptions::default(),
+    );
+    assert!(
+        work.path().join("OEBPS/images/art.png").is_file(),
+        "art.png kept"
+    );
+    assert_eq!((report.images_converted, report.images_unconverted), (0, 1));
+}
