@@ -657,6 +657,15 @@ else; run as a library, or in the tests, decoding is done in the same process
 as before, with no cap. The worker decodes with the very code the pipeline
 would have run, so a book comes out identical whether or not it was used.
 
+For converting, the worker reads the image file itself, from the path the
+parent sends, under the cap. The parent keeps no copy of its own, so only the
+one process ever holds the image, and its size is set aside once, not twice: a
+tiny image padded to a large file no longer sits in two buffers at once. A
+cover thumbnail has no file to name, so its bytes are sent to the worker, and
+the memory set aside counts that copy. A file that cannot be read fails the
+book, as reading it in the parent once did; one that will not decode leaves
+its image alone.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book

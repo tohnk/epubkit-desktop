@@ -22,7 +22,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -158,18 +158,29 @@ pub enum Converted {
     Overran,
 }
 
-/// Convert the image in `bytes`, named `filename`, for `options`, holding the
-/// work to `cap` bytes. In a worker where workers are on; in this process, with
-/// no cap, where they are not.
-pub fn convert(bytes: Vec<u8>, filename: &str, options: &ImageOptions, cap: u64) -> Converted {
+/// Convert the image file at `path`, named `filename`, for `options`, holding
+/// the work to `cap` bytes. In a worker where workers are on; in this process,
+/// with no cap, where they are not. The worker reads the file itself, so only
+/// it ever holds the image, under the cap — the parent keeps no copy to go
+/// past the memory set aside. `Err` only if the file cannot be read, which
+/// fails the book as reading it in the parent once did.
+pub fn convert(path: &Path, filename: &str, options: &ImageOptions, cap: u64) -> Result<Converted> {
     if worker_exe().is_none() {
-        return match image::process_image(&bytes, filename, options) {
+        let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        return Ok(match image::process_image(&bytes, filename, options) {
             Ok(outputs) => Converted::Done(outputs),
             Err(_) => Converted::Undecodable,
-        };
+        });
     }
-    with_worker(|worker| worker.convert(&bytes, filename, options, cap))
-        .unwrap_or(Converted::Overran)
+    match with_worker(|worker| worker.convert(path, filename, options, cap)) {
+        Some(Reply::Done(outputs)) => Ok(Converted::Done(outputs)),
+        Some(Reply::Undecodable) => Ok(Converted::Undecodable),
+        Some(Reply::Unreadable(message)) => {
+            Err(Error::Image(format!("{}: {message}", path.display())))
+        }
+        // The worker died, most likely stopped by the cap.
+        None => Ok(Converted::Overran),
+    }
 }
 
 /// Make a thumbnail of `bytes` within `max_width` x `max_height`, out of
@@ -182,7 +193,10 @@ pub fn thumbnail(
     max_height: u32,
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
-    let needed = image::thumbnail_needed(bytes, budget);
+    let cap = image::thumbnail_needed(bytes, budget);
+    // The decode is capped to `cap` above the cover the worker also holds; the
+    // reservation covers that copy too, so the budget bounds both.
+    let needed = cap.saturating_add(bytes.len() as u64);
     if needed > budget.total() {
         return Err(image::thumbnail_oversize_error(needed, budget.total()));
     }
@@ -190,7 +204,7 @@ pub fn thumbnail(
     if worker_exe().is_none() {
         return image::thumbnail_decode(bytes, max_width, max_height);
     }
-    with_worker(|worker| worker.thumbnail(bytes, max_width, max_height, needed))
+    with_worker(|worker| worker.thumbnail(bytes, max_width, max_height, cap))
         .unwrap_or_else(|| Err(Error::Image("the worker could not make a thumbnail".into())))
 }
 
@@ -229,6 +243,15 @@ const OP_THUMBNAIL: u8 = 2;
 /// How a worker answers.
 const STATUS_OK: u8 = 0;
 const STATUS_UNDECODABLE: u8 = 1;
+const STATUS_UNREADABLE: u8 = 2;
+
+/// What a worker replied to a convert request.
+enum Reply {
+    Done(Vec<ProcessedImage>),
+    Undecodable,
+    /// The file could not be read; the message says why.
+    Unreadable(String),
+}
 
 impl Worker {
     fn spawn(exe: &PathBuf) -> io::Result<Worker> {
@@ -249,18 +272,18 @@ impl Worker {
 
     fn convert(
         &mut self,
-        bytes: &[u8],
+        path: &Path,
         filename: &str,
         options: &ImageOptions,
         cap: u64,
-    ) -> io::Result<Converted> {
+    ) -> io::Result<Reply> {
         let options =
             toml::to_string(options).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.stdin.write_all(&[OP_CONVERT])?;
         self.stdin.write_all(&cap.to_le_bytes())?;
         write_block(&mut self.stdin, filename.as_bytes())?;
         write_block(&mut self.stdin, options.as_bytes())?;
-        write_block(&mut self.stdin, bytes)?;
+        write_block(&mut self.stdin, path.as_os_str().as_encoded_bytes())?;
         self.stdin.flush()?;
 
         match read_status(&mut self.stdout)? {
@@ -270,9 +293,12 @@ impl Worker {
                 for _ in 0..count {
                     outputs.push(read_processed_image(&mut self.stdout)?);
                 }
-                Ok(Converted::Done(outputs))
+                Ok(Reply::Done(outputs))
             }
-            _ => Ok(Converted::Undecodable),
+            STATUS_UNREADABLE => Ok(Reply::Unreadable(
+                String::from_utf8_lossy(&read_block(&mut self.stdout)?).into_owned(),
+            )),
+            _ => Ok(Reply::Undecodable),
         }
     }
 
@@ -349,16 +375,32 @@ fn serve_one(input: &mut impl Read, output: &mut impl Write) -> io::Result<bool>
         OP_CONVERT => {
             let filename = read_block(input)?;
             let options = read_block(input)?;
-            let bytes = read_block(input)?;
+            let path = read_block(input)?;
             let filename = String::from_utf8_lossy(&filename).into_owned();
             let options: ImageOptions = toml::from_str(&String::from_utf8_lossy(&options))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // SAFETY: these bytes were produced by `OsStr::as_encoded_bytes`
+            // in the parent, on this same platform, which is exactly the
+            // contract `from_encoded_bytes_unchecked` requires.
+            let path = std::path::PathBuf::from(unsafe {
+                std::ffi::OsStr::from_encoded_bytes_unchecked(&path)
+            });
 
+            // The file is read here, under the cap, so only this process ever
+            // holds the image, and its size counts against the memory set
+            // aside for it. `Err(None)` is undecodable; `Err(Some)` is a file
+            // that could not be read.
             set_limit(cap);
-            let decoded = image::process_image(&bytes, &filename, &options);
+            let reply: std::result::Result<Vec<ProcessedImage>, Option<String>> =
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        image::process_image(&bytes, &filename, &options).map_err(|_| None)
+                    }
+                    Err(error) => Err(Some(error.to_string())),
+                };
             clear_limit();
 
-            match decoded {
+            match reply {
                 Ok(outputs) => {
                     output.write_all(&[STATUS_OK])?;
                     write_u32(output, outputs.len() as u32)?;
@@ -366,7 +408,11 @@ fn serve_one(input: &mut impl Read, output: &mut impl Write) -> io::Result<bool>
                         write_processed_image(output, image)?;
                     }
                 }
-                Err(_) => output.write_all(&[STATUS_UNDECODABLE])?,
+                Err(None) => output.write_all(&[STATUS_UNDECODABLE])?,
+                Err(Some(message)) => {
+                    output.write_all(&[STATUS_UNREADABLE])?;
+                    write_block(output, message.as_bytes())?;
+                }
             }
         }
         OP_THUMBNAIL => {

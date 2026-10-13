@@ -700,13 +700,13 @@ fn convert_images<P: FnMut(u8, &str)>(
                 return Ok(Converted::TooLarge(needed));
             }
             let _held = IMAGE_MEMORY.hold(needed);
-            let bytes = fs::read(job.path).map_err(|e| Error::io(job.path, e))?;
             // Decoded in a worker held to `needed` bytes, where workers are on,
-            // so an image crafted to make a decoder allocate wildly cannot;
-            // a single image that will not decode, or overruns the worker,
-            // must not sink the whole book.
+            // so an image crafted to make a decoder allocate wildly cannot. The
+            // worker reads the file itself, so the parent keeps no second copy.
+            // A single image that will not decode, or overruns the worker, must
+            // not sink the whole book; a file that cannot be read still does.
             Ok(
-                match worker::convert(bytes, &job.name, job.options, needed) {
+                match worker::convert(job.path, &job.name, job.options, needed)? {
                     worker::Converted::Done(outputs) => Converted::Done(outputs),
                     worker::Converted::Undecodable => Converted::Undecodable,
                     worker::Converted::Overran => Converted::Overran(needed),
