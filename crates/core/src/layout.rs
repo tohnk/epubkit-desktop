@@ -1624,7 +1624,6 @@ fn harmless(name: &str, terms: &Terms) -> bool {
         "column-break-",
         "orphans",
         "widows",
-        "box-sizing",
         "image-rendering",
         "--",
     ];
@@ -1645,6 +1644,10 @@ fn harmless(name: &str, terms: &Terms) -> bool {
             only(&["auto"]) && terms.numbers.iter().all(|&number| number == 0.0)
         }
         "visibility" => only(&["visible"]),
+        // `content-box`, which the replacement's own style pins, leaves its
+        // padding and border outside its size; `border-box` takes them from
+        // its size, and with padding or a border can leave no content box.
+        "box-sizing" => only(&["content-box"]),
         // As much as the image that takes a wrapper's place has of its own.
         "max-width" | "max-height" | "max-inline-size" | "max-block-size" => {
             only(&["none"])

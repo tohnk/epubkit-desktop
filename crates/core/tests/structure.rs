@@ -776,6 +776,10 @@ fn svg_wrapped_covers_become_plain_images() {
         !out.contains("<svg"),
         "the svg wrapper should be gone:\n{out}"
     );
+    // The `<img>` pins `box-sizing: content-box`, so a chapter's
+    // `box-sizing: border-box` cannot combine with padding or a border to
+    // collapse its content box to nothing.
+    assert!(out.contains("box-sizing:content-box"), "{out}");
 }
 
 /// An SVG holding several images is an illustration, not a cover wrapper.
@@ -1828,6 +1832,10 @@ fn an_svg_whose_img_a_rule_would_style_beyond_harmless_styling_is_not_unwrapped(
         ("img { max-width: 50% !important }", false),
         ("img { width: var(--w) }", false),
         ("* { box-sizing: border-box; margin: 0; padding: 0 }", true),
+        // Important `box-sizing: border-box` beats the `<img>`'s pinned
+        // `content-box`, and with padding or a border can leave no content
+        // box, so the wrapper stays.
+        ("img { box-sizing: border-box !important }", false),
         (
             "img { max-width: 100%; height: auto; border: none; color: red; font-size: 2em; \
              text-align: center; page-break-inside: avoid; background: white; padding: 1em }",
