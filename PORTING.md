@@ -613,15 +613,20 @@ Reading the header holds little, and that is set aside too while it is read.
 A JPEG's is read marker by marker, passing over every segment but its frame
 and its EXIF, as its decoder copies the whole file as it is made. Any other
 image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
-its text and EXIF chunks and unpack of its ICC profile, or a WebP's read of
-its EXIF, which with the buffers it doubles as they grow is 16 MiB at most,
-and 16 MiB is what is set aside. A larger profile, which nothing here uses,
-is let go of unread, and an image with more text than that is left as it is
-and counted. Decoding it holds the same, and that is reckoned in what it
-needs. A JPEG that a thumbnail of a book's cover or a check of the file had
-copied whole, comments and all, before anything was set aside, is read now
-for a few kilobytes, and a one-pixel PNG whose ICC profile unpacks to 64 MiB
-holds 9 MB rather than 69.
+its text and EXIF chunks and unpack of its ICC profile, which with the
+buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set
+aside. A larger profile, which nothing here uses, is let go of unread, and an
+image with more text than that is left as it is and counted. Decoding it
+holds the same, and that is reckoned in what it needs. A WebP's decoder is
+held to no limit, and reads the whole of its EXIF to say how it is turned, so
+that is read here instead: the first 64 KiB of it, where the turn is, and a
+WebP whose EXIF is longer and does not say within them is reckoned as
+turned. Converting one reads the turn where it lies in the file. A JPEG that
+a thumbnail of a book's cover or a check of the file had copied whole,
+comments and all, before anything was set aside, is read now for a few
+kilobytes, a one-pixel PNG whose ICC profile unpacks to 64 MiB holds 9 MB
+rather than 69, and a WebP of two pixels with 48 MiB of EXIF a few
+kilobytes rather than 48 MiB.
 
 A thumbnail for the desktop's book list is reckoned the same way, out of
 512 MiB for all of them, and one that would need more is not made: the book

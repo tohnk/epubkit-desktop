@@ -151,3 +151,70 @@ fn converting_an_image_holds_no_more_than_was_set_aside() {
         }
     }
 }
+
+/// `body` as a RIFF chunk named `fourcc`, padded to an even length.
+fn chunk(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut chunk = fourcc.to_vec();
+    chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        chunk.push(0);
+    }
+    chunk
+}
+
+/// An extended WebP of 2 x 1 pixels whose EXIF, `size` bytes of it, says in
+/// its first entry to turn it a quarter.
+fn webp_with_exif(size: usize) -> Vec<u8> {
+    let mut simple = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut simple)
+        .write_image(
+            &[200, 100, 50, 10, 20, 30],
+            2,
+            1,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    // TIFF's little-endian form: one entry, an orientation of 6.
+    let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+    exif.resize(size, 0);
+    // EXIF present; a canvas of 2 x 1.
+    let header = [0x08, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+
+    let mut body = b"WEBP".to_vec();
+    body.extend(chunk(b"VP8X", &header));
+    // The image's own chunk, after RIFF, its size and WEBP.
+    body.extend_from_slice(&simple[12..]);
+    body.extend(chunk(b"EXIF", &exif));
+    let mut riff = b"RIFF".to_vec();
+    riff.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    riff.extend(body);
+    riff
+}
+
+/// A WebP's decoder reads its whole EXIF chunk to say how the image is
+/// turned, held to no limit. A WebP of two pixels with 48 MiB of EXIF held
+/// 48 MiB to be reckoned, and converting it held 96 MiB where 80 were set
+/// aside. Its EXIF is read now no further than it has to be, and it comes out
+/// turned all the same.
+#[test]
+fn a_webps_exif_is_read_no_further_than_its_turn() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exif.webp");
+    std::fs::write(&path, webp_with_exif(48 << 20)).unwrap();
+    let options = ImageOptions::default();
+
+    let (needed, peak) = peak_of(|| memory_needed(&path, &options));
+    assert!(peak <= HEADER_MEMORY as usize, "reckoning held {peak}");
+    let (raster, peak) = peak_of(|| is_raster_image(&path));
+    assert!(raster);
+    assert!(peak <= HEADER_MEMORY as usize, "telling held {peak}");
+
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "exif.webp", &options));
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+    let page = image::load_from_memory(&converted.unwrap()[0].bytes).unwrap();
+    assert_eq!((page.width(), page.height()), (1, 2));
+}

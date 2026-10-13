@@ -55,10 +55,11 @@ pub const MAX_PIXELS: u64 = 178_956_970;
 const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 8 + 128 * 1024 * 1024;
 
 /// What reading an image's header may hold beside it: the ICC profile a
-/// PNG's decoder unpacks, and the text and EXIF chunks it keeps, or a WebP's
-/// EXIF. A decoder is held to half of this as it is made, as a buffer it
-/// grows doubles, and can come to twice what it counts before it stops; it
-/// lets go of an ICC profile larger, which nothing here uses.
+/// PNG's decoder unpacks, and the text and EXIF chunks it keeps. A decoder is
+/// held to half of this as it is made, as a buffer it grows doubles, and can
+/// come to twice what it counts before it stops; it lets go of an ICC
+/// profile larger, which nothing here uses. A WebP's decoder is held to no
+/// limit at all, so its EXIF is never left to it: see [`webp_orientation`].
 pub const HEADER_MEMORY: u64 = 16 << 20;
 
 pub const DEFAULT_DEVICE: &str = "x4";
@@ -275,25 +276,31 @@ impl Header {
             });
         }
 
-        let webp = if format == ImageFormat::WebP {
+        // A WebP's decoder reads the whole of its EXIF to say how it is
+        // turned, held to no limit, so that is read here too.
+        let (webp, webp_orientation) = if format == ImageFormat::WebP {
             let kind = webp_kind(&mut inner);
             inner.seek(SeekFrom::Start(0)).ok()?;
-            kind
+            let orientation = webp_orientation(&mut inner);
+            inner.seek(SeekFrom::Start(0)).ok()?;
+            (kind, Some(orientation))
         } else {
-            None
+            (None, None)
         };
         let mut reader = ImageReader::with_format(inner, format);
         reader.limits(header_limits());
         let mut decoder = reader.into_decoder().ok()?;
         let (width, height) = decoder.dimensions();
+        // A tag that cannot be read leaves the image as it is stored, as a
+        // reader would.
+        let orientation = webp_orientation
+            .unwrap_or_else(|| decoder.orientation().unwrap_or(Orientation::NoTransforms));
         Some(Header {
             format,
             width,
             height,
             color: decoder.color_type(),
-            // A tag that cannot be read leaves the image as it is stored, as
-            // a reader would.
-            orientation: decoder.orientation().unwrap_or(Orientation::NoTransforms),
+            orientation,
             jpeg: None,
             webp,
         })
@@ -603,6 +610,57 @@ enum WebpKind {
     Lossy,
     Lossless,
     Animated,
+}
+
+/// Where the EXIF of the WebP `reader` holds lies, as its decoder finds it:
+/// the first EXIF chunk of an extended WebP. A simple one has none.
+fn webp_exif(reader: &mut (impl Read + Seek)) -> Option<std::ops::Range<u64>> {
+    let mut riff = [0u8; 12];
+    reader.read_exact(&mut riff).ok()?;
+    if &riff[..4] != b"RIFF" || &riff[8..] != b"WEBP" {
+        return None;
+    }
+    let mut first = true;
+    loop {
+        let mut chunk = [0u8; 8];
+        reader.read_exact(&mut chunk).ok()?;
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if first && &chunk[..4] != b"VP8X" {
+            return None;
+        }
+        first = false;
+        let start = reader.stream_position().ok()?;
+        if &chunk[..4] == b"EXIF" {
+            return Some(start..start + u64::from(size));
+        }
+        // Chunks are padded to an even size.
+        reader
+            .seek(SeekFrom::Current(i64::from(size) + i64::from(size & 1)))
+            .ok()?;
+    }
+}
+
+/// How much of a WebP's EXIF is read to tell how it turns the image: the
+/// entry says so in the first few hundred bytes.
+const WEBP_EXIF_READ: u64 = 64 << 10;
+
+/// How the EXIF of the WebP `reader` holds turns it, as its decoder reads
+/// it, from no more than [`WEBP_EXIF_READ`] of it. One whose EXIF is longer,
+/// and does not say within that, is taken to be turned a quarter, which
+/// reckons the most memory.
+fn webp_orientation(reader: &mut (impl Read + Seek)) -> Orientation {
+    let Some(range) = webp_exif(reader) else {
+        return Orientation::NoTransforms;
+    };
+    let length = range.end - range.start;
+    let mut exif = Vec::new();
+    let read = reader.seek(SeekFrom::Start(range.start)).is_ok()
+        && reader.take(WEBP_EXIF_READ).read_to_end(&mut exif).is_ok();
+    match Orientation::from_exif_chunk(&exif) {
+        Some(orientation) => orientation,
+        None if read && length > WEBP_EXIF_READ => Orientation::Rotate90,
+        None => Orientation::NoTransforms,
+    }
 }
 
 /// How the WebP `reader` holds is coded, from its chunks up to the first
@@ -966,16 +1024,26 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 /// nothing, and is refused before anything is sized from it.
 ///
 /// Its decoder is held to [`HEADER_MEMORY`] as it is made, as [`Footprint`]
-/// reckons it: what a PNG's keeps of its chunks, or a WebP's reads of its
-/// EXIF. A JPEG's copies the file, which is reckoned too.
+/// reckons it: what a PNG's keeps of its chunks. A JPEG's copies the file,
+/// which is reckoned too.
 fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let format = reader.format();
     reader.limits(header_limits());
     let mut decoder = reader.into_decoder()?;
     // A tag that cannot be read leaves the image as it is stored, as a
-    // reader would.
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    // reader would. A WebP's decoder would copy the whole of its EXIF, which
+    // is read here where it lies.
+    let orientation = if format == Some(ImageFormat::WebP) {
+        webp_exif(&mut Cursor::new(bytes))
+            .and_then(|range| {
+                bytes.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
+            })
+            .and_then(Orientation::from_exif_chunk)
+            .unwrap_or(Orientation::NoTransforms)
+    } else {
+        decoder.orientation().unwrap_or(Orientation::NoTransforms)
+    };
 
     let (width, height) = decoder.dimensions();
     if width == 0 || height == 0 {
