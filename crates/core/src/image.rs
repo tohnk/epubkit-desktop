@@ -60,6 +60,8 @@ const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 8 + 128 * 1024 * 1024;
 /// come to twice what it counts before it stops; it lets go of an ICC
 /// profile larger, which nothing here uses. A WebP's decoder is held to no
 /// limit at all, so its EXIF is never left to it: see [`webp_orientation`].
+/// Nor is a GIF's, which collects its ICC profile and XMP as it is made, so
+/// its header is read without it: see [`gif_start`].
 pub const HEADER_MEMORY: u64 = 16 << 20;
 
 pub const DEFAULT_DEVICE: &str = "x4";
@@ -246,16 +248,18 @@ struct Header {
     jpeg: Option<JpegFrame>,
     /// How a WebP is coded, which tells the same.
     webp: Option<WebpKind>,
-    /// A GIF's first frame, which tells the same.
-    gif: Option<GifFrame>,
+    /// What a GIF's decoder reads before its image, which tells the same.
+    gif: Option<GifStart>,
 }
 
 impl Header {
     /// The header of the image `reader` reads, from its start: `None` for an
     /// image in no format the image step decodes, or whose header does not
     /// read. A JPEG's is read here, marker by marker, as its decoder reads the
-    /// whole file as it is made, and copies each segment it knows; any other's
-    /// decoder reads its header, held to [`HEADER_MEMORY`].
+    /// whole file as it is made, and copies each segment it knows; so is a
+    /// GIF's, block by block, as its decoder collects its ICC profile and XMP
+    /// as it is made, held to no limit of ours. Any other's decoder reads its
+    /// header, held to [`HEADER_MEMORY`].
     fn read<R: BufRead + Seek>(reader: R) -> Option<Header> {
         let reader = ImageReader::new(reader).with_guessed_format().ok()?;
         let format = reader.format()?;
@@ -278,13 +282,21 @@ impl Header {
                 gif: None,
             });
         }
-        let gif = if format == ImageFormat::Gif {
-            let frame = gif_frame(&mut inner);
-            inner.seek(SeekFrom::Start(0)).ok()?;
-            frame
-        } else {
-            None
-        };
+        if format == ImageFormat::Gif {
+            let start = gif_start(&mut inner)?;
+            return Some(Header {
+                format,
+                width: u32::from(start.width),
+                height: u32::from(start.height),
+                // Its decoder decodes every GIF in RGBA, and a GIF has no
+                // EXIF to turn it.
+                color: image::ColorType::Rgba8,
+                orientation: Orientation::NoTransforms,
+                jpeg: None,
+                webp: None,
+                gif: Some(start),
+            });
+        }
 
         // A WebP's decoder reads the whole of its EXIF to say how it is
         // turned, held to no limit, so that is read here too.
@@ -313,7 +325,7 @@ impl Header {
             orientation,
             jpeg: None,
             webp,
-            gif,
+            gif: None,
         })
     }
 }
@@ -375,7 +387,8 @@ impl Footprint {
             gif,
         } = header;
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_PIXELS || gif.is_some_and(|frame| frame.pixels() > MAX_PIXELS) {
+        let gif_frame = gif.as_ref().and_then(|start| start.frame);
+        if pixels > MAX_PIXELS || gif_frame.is_some_and(|frame| frame.pixels() > MAX_PIXELS) {
             return None;
         }
 
@@ -412,13 +425,16 @@ impl Footprint {
             // The chunks it keeps, and the ICC profile it unpacks.
             ImageFormat::Png => HEADER_MEMORY,
             ImageFormat::Bmp => 0,
-            // The indices of a frame, beside its colours; and a frame that does
-            // not lie across the canvas decoded in RGBA of its own size, to be
-            // laid on it.
-            ImageFormat::Gif => match gif {
-                Some(frame) if !frame.lies_across(width, height) => pixels + frame.pixels() * 5,
-                _ => pixels,
-            },
+            // The indices of a frame, beside its colours; a frame that does not
+            // lie across the canvas decoded in RGBA of its own size, to be laid
+            // on it; and the ICC profile and XMP collected before it.
+            ImageFormat::Gif => {
+                let apart = match gif_frame {
+                    Some(frame) if !frame.lies_across(width, height) => frame.pixels() * 5,
+                    _ => 0,
+                };
+                pixels + apart + gif.as_ref().map_or(0, |start| start.metadata)
+            }
             // Its copy of the file, and of each segment it knows, beside it;
             // and every coefficient of a progressive scan, kept to its end.
             ImageFormat::Jpeg => file * 2 + jpeg.as_ref().map_or(0, jpeg_coefficients),
@@ -651,48 +667,125 @@ impl GifFrame {
     }
 }
 
-/// The first frame of the GIF `reader` holds, found by stepping over its
-/// colour table and the extensions before the frame, a block of data at a
-/// time.
-fn gif_frame(reader: &mut (impl Read + Seek)) -> Option<GifFrame> {
+/// What a GIF's decoder collects of an ICC profile, or of XMP, before it
+/// fails: its own limit of 50 MB, as the image step's limits are not passed
+/// on to it.
+const GIF_METADATA_LIMIT: u64 = 50_000_000;
+
+/// What a GIF's decoder reads before its image, as it is made.
+struct GifStart {
+    /// The canvas.
+    width: u16,
+    height: u16,
+    /// What the ICC profile and XMP it collects can come to.
+    metadata: u64,
+    /// The first frame, where the GIF starts with one.
+    frame: Option<GifFrame>,
+}
+
+/// What the GIF `reader` holds starts with, read as its decoder reads it
+/// when it is made: the canvas; then, past the colour table and each
+/// extension before it, a block of data at a time, the first frame. `None`
+/// where the decoder fails to be made: at a signature or an extension it
+/// does not know, a graphic control extension of the wrong length, or the
+/// file's end.
+///
+/// The decoder collects the data of an application extension that names
+/// itself an ICC profile or XMP, with a byte more for each block of XMP, to
+/// [`GIF_METADATA_LIMIT`], past which it fails. It keeps the last of each
+/// kind, in a buffer that doubles as it grows, which can come to twice what
+/// it collects: what the largest of each can come to is reckoned.
+fn gif_start(reader: &mut (impl Read + Seek)) -> Option<GifStart> {
+    // The two kinds of application extension the decoder collects.
+    const PROFILE: usize = 0;
+    const XMP: usize = 1;
+
     let mut screen = [0u8; 13];
     reader.read_exact(&mut screen).ok()?;
-    if &screen[..3] != b"GIF" {
+    if &screen[..6] != b"GIF87a" && &screen[..6] != b"GIF89a" {
         return None;
     }
     if screen[10] & 0x80 != 0 {
         let colours = 3 * (2i64 << (screen[10] & 7));
         reader.seek(SeekFrom::Current(colours)).ok()?;
     }
+    // The most collected of each kind.
+    let mut largest = [0u64; 2];
     let mut byte = [0u8; 1];
-    loop {
+    let frame = 'blocks: loop {
         reader.read_exact(&mut byte).ok()?;
         match byte[0] {
             // An extension: its label, then blocks up to an empty one.
             0x21 => {
                 reader.read_exact(&mut byte).ok()?;
+                let label = byte[0];
+                // Plain text, graphic control, comment or application.
+                if !matches!(label, 0x01 | 0xF9 | 0xFE | 0xFF) {
+                    return None;
+                }
+                // The kind the first block names an application extension,
+                // if it is one the decoder collects, and what it has
+                // collected of it: each block, after its length for XMP.
+                let mut kind = None;
+                let mut collected = 0u64;
+                // The length of the block before.
+                let mut last = None;
                 loop {
                     reader.read_exact(&mut byte).ok()?;
-                    if byte[0] == 0 {
+                    let length = byte[0];
+                    if length == 0 {
                         break;
                     }
-                    reader.seek(SeekFrom::Current(i64::from(byte[0]))).ok()?;
+                    if last.is_none() && label == 0xFF && length == 11 {
+                        let mut name = [0u8; 11];
+                        reader.read_exact(&mut name).ok()?;
+                        kind = match &name {
+                            b"ICCRGBG1012" => Some(PROFILE),
+                            b"XMP DataXMP" => Some(XMP),
+                            _ => None,
+                        };
+                    } else {
+                        if let Some(kind) = kind {
+                            collected += u64::from(length) + u64::from(kind == XMP);
+                            if collected > GIF_METADATA_LIMIT {
+                                largest[kind] = GIF_METADATA_LIMIT;
+                                break 'blocks None;
+                            }
+                            largest[kind] = largest[kind].max(collected);
+                        }
+                        reader.seek(SeekFrom::Current(i64::from(length))).ok()?;
+                    }
+                    last = Some(length);
+                }
+                // A graphic control extension's last block is of four bytes.
+                if label == 0xF9 && last != Some(4) {
+                    return None;
                 }
             }
-            0x2C => {
+            // Anything else ends what the decoder reads as it is made, once
+            // it has the byte after it: a frame's descriptor, say.
+            introducer => {
                 let mut descriptor = [0u8; 8];
-                reader.read_exact(&mut descriptor).ok()?;
+                reader.read_exact(&mut descriptor[..1]).ok()?;
+                if introducer != 0x2C || reader.read_exact(&mut descriptor[1..]).is_err() {
+                    break None;
+                }
                 let word = |at: usize| u16::from_le_bytes([descriptor[at], descriptor[at + 1]]);
-                return Some(GifFrame {
+                break Some(GifFrame {
                     left: word(0),
                     top: word(2),
                     width: word(4),
                     height: word(6),
                 });
             }
-            _ => return None,
         }
-    }
+    };
+    Some(GifStart {
+        width: u16::from_le_bytes([screen[6], screen[7]]),
+        height: u16::from_le_bytes([screen[8], screen[9]]),
+        metadata: 2 * (largest[PROFILE] + largest[XMP]),
+        frame,
+    })
 }
 
 /// How a WebP is coded.
@@ -1140,6 +1233,21 @@ pub fn floyd_steinberg(gray: &mut GrayImage, levels: &[u8]) {
 fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let format = reader.format();
+    // A GIF's decoder collects its ICC profile and XMP as it is made, so one
+    // too large to decode is refused before then. Its first frame is decoded
+    // at its own size where it does not lie across the canvas, and is held to
+    // the same limit.
+    if format == Some(ImageFormat::Gif) {
+        let too_large = gif_start(&mut Cursor::new(bytes)).is_some_and(|start| {
+            u64::from(start.width) * u64::from(start.height) > MAX_PIXELS
+                || start.frame.is_some_and(|frame| frame.pixels() > MAX_PIXELS)
+        });
+        if too_large {
+            return Err(ImageError::Limits(LimitError::from_kind(
+                LimitErrorKind::DimensionError,
+            )));
+        }
+    }
     reader.limits(header_limits());
     let mut decoder = reader.into_decoder()?;
     // A tag that cannot be read leaves the image as it is stored, as a
@@ -1163,11 +1271,7 @@ fn decode(bytes: &[u8]) -> image::ImageResult<(DynamicImage, Orientation)> {
             "the image has no pixels",
         )));
     }
-    // A GIF's first frame is decoded at its own size where it does not lie
-    // across the canvas, and is held to the same limit.
-    let frame_too_large = format == Some(ImageFormat::Gif)
-        && gif_frame(&mut Cursor::new(bytes)).is_some_and(|frame| frame.pixels() > MAX_PIXELS);
-    if u64::from(width) * u64::from(height) > MAX_PIXELS || frame_too_large {
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(ImageError::Limits(LimitError::from_kind(
             LimitErrorKind::DimensionError,
         )));

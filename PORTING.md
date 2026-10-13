@@ -614,7 +614,12 @@ out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
 
 Reading the header holds little, and that is set aside too while it is read.
 A JPEG's is read marker by marker, passing over every segment but its frame
-and its EXIF, as its decoder copies the whole file as it is made. Any other
+and its EXIF, as its decoder copies the whole file as it is made. A GIF's is
+read block by block to its first frame, as its decoder collects an ICC
+profile and XMP on the way as it is made, to 50 MB each, held to no limit of
+the image step's; what those come to, twice what is collected as the buffer
+doubles as it grows, is reckoned in what decoding it holds, and a GIF too
+large to decode is refused before its decoder is made. Any other
 image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
 its text and EXIF chunks and unpack of its ICC profile, which with the
 buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set
@@ -629,8 +634,9 @@ turned. Converting one reads the turn where it lies in the file. A JPEG that
 a thumbnail of a book's cover or a check of the file had copied whole,
 comments and all, before anything was set aside, is read now for a few
 kilobytes, a one-pixel PNG whose ICC profile unpacks to 64 MiB holds 9 MB
-rather than 69, and a WebP of two pixels with 48 MiB of EXIF a few
-kilobytes rather than 48 MiB.
+rather than 69, a WebP of two pixels with 48 MiB of EXIF a few kilobytes
+rather than 48 MiB, and a one-pixel GIF with a 40 MiB ICC profile a few
+kilobytes rather than 64 MiB.
 
 A thumbnail for the desktop's book list is reckoned the same way, out of
 512 MiB for all of them, and one that would need more is not made: the book

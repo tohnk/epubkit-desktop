@@ -266,6 +266,72 @@ fn a_gif_frame_larger_than_its_canvas_is_reckoned_at_its_own_size() {
     );
 }
 
+/// A GIF of one pixel with `size` bytes of `kind`, an ICC profile or XMP, in
+/// an application extension before its frame, which its decoder collects as
+/// it is made.
+fn gif_with_metadata(kind: &[u8; 11], size: usize) -> Vec<u8> {
+    let gif = gif_with_frame((1, 1), (1, 1));
+    // After the signature and the screen, and its colours if it has them.
+    let flags = gif[10];
+    let colours = if flags & 0x80 != 0 {
+        3 << ((flags & 7) + 1)
+    } else {
+        0
+    };
+    let at = 13 + colours;
+    let mut extension = vec![0x21, 0xFF, 11];
+    extension.extend_from_slice(kind);
+    let data = vec![0x5A; size];
+    for block in data.chunks(255) {
+        extension.push(block.len() as u8);
+        extension.extend_from_slice(block);
+    }
+    extension.push(0);
+    [&gif[..at], &extension[..], &gif[at..]].concat()
+}
+
+/// A GIF's decoder collects its ICC profile and XMP as it is made, to 50 MB
+/// each, held to no limit of the image step's. A GIF of one pixel with a
+/// 40 MiB profile held 64 MiB while its header was read, where 16 were set
+/// aside, and more to convert than was set aside; its header is read now
+/// without the decoder, and what that collects is reckoned.
+#[test]
+fn a_gifs_profile_and_xmp_are_reckoned() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for kind in [b"ICCRGBG1012", b"XMP DataXMP"] {
+        let path = dir.path().join("metadata.gif");
+        std::fs::write(&path, gif_with_metadata(kind, 40 << 20)).unwrap();
+        let name = String::from_utf8_lossy(kind);
+
+        let (needed, peak) = peak_of(|| memory_needed(&path, &options));
+        assert!(
+            peak <= HEADER_MEMORY as usize,
+            "{name}: reckoning held {peak}"
+        );
+        let (raster, peak) = peak_of(|| is_raster_image(&path));
+        assert!(raster, "{name}");
+        assert!(
+            peak <= HEADER_MEMORY as usize,
+            "{name}: telling held {peak}"
+        );
+
+        let file = std::fs::read(&path).unwrap();
+        let (converted, peak) = peak_of(|| process_image(&file, "metadata.gif", &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (file.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+
+        let budget = MemoryBudget::new(33 << 20);
+        let (made, peak) = peak_of(|| thumbnail(&file, 480, 720, &budget));
+        assert!(
+            made.is_err() || peak <= 33 << 20,
+            "{name}: a thumbnail held {peak} of 33 MiB"
+        );
+    }
+}
+
 /// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
 /// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
 /// held more than was set aside.
