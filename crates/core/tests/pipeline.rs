@@ -1468,13 +1468,16 @@ fn light_novel_mode_keeps_whole_an_image_something_clips() {
 /// A wrapper that draws its spread otherwise than an `<img>` would, clipped
 /// to its left page by its own attribute, or faded by a stylesheet, keeps it
 /// whole: plain images of its pages in its place would show what it hid,
-/// and lose what it did to the rest.
+/// and lose what it did to the rest. So does one whose pages, as images,
+/// would be drawn otherwise than it, hidden by a rule for images say.
 #[test]
 fn an_svg_that_draws_its_spread_otherwise_keeps_it_whole() {
     let defs = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><defs><clipPath id="left"><rect width="500" height="400"/></clipPath></defs></svg>"#;
     for (svg, css) in [
         (r#"clip-path="url(#left)""#, ""),
         ("", "svg { opacity: .5 }"),
+        // Its pages, which rules for images would hide.
+        ("", "img { visibility: hidden }"),
     ] {
         let files = [
             ("images/spread.png", "image/png", spread()),

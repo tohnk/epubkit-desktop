@@ -1666,12 +1666,9 @@ fn free_images(
         let Some(mut parent) = svg.get_parent() else {
             continue;
         };
-        let Ok(mut page) = parent.new_child(parent.get_namespace(), "img") else {
+        let Some(mut page) = full_page_image(&mut parent, "", "") else {
             continue;
         };
-        page.set_attribute("src", "").ok();
-        page.set_attribute("alt", "").ok();
-        page.set_attribute("style", FULL_PAGE_STYLE).ok();
         let mut svg = svg.clone();
         svg.add_prev_sibling(&mut page).ok();
         reshaping.changing.insert(parent.node_ptr());
@@ -1703,6 +1700,7 @@ fn free_images(
         };
         for (svg, image, page) in &stand_ins {
             if !layout.frames_itself(page)
+                && !layout.drawn_otherwise(page)
                 && !framed_around(svg)
                 && drawn_as_it_is(&layout, svg, image)
             {
@@ -1809,52 +1807,52 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         };
 
         // Each wrapper is found, as the chapter is styled, before any of
-        // them is replaced.
+        // them is replaced, with the image that would take its place beside
+        // it, which the chapter's rules for images would draw.
+        let mut candidates = Vec::new();
+        let mut reshaping = Reshaping::default();
+        for mut svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
+            let Some(image) = wrapped_image(&svg) else {
+                continue;
+            };
+            let target = image
+                .get_attribute_ns("href", NS_XLINK)
+                .or_else(|| image.get_attribute("href"))
+                .unwrap_or_default();
+            let Some(mut parent) = svg.get_parent().filter(|_| !target.is_empty()) else {
+                continue;
+            };
+            let Some(mut img) = full_page_image(&mut parent, &target, "Cover") else {
+                continue;
+            };
+            // `new_child` appends; move it into the SVG's position.
+            svg.add_prev_sibling(&mut img).ok();
+            reshaping.changing.insert(parent.node_ptr());
+            reshaping.pages.insert(img.node_ptr());
+            candidates.push((svg, image, img));
+        }
         let mut wrappers = Vec::new();
         {
             let sheets: Vec<(&Sheet, Tri)> = styles
                 .iter()
                 .map(|(sheet, applies)| (&**sheet, *applies))
                 .collect();
-            let reshaping = Reshaping::default();
             let layout = Layout::new(&sheets, &reshaping, &budget);
-            for svg in xml::find_nodes(&content.doc, &outermost_svgs())? {
-                let Some(image) = wrapped_image(&svg) else {
-                    continue;
-                };
-                if !drawn_as_it_is(&layout, &svg, &image) {
-                    continue;
-                }
-                let target = image
-                    .get_attribute_ns("href", NS_XLINK)
-                    .or_else(|| image.get_attribute("href"))
-                    .unwrap_or_default();
-                if !target.is_empty() {
-                    wrappers.push((svg, target));
-                }
+            for (svg, image, img) in candidates {
+                let unwrapped =
+                    drawn_as_it_is(&layout, &svg, &image) && !layout.drawn_otherwise(&img);
+                wrappers.push((svg, img, unwrapped));
             }
         }
 
         let mut fixed_here = 0;
-        for (mut svg, target) in wrappers {
-            let Some(mut parent) = svg.get_parent() else {
-                continue;
-            };
-
-            // Inherit the parent's namespace so the replacement stays in the
-            // XHTML namespace rather than falling out of it.
-            let namespace = parent.get_namespace();
-            let Ok(mut img) = parent.new_child(namespace, "img") else {
-                continue;
-            };
-            img.set_attribute("src", &target).ok();
-            img.set_attribute("alt", "Cover").ok();
-            img.set_attribute("style", FULL_PAGE_STYLE).ok();
-
-            // `new_child` appends; move it into the SVG's position.
-            svg.add_prev_sibling(&mut img).ok();
-            svg.unlink();
-            fixed_here += 1;
+        for (mut svg, img, unwrapped) in wrappers {
+            if unwrapped {
+                svg.unlink();
+                fixed_here += 1;
+            } else {
+                img.free_subtree();
+            }
         }
 
         if fixed_here > 0 {
@@ -1935,6 +1933,17 @@ fn item_from_node(node: &Node) -> ManifestItem {
 /// illustration it is in, and an `<img>` would not show there at all.
 fn outermost_svgs() -> String {
     format!("//{svg}[not(ancestor::{svg})]", svg = xml::local("svg"))
+}
+
+/// A plain `<img>` of `src`, filling the page, appended to `parent`, to take
+/// an SVG wrapper's place, in the parent's namespace so that it stays in
+/// XHTML's rather than falling out of it.
+fn full_page_image(parent: &mut Node, src: &str, alt: &str) -> Option<Node> {
+    let mut img = parent.new_child(parent.get_namespace(), "img").ok()?;
+    img.set_attribute("src", src).ok();
+    img.set_attribute("alt", alt).ok();
+    img.set_attribute("style", FULL_PAGE_STYLE).ok();
+    Some(img)
 }
 
 /// The image an SVG wraps, if showing the whole of it is all the SVG does:

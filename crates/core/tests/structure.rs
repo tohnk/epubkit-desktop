@@ -1687,8 +1687,10 @@ fn an_svg_that_shows_part_of_its_image_is_not_unwrapped() {
 /// an `<img>` would: clipped, masked, filtered, faded, blended or hidden, by an
 /// attribute of its own or of its image, or by the chapter's stylesheets,
 /// which can slide, turn or size the image too. An `<img>` in its place
-/// showed the whole picture, as it is. Such an SVG stays as it is; one the
-/// stylesheets only lay out, or draw as it is after all, is unwrapped.
+/// showed the whole picture, as it is. Such an SVG stays as it is, and so
+/// does one whose `<img>` the stylesheets would draw otherwise than it, as
+/// a rule for images may; one the stylesheets only lay out, or draw as it is
+/// after all, is unwrapped.
 #[test]
 fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
     let wrapper = |svg: &str, image: &str| {
@@ -1731,7 +1733,13 @@ fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
         ("", "", "svg image { translate: -500px 0 }", false),
         ("", "", "image { x: -500px }", false),
         ("", "", "image { width: 500px }", false),
+        // The image in its place, which rules for images would hide, fade or
+        // clip.
+        ("", "", "img { visibility: hidden }", false),
+        ("", "", "img { opacity: .2 }", false),
+        ("", "", "body > img { clip-path: inset(10%) }", false),
         // Laid out, or drawn as it is after all.
+        ("", "", "img { margin: 1em }", true),
         (
             "",
             "",

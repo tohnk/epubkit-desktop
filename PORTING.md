@@ -799,8 +799,13 @@ image's can do that, their `style`, or the chapter's stylesheets, read
 through the cascade as Light Novel mode reads them, where an attribute is a
 declaration that any rule setting the same takes the place of; and the
 stylesheets can put the image elsewhere or at another size, as SVG 2 lets
-`x`, `y`, `width` and `height` do. A chapter styled by a stylesheet too large
-to read keeps its wrappers. Light Novel mode keeps such an image whole.
+`x`, `y`, `width` and `height` do. Nor one whose `<img>` the stylesheets
+would draw otherwise than the SVG, which they style apart from it: under
+`img { visibility: hidden }` a cover in plain sight was hidden once it was
+an `<img>`. The `<img>` is put where the SVG is, as it will be, and the
+cascade asked of it too. A chapter styled by a stylesheet too large to read
+keeps its wrappers. Light Novel mode keeps such an image whole, and asks the
+same of the pages that would take a wrapper's place.
 
 ### A document too large to read whole is left as it is
 
