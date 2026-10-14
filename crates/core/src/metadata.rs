@@ -51,8 +51,11 @@ const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
     ('|', "-"),
 ];
 
-/// Leave room for the `.epub` extension within common filesystem limits.
-const MAX_FILENAME_CHARS: usize = 200;
+/// The most a name may take before its `.epub`, in bytes, as Linux's
+/// filesystems count a name: ext4 and btrfs take 255, which leaves room for
+/// the extension and a ` (2)` beside it. Filesystems that count UTF-16 units
+/// instead take 255 of those, never fewer than the bytes.
+const MAX_FILENAME_BYTES: usize = 200;
 
 /// A filename template longer than a filename is a mistake.
 const MAX_TEMPLATE_CHARS: usize = 200;
@@ -526,10 +529,14 @@ fn strip_epub_extension(name: &str) -> &str {
 fn finish_filename(name: &str) -> String {
     let mut name = sanitize_filename(strip_epub_extension(name.trim()));
 
-    // Truncate by characters, not bytes — the latter would split a multi-byte
-    // codepoint and panic.
-    if name.chars().count() > MAX_FILENAME_CHARS {
-        name = name.chars().take(MAX_FILENAME_CHARS).collect();
+    // Cut in bytes, at the end of a character: cut at 200 characters, a long
+    // Japanese title made a name of 374 bytes, which Linux refuses.
+    if name.len() > MAX_FILENAME_BYTES {
+        let mut end = MAX_FILENAME_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
         name = name.trim_end_matches([' ', '.', '-']).to_string();
     }
 

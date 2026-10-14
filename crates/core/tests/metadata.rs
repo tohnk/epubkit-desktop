@@ -312,6 +312,28 @@ fn long_multibyte_titles_do_not_panic() {
     assert!(name.chars().count() <= 205);
 }
 
+/// A name is cut to what filesystems take, which Linux's count in bytes: ext4
+/// and btrfs take 255 to a name. Cut at 200 characters, a long Japanese title
+/// made a name of 374 bytes, which such a system, the Flatpak's say, refuses
+/// as the finished book is moved into place, failing the run at its end.
+#[test]
+fn a_long_title_is_cut_to_a_name_that_fits_in_bytes() {
+    for title in [
+        "異世界".repeat(40),
+        "é".repeat(300),
+        "😀".repeat(80),
+        "a".repeat(300),
+    ] {
+        let name = format_filename(&title, "作者");
+        assert!(name.ends_with(".epub"), "{name}");
+        assert!(name.len() <= 205, "{} bytes: {name}", name.len());
+        // With room beside it for the " (2)" another book of that name takes.
+        assert!(name.len() + " (999)".len() <= 255);
+    }
+    // ASCII is cut where it was, at 200 characters.
+    assert_eq!(format_filename(&"a".repeat(300), "").len(), 205);
+}
+
 // ------------------------------------------------- filename formats (PR #5)
 
 fn book(title: &str, author: &str) -> Metadata {
