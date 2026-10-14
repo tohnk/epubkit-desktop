@@ -318,6 +318,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !options.metadata_edits.is_empty() {
         metadata::update_metadata(&opf, &options.metadata_edits)?;
     }
+    // What the book is named from, read now: cleaning the metadata strips an
+    // EPUB 2 book's series, kept in Calibre's tags, before the name is made.
+    let naming = metadata::extract_metadata(&opf)?;
 
     let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;
 
@@ -595,13 +598,11 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     progress(95, "Repackaging EPUB...");
     package::package_epub(work_dir, output_path)?;
 
-    let final_metadata = metadata::extract_metadata(&opf)?;
     let original = input_path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    report.output_filename =
-        metadata::output_filename(&final_metadata, &options.filename, &original)?;
+    report.output_filename = metadata::output_filename(&naming, &options.filename, &original)?;
     report.optimized_size = fs::metadata(output_path)
         .map_err(|e| Error::io(output_path, e))?
         .len();

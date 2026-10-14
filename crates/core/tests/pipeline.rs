@@ -1757,6 +1757,56 @@ fn the_output_is_named_as_chosen() {
     assert_eq!(report.output_filename, "The Long Afternoon (in).epub");
 }
 
+/// A book's series names it however its metadata is cleaned. Under EPUB 2 a
+/// series is kept in Calibre's `<meta>` tags, which cleaning the metadata
+/// strips from the book, and the name was made from what was left, so
+/// `{series} {series_index} - {title}` named the book `The Long
+/// Afternoon.epub` under the default preset, as the Python original did.
+#[test]
+fn a_series_names_the_book_however_its_metadata_is_cleaned() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:series</dc:identifier>
+    <dc:title>The Long Afternoon</dc:title>
+    <dc:creator>Marguerite Vale</dc:creator>
+    <meta name="calibre:series" content="Afternoons"/>
+    <meta name="calibre:series_index" content="2"/>
+  </metadata>
+  <manifest><item id="ch2" href="chapter2.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch2"/></spine>
+</package>
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    common::write_epub(
+        &input,
+        &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", common::CONTAINER_XML),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/chapter2.xhtml", CLEAN_CHAPTER.as_bytes()),
+        ],
+    );
+
+    for clean_metadata in [false, true] {
+        let options = ProcessingOptions {
+            clean_metadata,
+            filename: metadata::FilenameOptions {
+                format: metadata::FilenameFormat::Custom,
+                template: "{series} {series_index} - {title}".into(),
+            },
+            ..ProcessingOptions::default()
+        };
+        let output = dir.path().join("out.epub");
+        let report = process_epub(&input, &output, &options, |_, _| {}).unwrap();
+        assert_eq!(
+            report.output_filename, "Afternoons 2 - The Long Afternoon.epub",
+            "metadata cleaned: {clean_metadata}"
+        );
+    }
+}
+
 /// A template that cannot name the book fails before the work, not after.
 #[test]
 fn a_bad_template_is_refused_before_anything_is_done() {
