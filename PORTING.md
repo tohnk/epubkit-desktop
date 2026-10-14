@@ -142,7 +142,18 @@ On the CLI, saved settings are the base and the flags are overrides: each
 `--no-*` flag can only turn something off, so an option nobody mentioned keeps
 whatever it had. `--filename` and `--filename-template` are remembered too.
 Metadata edits (`--title`, `--author`) are about one book and are never
-persisted.
+persisted. `--quality` is refused outside 20 to 95, the range the window's
+slider allows; any byte was taken, and remembered, so `--quality 9` meant as
+90 made every book after it at the worst quality the encoder has.
+
+Settings are saved whole: written to a file beside the real one, flushed, and
+moved into place. The window saves after every change and the CLI after every
+run, and written in place, a save emptied the file before writing it, so the
+other could read no settings at all, take defaults in their place and save
+those over every preset, or read half a file, which does not parse, and refuse
+to start until it was deleted. With two writers and a reader, a third of the
+loads in three seconds found one or the other; now none do. A settings file
+that is a link to one elsewhere is saved where it points.
 
 ## Validating against the reference
 
@@ -848,6 +859,22 @@ both front ends check a template before any book is touched. Since a book can
 now be named exactly as the file it came from, neither front end ever
 replaces a file that is already there; the output becomes `name (2).epub`.
 The CLI used to write over one without asking.
+
+Two of its rules differ from upstream's. A book is named from its metadata as
+it stands once the user's edits are in, before anything is stripped: upstream
+named it from what was left after cleaning the metadata, which strips
+Calibre's tags, where an EPUB 2 book keeps its series, so under the default
+preset `{series}` and `{series_index}` were always empty for such a book. And
+a name is cut at 200 bytes, at the end of a character, not at 200 characters:
+Linux's filesystems count a name in bytes and take 255, and a long Japanese
+title, cut at 200 characters, made a name of 374 bytes, which they refuse as
+the finished book is moved into place.
+
+An edited title or author goes into the package document as the text it is.
+The port set it with libxml2's `set_content`, which parses what it is given
+for an element as markup, so an `&` was taken for the start of a reference
+and dropped: "Tom & Jerry" came out "Tom  Jerry", in the book and its name.
+Upstream assigned the text, as lxml escapes it.
 
 ### Paths in a book stay inside it
 
