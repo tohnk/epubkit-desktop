@@ -292,6 +292,79 @@ fn saving_creates_the_directory() {
     assert!(path.exists());
 }
 
+/// A save replaces the settings file whole. Written in place, a save emptied
+/// the file before writing it: a reader then, the app or another run of the
+/// CLI, both of which save after every change, found no settings at all and
+/// took defaults in their place, which the app would save over every preset;
+/// or found half a file, which does not parse, and the app would not start.
+#[test]
+fn a_reader_never_sees_a_settings_file_half_saved() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    let mut many = Settings::default();
+    for n in 0..40 {
+        many.save_preset(&format!("Preset {n}")).unwrap();
+    }
+    let mut one = many.clone();
+    one.presets.truncate(1);
+    many.save(&path).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = [many, one]
+        .into_iter()
+        .map(|settings| {
+            let (path, stop) = (path.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    settings.save(&path).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    let started = Instant::now();
+    let mut broken = None;
+    while broken.is_none() && started.elapsed() < Duration::from_secs(1) {
+        match Settings::load(&path) {
+            Ok(settings) if settings.presets.is_empty() => {
+                broken = Some("every preset gone".to_string());
+            }
+            Ok(_) => {}
+            Err(error) => broken = Some(error.to_string()),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert_eq!(broken, None);
+}
+
+/// A settings file that is a link to one kept elsewhere, in a folder of
+/// dotfiles say, stays a link: the file it points at is what is saved.
+#[cfg(unix)]
+#[test]
+fn a_linked_settings_file_stays_linked() {
+    let dir = tempdir();
+    let real = dir.path().join("dotfiles").join("epubkit.toml");
+    Settings::default().save(&real).unwrap();
+    let link = dir.path().join("config").join("settings.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut settings = Settings::default();
+    settings.options.quality = 42;
+    settings.save(&link).unwrap();
+
+    let link_kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(link_kind.is_symlink(), "the link was replaced");
+    assert_eq!(Settings::load(&real).unwrap().options.quality, 42);
+}
+
 #[test]
 fn labels_read_the_way_the_ui_shows_them() {
     let mut settings = Settings::default();

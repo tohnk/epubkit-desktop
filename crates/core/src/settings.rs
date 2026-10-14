@@ -27,6 +27,7 @@
 //!   desk, not a processing taste, so it is sticky on its own. So is how the
 //!   output is named, which is about the user's library, not the book.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -171,14 +172,28 @@ impl Settings {
         toml::from_str(&text).map_err(|e| Error::Settings(format!("{}: {e}", path.display())))
     }
 
+    /// Write settings to `path`, whole. They are written beside it and moved
+    /// into place, so whoever reads them meanwhile, the app or another run of
+    /// the CLI, finds the settings before or the settings after, never a file
+    /// half written; and a save that is stopped part way leaves the old ones.
+    /// A file that is a link to one elsewhere is saved where it points.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(directory).map_err(|e| Error::io(directory, e))?;
 
         let text = toml::to_string_pretty(self)
             .map_err(|e| Error::Settings(format!("could not serialize settings: {e}")))?;
-        std::fs::write(path, text).map_err(|e| Error::io(path, e))
+        let mut file =
+            tempfile::NamedTempFile::new_in(directory).map_err(|e| Error::io(directory, e))?;
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.as_file().sync_all())
+            .map_err(|e| Error::io(file.path(), e))?;
+        file.persist(&path).map_err(|e| Error::io(&path, e.error))?;
+        Ok(())
     }
 
     /// The device profile, falling back to the default if the stored id is not
