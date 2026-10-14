@@ -216,16 +216,26 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         };
 
         if let Some(mut existing) = dc_element(doc, local_name)? {
-            existing.set_content(value).ok();
+            set_text(&mut existing, value);
         } else {
             let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC)?;
             if let Ok(mut created) = metadata_el.new_child(namespace, local_name) {
-                created.set_content(value).ok();
+                set_text(&mut created, value);
             }
         }
     }
 
     Ok(())
+}
+
+/// Make `value`, as it reads, all the text of `element`. What libxml2's
+/// `set_content` is given for an element it parses as markup, so an `&` in an
+/// edited title was taken for the start of a reference and dropped.
+fn set_text(element: &mut Node, value: &str) {
+    for mut child in element.get_child_nodes() {
+        child.unlink();
+    }
+    element.append_text(value).ok();
 }
 
 /// Remove store- and reader-specific `<meta>` entries. Returns how many went.

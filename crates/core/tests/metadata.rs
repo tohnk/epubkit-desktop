@@ -184,6 +184,41 @@ fn edits_create_missing_fields() {
     assert_eq!(extract_metadata(&doc).unwrap().author, "Added Author");
 }
 
+/// An edit is kept as it was typed, in a field the book has and in one it
+/// lacks. libxml2 parses what it is given for an element as markup, so an `&`
+/// in an edited title or author was taken for the start of a reference and
+/// dropped: "Tom & Jerry" became "Tom  Jerry", "AT&T" became "ATT", and one
+/// typed as "&amp;" read back as "&".
+#[test]
+fn edits_are_kept_as_typed() {
+    for typed in [
+        "Tom & Jerry",
+        "AT&T",
+        "Already &amp; escaped",
+        "&#38; and <tags>",
+    ] {
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Only A Title</dc:title>
+  </metadata>
+  <manifest/><spine/>
+</package>
+"#);
+        let edits = MetadataEdits {
+            title: Some(typed.into()),
+            author: Some(typed.into()),
+            ..MetadataEdits::default()
+        };
+        update_metadata(&doc, &edits).unwrap();
+
+        // As the book is written out, and read back.
+        let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+        assert_eq!(metadata.title, typed, "an edited title");
+        assert_eq!(metadata.author, typed, "an author the book lacked");
+    }
+}
+
 #[test]
 fn empty_edits_change_nothing() {
     let doc = opf(STANDARD);
