@@ -159,7 +159,8 @@ pub struct ProcessedImage {
 /// `bytes`, an image, as a JPEG to show it small: in colour, turned as its
 /// EXIF data says, and shrunk to fit within `max_width` x `max_height`. What
 /// reading its header may take is held from `budget` while it is read, and
-/// what decoding it takes, until the thumbnail is made.
+/// what decoding it takes, until the thumbnail is made. One that will not be
+/// decoded, as [`memory_needed`] tells, is refused without decoding it.
 ///
 /// Shrunk by averaging blocks of pixels, not resampled: at the size a
 /// thumbnail is shown, the two look alike, and averaging takes a third of the
@@ -170,7 +171,7 @@ pub fn thumbnail(
     max_height: u32,
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
-    let needed = thumbnail_needed(bytes, budget);
+    let needed = thumbnail_needed(bytes, budget).ok_or_else(undecodable_error)?;
     if needed > budget.total() {
         return Err(thumbnail_oversize_error(needed, budget.total()));
     }
@@ -180,13 +181,18 @@ pub fn thumbnail(
 
 /// About as much memory as making a thumbnail of the image in `bytes` holds
 /// at once, reckoned from its header, which is read holding [`HEADER_MEMORY`]
-/// of `budget`. Zero for one whose header does not read, which fails as it is
-/// decoded.
-pub(crate) fn thumbnail_needed(bytes: &[u8], budget: &MemoryBudget) -> u64 {
+/// of `budget`. `None` for one that will not be decoded, as for
+/// [`memory_needed`].
+pub(crate) fn thumbnail_needed(bytes: &[u8], budget: &MemoryBudget) -> Option<u64> {
     let _reading = budget.hold(HEADER_MEMORY);
-    Header::read(Cursor::new(bytes))
-        .and_then(|header| Footprint::of(header, bytes.len() as u64))
-        .map_or(0, |footprint| footprint.thumbnail())
+    let header = Header::read(Cursor::new(bytes))?;
+    Some(Footprint::of(header, bytes.len() as u64)?.thumbnail())
+}
+
+/// The error an image that will not be decoded, as [`memory_needed`] tells,
+/// is refused with before anything is decoded.
+pub(crate) fn undecodable_error() -> Error {
+    Error::Image("the image could not be decoded".into())
 }
 
 /// The error a thumbnail that would take `needed` bytes, more than the
@@ -237,16 +243,20 @@ pub fn is_raster_image(path: &Path) -> bool {
 /// About as much memory as converting the image at `path` for `options`
 /// holds at once, reckoned from its header, before the rest of the file is
 /// read: the file itself, and [what decoding and converting it
-/// hold](Footprint::converting). Just the file for an image whose header
-/// cannot be read, which fails as it is decoded, and for one past
-/// [`MAX_PIXELS`], refused before anything is allocated for it.
+/// hold](Footprint::converting).
+///
+/// `None` for an image that will not be decoded, which is left as it is
+/// without being tried: one whose header does not read, or one past
+/// [`MAX_PIXELS`], which its decoder refuses. Nothing could be set aside for
+/// decoding either, so a worker held to what was set aside for one, its file
+/// alone, was stopped before it could say the image would not decode.
 ///
 /// Reading the header holds no more than [`HEADER_MEMORY`], which the caller
 /// sets aside while it is read.
-pub fn memory_needed(path: &Path, options: &ImageOptions) -> u64 {
+pub fn memory_needed(path: &Path, options: &ImageOptions) -> Option<u64> {
     let file = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    let footprint = header_of(path).and_then(|header| Footprint::of(header, file));
-    file.saturating_add(footprint.map_or(0, |footprint| footprint.converting(options)))
+    let footprint = Footprint::of(header_of(path)?, file)?;
+    Some(file.saturating_add(footprint.converting(options)))
 }
 
 /// The header of the image at `path`: see [`Header::read`].

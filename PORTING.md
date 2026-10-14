@@ -714,7 +714,12 @@ tiny image padded to a large file no longer sits in two buffers at once. A
 cover thumbnail has no file to name, so its bytes are sent to the worker, and
 the memory set aside counts that copy. A file that cannot be read fails the
 book, as reading it in the parent once did; one that will not decode leaves
-its image alone. And where the cap refuses an allocation that fails with an
+its image alone. An image whose header does not read, or that is past 179
+megapixels, is not sent to a worker at all, but counted as one that will not
+decode, and its cover is refused the same way: nothing could be reckoned for
+it, so the worker was held to its file alone and stopped before it could say
+the image would not decode. Each was counted as having overrun the 0 MB set
+aside for it, and every such cover cost a worker. And where the cap refuses an allocation that fails with an
 error rather than stopping the worker — reading the file allocates that way,
 as some decoders do — the image is left as one that overran, not taken for a
 file that cannot be read or an image that will not decode.

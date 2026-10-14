@@ -169,7 +169,7 @@ fn a_deep_tiff_converts_within_the_memory_reckoned_for_it() {
     ] {
         let path = dir.path().join(name);
         std::fs::write(&path, &bytes).unwrap();
-        let cap = epubkit_core::image::memory_needed(&path, &options);
+        let cap = epubkit_core::image::memory_needed(&path, &options).unwrap();
         let converted = worker::convert(&path, name, &options, cap).unwrap();
         assert!(
             matches!(converted, Converted::Done(_)),
@@ -281,11 +281,161 @@ fn a_page_of_colour_noise_converts_within_the_memory_reckoned_for_it() {
             quality,
             ..ImageOptions::default()
         };
-        let cap = epubkit_core::image::memory_needed(&path, &options);
+        let cap = epubkit_core::image::memory_needed(&path, &options).unwrap();
         let converted = worker::convert(&path, "noise.bmp", &options, cap).unwrap();
         assert!(
             matches!(converted, Converted::Done(_)),
             "quality {quality}: did not convert within the {cap} bytes reckoned for it"
+        );
+    }
+}
+
+/// A book's manifest calls these images, but none of them will decode: a file
+/// that begins like a JPEG and is not one, a PNG whose header claims more
+/// pixels than any image may have, and text named as a PNG.
+fn images_that_will_not_decode() -> Vec<(&'static str, Vec<u8>)> {
+    let mut not_a_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    not_a_jpeg.extend((0..4000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+    // A PNG's signature and header claiming 20,000 x 20,000, and nothing more.
+    let mut too_many_pixels = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    too_many_pixels.extend_from_slice(&20_000u32.to_be_bytes());
+    too_many_pixels.extend_from_slice(&20_000u32.to_be_bytes());
+    too_many_pixels.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let crc = crc32(&too_many_pixels[12..]);
+    too_many_pixels.extend_from_slice(&crc.to_be_bytes());
+    vec![
+        ("not-a-jpeg.jpg", not_a_jpeg),
+        ("too-many-pixels.png", too_many_pixels),
+        ("text.png", b"not an image".to_vec()),
+    ]
+}
+
+/// The CRC a PNG chunk ends with.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// An EPUB whose one chapter shows `images`, each in its manifest as the
+/// image its name says it is.
+fn book_with_images(path: &Path, images: &[(&str, Vec<u8>)]) {
+    use std::io::Write;
+    let manifest: String = images
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            let media_type = if name.ends_with(".png") {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            format!(r#"<item id="img{index}" href="{name}" media-type="{media_type}"/>"#)
+        })
+        .collect();
+    let body: String = images
+        .iter()
+        .map(|(name, _)| format!(r#"<p><img src="{name}" alt=""/></p>"#))
+        .collect();
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:broken-images</dc:identifier>
+    <dc:title>Broken images</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    {manifest}
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>
+"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>{body}</body></html>
+"#
+    );
+    let container = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"#;
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".into(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".into(),
+            container.as_bytes().to_vec(),
+        ),
+        ("OEBPS/content.opf".into(), opf.into_bytes()),
+        ("OEBPS/chapter1.xhtml".into(), chapter.into_bytes()),
+    ];
+    for (name, bytes) in images {
+        entries.push((format!("OEBPS/{name}"), bytes.clone()));
+    }
+    for (name, bytes) in entries {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(&bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// An image that will not decode is reported so, where workers are on. Nothing
+/// could be reckoned for it, so the worker was held to its file alone, and was
+/// stopped before it could say so: each was reported as not decoding within
+/// the 0 MB set aside for it.
+#[test]
+fn an_image_that_will_not_decode_is_reported_so_not_as_an_overrun() {
+    use_the_cli_as_worker();
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    let images = images_that_will_not_decode();
+    book_with_images(&input, &images);
+
+    let options = epubkit_core::pipeline::ProcessingOptions::default();
+    let report =
+        epubkit_core::pipeline::process_epub(&input, &output, &options, |_, _| {}).unwrap();
+    assert_eq!(report.images_unconverted, images.len());
+    for (name, _) in &images {
+        let said = format!("{name}: skipped (could not be decoded)");
+        assert!(
+            report.image_details.contains(&said),
+            "{name}: {:?}",
+            report.image_details
+        );
+    }
+}
+
+/// A cover that will not decode is refused as it is, rather than by the
+/// worker asked to make its thumbnail being stopped, under a cap of nothing.
+#[test]
+fn a_cover_that_will_not_decode_is_refused_without_stopping_a_worker() {
+    use_the_cli_as_worker();
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    for (name, bytes) in images_that_will_not_decode() {
+        let refused = worker::thumbnail(&bytes, 120, 160, &budget)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            refused.as_deref(),
+            Some("image error: the image could not be decoded"),
+            "{name}"
         );
     }
 }

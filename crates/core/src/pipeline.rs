@@ -717,6 +717,10 @@ fn convert_images<P: FnMut(u8, &str)>(
                 let _reading = IMAGE_MEMORY.hold(image::HEADER_MEMORY);
                 image::memory_needed(job.path, job.options)
             };
+            // One that will not be decoded is not tried.
+            let Some(needed) = needed else {
+                return Ok(Converted::Undecodable);
+            };
             if needed > IMAGE_MEMORY.total() {
                 return Ok(Converted::TooLarge(needed));
             }

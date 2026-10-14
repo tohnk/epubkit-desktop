@@ -195,14 +195,15 @@ pub fn convert(path: &Path, filename: &str, options: &ImageOptions, cap: u64) ->
 /// Make a thumbnail of `bytes` within `max_width` x `max_height`, out of
 /// `budget`, as [`image::thumbnail`] does, but decoding it in a worker where
 /// workers are on, so that an image crafted to make a decoder allocate wildly
-/// cannot. One too large for the budget is refused before any worker is asked.
+/// cannot. One too large for the budget, or that will not be decoded, is
+/// refused before any worker is asked.
 pub fn thumbnail(
     bytes: &[u8],
     max_width: u32,
     max_height: u32,
     budget: &MemoryBudget,
 ) -> Result<Vec<u8>> {
-    let cap = image::thumbnail_needed(bytes, budget);
+    let cap = image::thumbnail_needed(bytes, budget).ok_or_else(image::undecodable_error)?;
     // The decode is capped to `cap` above the cover the worker also holds; the
     // reservation covers that copy too, so the budget bounds both.
     let needed = cap.saturating_add(bytes.len() as u64);

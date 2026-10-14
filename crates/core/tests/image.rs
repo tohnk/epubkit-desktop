@@ -818,10 +818,10 @@ fn the_memory_an_image_needs_counts_its_file_and_its_depth() {
     .unwrap();
     let options = ImageOptions::default();
 
-    let needed = epubkit_core::image::memory_needed(&deep, &options);
+    let needed = epubkit_core::image::memory_needed(&deep, &options).unwrap();
     let file = std::fs::metadata(&deep).unwrap().len();
     assert!(needed >= file + pixels * 11, "{needed}");
-    let shallow_needed = epubkit_core::image::memory_needed(&shallow, &options);
+    let shallow_needed = epubkit_core::image::memory_needed(&shallow, &options).unwrap();
     let shallow_file = std::fs::metadata(&shallow).unwrap().len();
     assert!(
         shallow_needed >= shallow_file + pixels * 4,
@@ -849,10 +849,48 @@ fn the_memory_a_progressive_jpeg_needs_counts_its_coefficients() {
             .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
             .unwrap();
         let file = std::fs::metadata(&path).unwrap().len();
-        let reckoned = epubkit_core::image::memory_needed(&path, &ImageOptions::default());
+        let reckoned = epubkit_core::image::memory_needed(&path, &ImageOptions::default()).unwrap();
         needed.push(reckoned - file);
     }
     assert!(needed[1] >= needed[0] + pixels, "{needed:?}");
+}
+
+/// Nothing is reckoned for an image that will not be decoded, so it is not
+/// tried: one whose header does not read, as a file that only begins like a
+/// JPEG, or whose header claims more pixels than any image may have. Its
+/// thumbnail is refused for it too.
+#[test]
+fn an_image_that_will_not_decode_is_not_reckoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut not_a_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    not_a_jpeg.extend((0..4000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+    // A GIF whose canvas is 20,000 x 20,000, then the descriptor of a frame of
+    // one pixel.
+    let mut too_many_pixels = b"GIF89a".to_vec();
+    too_many_pixels.extend_from_slice(&[0x20, 0x4E, 0x20, 0x4E, 0, 0, 0]);
+    too_many_pixels.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]);
+    let budget = epubkit_core::memory::MemoryBudget::new(1 << 30);
+    for (name, bytes) in [
+        ("not-a-jpeg.jpg", not_a_jpeg),
+        ("too-many-pixels.gif", too_many_pixels),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        // The GIF's header reads; it is its size that refuses it.
+        assert_eq!(is_raster_image(&path), name.ends_with(".gif"), "{name}");
+        assert_eq!(
+            memory_needed(&path, &ImageOptions::default()),
+            None,
+            "{name}"
+        );
+        assert!(
+            epubkit_core::image::thumbnail(&bytes, 120, 160, &budget).is_err(),
+            "{name}"
+        );
+    }
+    let path = dir.path().join("photo.jpg");
+    std::fs::write(&path, photo(64, 64)).unwrap();
+    assert!(memory_needed(&path, &ImageOptions::default()).is_some());
 }
 
 /// A thumbnail that would need more memory than its budget has is not made,
@@ -1028,14 +1066,14 @@ fn the_memory_a_webp_or_gif_needs_counts_what_its_decoder_keeps() {
     ] {
         let path = dir.path().join(format!("{coding}.webp"));
         std::fs::write(&path, webp_claiming(width, height, coding)).unwrap();
-        let needed = epubkit_core::image::memory_needed(&path, &options);
+        let needed = epubkit_core::image::memory_needed(&path, &options).unwrap();
         let file = std::fs::metadata(&path).unwrap().len();
         assert!(needed >= file + holds, "{coding}: {needed}");
     }
 
     let path = dir.path().join("frame.gif");
     std::fs::write(&path, gif_claiming((1, 1), (4000, 3000))).unwrap();
-    let needed = epubkit_core::image::memory_needed(&path, &options);
+    let needed = epubkit_core::image::memory_needed(&path, &options).unwrap();
     assert!(needed >= 4000 * 3000 * 4, "{needed}");
     // A frame larger than Pillow converts is refused, as a canvas that large
     // is.
@@ -1123,7 +1161,7 @@ fn a_real_tiff_is_read_by_the_bounded_walk() {
 
         assert!(is_raster_image(&path), "{w}x{h} TIFF is an image");
         assert!(
-            memory_needed(&path, &ImageOptions::default()) >= bytes.len() as u64,
+            memory_needed(&path, &ImageOptions::default()).unwrap() >= bytes.len() as u64,
             "reckoned at least its file"
         );
         let converted = process_image(&bytes, "x.tiff", &ImageOptions::default()).unwrap();

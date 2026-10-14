@@ -116,7 +116,7 @@ fn reading_a_header_holds_little_of_the_file() {
     let options = ImageOptions::default();
 
     for (path, most) in [(&jpeg, 1 << 20), (&png, HEADER_MEMORY as usize)] {
-        let (needed, peak) = peak_of(|| memory_needed(path, &options));
+        let (needed, peak) = peak_of(|| memory_needed(path, &options).unwrap());
         assert!(needed > std::fs::metadata(path).unwrap().len());
         assert!(peak <= most, "{}: reckoning held {peak}", path.display());
         let (raster, peak) = peak_of(|| is_raster_image(path));
@@ -144,7 +144,7 @@ fn converting_an_image_holds_no_more_than_was_set_aside() {
                 light_novel_mode,
                 ..ImageOptions::default()
             };
-            let needed = memory_needed(&path, &options);
+            let needed = memory_needed(&path, &options).unwrap();
             let file = std::fs::read(&path).unwrap();
             let (converted, peak) = peak_of(|| process_image(&file, name, &options));
             assert!(converted.is_ok(), "{name}");
@@ -207,7 +207,7 @@ fn a_webps_exif_is_read_no_further_than_its_turn() {
     std::fs::write(&path, webp_with_exif(48 << 20)).unwrap();
     let options = ImageOptions::default();
 
-    let (needed, peak) = peak_of(|| memory_needed(&path, &options));
+    let (needed, peak) = peak_of(|| memory_needed(&path, &options).unwrap());
     assert!(peak <= HEADER_MEMORY as usize, "reckoning held {peak}");
     let (raster, peak) = peak_of(|| is_raster_image(&path));
     assert!(raster);
@@ -252,7 +252,7 @@ fn a_gif_frame_larger_than_its_canvas_is_reckoned_at_its_own_size() {
     std::fs::write(&path, gif_with_frame((1, 1), (4000, 3000))).unwrap();
     let options = ImageOptions::default();
 
-    let needed = memory_needed(&path, &options);
+    let needed = memory_needed(&path, &options).unwrap();
     let file = std::fs::read(&path).unwrap();
     let (converted, peak) = peak_of(|| process_image(&file, "frame.gif", &options));
     assert!(converted.is_ok());
@@ -306,7 +306,7 @@ fn a_gifs_profile_and_xmp_are_reckoned() {
         std::fs::write(&path, gif_with_metadata(kind, 40 << 20)).unwrap();
         let name = String::from_utf8_lossy(kind);
 
-        let (needed, peak) = peak_of(|| memory_needed(&path, &options));
+        let (needed, peak) = peak_of(|| memory_needed(&path, &options).unwrap());
         assert!(
             peak <= HEADER_MEMORY as usize,
             "{name}: reckoning held {peak}"
@@ -377,7 +377,7 @@ fn a_tiffs_directory_is_read_without_its_decoder() {
     let path = dir.path().join("strips.tiff");
     std::fs::write(&path, tiff_with_strips(5_000_000)).unwrap();
 
-    let (_needed, reckoning) = peak_of(|| memory_needed(&path, &options));
+    let (_needed, reckoning) = peak_of(|| memory_needed(&path, &options).unwrap());
     assert!(
         reckoning <= HEADER_MEMORY as usize,
         "reckoning held {reckoning}"
@@ -469,7 +469,7 @@ fn a_deep_tiff_is_reckoned_at_its_depth() {
     ] {
         let path = dir.path().join(name);
         std::fs::write(&path, &bytes).unwrap();
-        let needed = memory_needed(&path, &options);
+        let needed = memory_needed(&path, &options).unwrap();
         let (converted, peak) = peak_of(|| process_image(&bytes, name, &options));
         assert!(converted.is_ok(), "{name}");
         let held = (bytes.len() + peak) as u64;
@@ -489,7 +489,7 @@ fn a_floating_point_image_is_shrunk_without_a_copy() {
     let path = dir.path().join("float.tiff");
     std::fs::write(&path, &bytes).unwrap();
 
-    let needed = memory_needed(&path, &options);
+    let needed = memory_needed(&path, &options).unwrap();
     let (converted, peak) = peak_of(|| process_image(&bytes, "float.tiff", &options));
     assert!(converted.is_ok());
     let held = (bytes.len() + peak) as u64;
@@ -548,7 +548,7 @@ fn a_page_of_noise_at_the_largest_size_converts_within_what_is_set_aside() {
 
     for (grayscale, quality) in [(false, 70), (false, 95), (false, 100), (true, 100)] {
         let options = page_options(grayscale, quality);
-        let needed = memory_needed(&path, &options);
+        let needed = memory_needed(&path, &options).unwrap();
         let (converted, peak) = peak_of(|| process_image(&bmp, "noise.bmp", &options));
         assert!(converted.is_ok(), "grey {grayscale}, quality {quality}");
         let held = (bmp.len() + peak) as u64;
@@ -631,7 +631,7 @@ fn an_opaque_lossless_webp_is_reckoned_with_its_rgba() {
     std::fs::write(&path, webp).unwrap();
     let options = ImageOptions::default();
 
-    let needed = memory_needed(&path, &options);
+    let needed = memory_needed(&path, &options).unwrap();
     let file = std::fs::read(&path).unwrap();
     let (converted, peak) = peak_of(|| process_image(&file, "opaque.webp", &options));
     assert!(converted.is_ok());

@@ -1092,6 +1092,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
