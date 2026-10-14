@@ -50,7 +50,7 @@ enum Command {
         #[arg(short, long)]
         device: Option<String>,
         /// JPEG quality, 20-95.
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = clap::value_parser!(u8).range(20..=95))]
         quality: Option<u8>,
         /// Rotate and split landscape artwork for vertical reading.
         #[arg(long)]
