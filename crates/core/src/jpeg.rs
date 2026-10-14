@@ -12,16 +12,22 @@
 //! interleaved scan. So rather than let the encoder do it, this module takes the
 //! finished interleaved file and rewrites just its Huffman coding:
 //!
-//! 1. decode the entropy-coded scan into its symbol stream — no dequantization,
-//!    no IDCT, so nothing is approximated;
-//! 2. count symbol frequencies and build optimal tables per Annex K;
-//! 3. re-encode the identical symbol stream against the new tables.
+//! 1. decode the entropy-coded scan into its symbols — no dequantization, no
+//!    IDCT, so nothing is approximated — and count them;
+//! 2. build optimal tables from those counts per Annex K;
+//! 3. decode the scan again and re-encode the identical symbols against the
+//!    new tables.
+//!
+//! The scan is decoded a block at a time, each time, so that what this holds
+//! is the file it writes and not the symbols of the file it reads.
 //!
 //! Everything else in the file is copied through untouched: SOF, DQT, the scan
-//! header, component order, sampling factors, and every DCT coefficient. The
-//! result decodes to the same pixels, byte for byte, and differs only in the
-//! DHT segments and the entropy bits. It is the same transformation
-//! `jpegtran -optimize` performs.
+//! header, component order, sampling factors, and every DCT coefficient of
+//! the image. Only blocks past the image's edge, which no decoder shows, are
+//! coded afresh, as libjpeg codes them: see `Blocks`. The result
+//! decodes to the same pixels, byte for byte, and differs only in the DHT
+//! segments and the entropy bits. It is the same transformation
+//! `jpegtran -optimize` performs on a file libjpeg wrote.
 //!
 //! Anything unexpected — progressive, restart markers, multiple scans, 12-bit —
 //! returns `None`, and the caller keeps the original file.
@@ -86,29 +92,52 @@ pub fn optimize_huffman(jpeg: &[u8]) -> Option<Vec<u8>> {
     }
 
     let parsed = stage!(parse(jpeg), "parse");
-    let symbols = stage!(decode_symbols(&parsed), "decode");
-    if symbols.is_empty() {
+
+    // The scan is read a block at a time, three times over: to count its
+    // symbols, to code them against the tables those counts make, and to
+    // check what was written. A list of all its symbols, copied to code the
+    // padding afresh, beside another read back from the rewritten file to
+    // check it, held ten times a JPEG of colour noise.
+    let mut counts = [[0u32; 256]; 8];
+    let mut any = false;
+    let mut blocks = stage!(Blocks::new(&parsed, true), "decode");
+    while let Some(block) = stage!(blocks.next(), "decode") {
+        for sym in block {
+            counts[usize::from(sym.slot)][usize::from(sym.symbol)] += 1;
+            any = true;
+        }
+    }
+    if !any {
         return None;
     }
 
-    let tables = stage!(build_tables(&parsed, &symbols), "table building");
-    let entropy = encode_symbols(&symbols, &tables);
-    let out = assemble(&parsed, &tables, &entropy);
+    let tables = stage!(build_tables(&parsed, &counts), "table building");
+    // No rewrite at all where it would be no smaller than the file.
+    let out = stage!(rewrite(&parsed, &tables, jpeg.len()), "encode")?;
 
-    if out.len() >= jpeg.len() {
-        return None;
-    }
-
-    // Decode what was just written and require the same symbols back. This is
-    // cheap — no IDCT is involved — and it means a bug here degrades to
-    // "no saving" rather than to a corrupt book.
+    // Decode what was just written and require the same symbols back, block
+    // for block, as they were coded. This is cheap — no IDCT is involved —
+    // and it means a bug here degrades to "no saving" rather than to a
+    // corrupt book.
     {
         let check = stage!(parse(&out), "re-parse of the rewritten file");
-        let round_tripped = stage!(decode_symbols(&check), "re-decode of the rewritten file");
-        stage!(
-            (round_tripped == symbols).then_some(()),
-            "verification: the rewritten scan decodes to different symbols"
+        let mut ours = stage!(Blocks::new(&parsed, true), "decode");
+        let mut theirs = stage!(
+            Blocks::new(&check, false),
+            "re-decode of the rewritten file"
         );
+        loop {
+            let coded = stage!(ours.next(), "decode");
+            let read = stage!(theirs.next(), "re-decode of the rewritten file");
+            match (coded, read) {
+                (None, None) => break,
+                (Some(coded), Some(read)) if coded == read => {}
+                _ => stage!(
+                    None::<()>,
+                    "verification: the rewritten scan decodes to different symbols"
+                ),
+            }
+        }
     }
 
     Some(out)
@@ -117,10 +146,7 @@ pub fn optimize_huffman(jpeg: &[u8]) -> Option<Vec<u8>> {
 // ------------------------------------------------------------------ parsing
 
 fn be16(bytes: &[u8], at: usize) -> Option<usize> {
-    Some(u16::from_be_bytes([
-        *bytes.get(at)?,
-        *bytes.get(at + 1)?,
-    ]) as usize)
+    Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]) as usize)
 }
 
 fn parse(jpeg: &[u8]) -> Option<Parsed<'_>> {
@@ -301,11 +327,14 @@ fn parse_scan(payload: &[u8], components: &mut [Component]) -> Option<Vec<usize>
 
 // ------------------------------------------------------------------ decoding
 
+/// The bits of entropy-coded data, read ahead so that a code can be looked
+/// up from the bits that begin it.
 struct BitReader<'a> {
     data: &'a [u8],
     at: usize,
-    byte: u32,
-    left: u32,
+    /// Bits read ahead, the next of them the highest, and below them zeroes.
+    ahead: u64,
+    held: u32,
 }
 
 impl<'a> BitReader<'a> {
@@ -313,40 +342,67 @@ impl<'a> BitReader<'a> {
         Self {
             data,
             at: 0,
-            byte: 0,
-            left: 0,
+            ahead: 0,
+            held: 0,
         }
     }
 
-    fn bit(&mut self) -> Option<u32> {
-        if self.left == 0 {
-            let raw = *self.data.get(self.at)?;
-            self.at += 1;
-            self.byte = if raw == 0xFF {
+    /// Read ahead to at least 57 bits, or as far as the data goes.
+    fn fill(&mut self) {
+        while self.held <= 56 {
+            let Some(&byte) = self.data.get(self.at) else {
+                return;
+            };
+            if byte == 0xFF {
                 // A stuffed zero means a literal 0xFF; anything else is a
                 // marker, and the entropy data has ended.
-                if *self.data.get(self.at)? != 0x00 {
-                    return None;
+                if self.data.get(self.at + 1) != Some(&0x00) {
+                    return;
                 }
-                self.at += 1;
-                0xFF
+                self.at += 2;
             } else {
-                raw as u32
-            };
-            self.left = 8;
+                self.at += 1;
+            }
+            self.ahead |= u64::from(byte) << (56 - self.held);
+            self.held += 8;
         }
-        self.left -= 1;
-        Some((self.byte >> self.left) & 1)
+    }
+
+    /// The next sixteen bits, zeroes past the end of the data, and how many
+    /// of them there are.
+    fn peek(&mut self) -> (u32, u32) {
+        if self.held < 16 {
+            self.fill();
+        }
+        ((self.ahead >> 48) as u32, self.held.min(16))
+    }
+
+    fn skip(&mut self, count: u32) {
+        self.ahead <<= count;
+        self.held -= count;
     }
 
     fn bits(&mut self, count: u8) -> Option<u16> {
-        let mut value = 0u16;
-        for _ in 0..count {
-            value = (value << 1) | self.bit()? as u16;
+        let count = u32::from(count);
+        if count == 0 {
+            return Some(0);
         }
+        if self.held < count {
+            self.fill();
+            if self.held < count {
+                return None;
+            }
+        }
+        let value = (self.ahead >> (64 - count)) as u16;
+        self.skip(count);
         Some(value)
     }
 }
+
+/// How many bits ahead a code is looked up in one step, as libjpeg looks
+/// codes up. Sought a length at a time instead, codes as long as colour
+/// noise's took most of the time reading a scan takes.
+const LOOKAHEAD: usize = 10;
 
 /// Canonical decoding tables, per Annex F.2.2.3.
 struct Decoder {
@@ -354,6 +410,11 @@ struct Decoder {
     maxcode: [i32; 17],
     valptr: [usize; 17],
     values: Vec<u8>,
+    /// For each value the next `LOOKAHEAD` bits can take, what seeking the
+    /// code they begin with finds: its length and its symbol, or no symbol
+    /// where the table has none for it. A length of 0 where the code is
+    /// longer.
+    ahead: Vec<(u8, Option<u8>)>,
 }
 
 impl Decoder {
@@ -363,6 +424,7 @@ impl Decoder {
             maxcode: [-1; 17],
             valptr: [0; 17],
             values: table.values.clone(),
+            ahead: Vec::new(),
         };
 
         let mut code = 0i32;
@@ -379,84 +441,234 @@ impl Decoder {
             code <<= 1;
         }
 
+        decoder.ahead = (0..1 << LOOKAHEAD)
+            .map(|bits: i32| {
+                (1..=LOOKAHEAD)
+                    .find_map(|length| decoder.seek(bits >> (LOOKAHEAD - length), length))
+                    .unwrap_or((0, None))
+            })
+            .collect();
         decoder
     }
 
+    /// What the code `code`, `length` bits long, is: its length and its
+    /// symbol, or no symbol where the table has none for it. `None` where
+    /// there is no code that long beginning so.
+    fn seek(&self, code: i32, length: usize) -> Option<(u8, Option<u8>)> {
+        (code <= self.maxcode[length]).then(|| {
+            let symbol = usize::try_from(code - self.mincode[length])
+                .ok()
+                .and_then(|offset| self.values.get(self.valptr[length] + offset));
+            (length as u8, symbol.copied())
+        })
+    }
+
     fn decode(&self, reader: &mut BitReader) -> Option<u8> {
-        let mut code = reader.bit()? as i32;
-        for length in 1..=16 {
-            if code <= self.maxcode[length] {
-                let at = self.valptr[length] + (code - self.mincode[length]) as usize;
-                return self.values.get(at).copied();
-            }
-            code = (code << 1) | reader.bit()? as i32;
+        let (next, there) = reader.peek();
+        let found = match self.ahead[(next >> (16 - LOOKAHEAD)) as usize] {
+            (0, _) => (LOOKAHEAD + 1..=16)
+                .find_map(|length| self.seek((next >> (16 - length)) as i32, length)),
+            found => Some(found),
+        };
+        let (length, symbol) = found?;
+        if u32::from(length) > there {
+            return None;
         }
-        None
+        reader.skip(u32::from(length));
+        symbol
     }
 }
 
-fn decode_symbols(parsed: &Parsed) -> Option<Vec<Sym>> {
-    let decoders: Vec<Option<Decoder>> = parsed
-        .tables
-        .iter()
-        .map(|t| t.as_ref().map(Decoder::new))
-        .collect();
+/// The scan of a parsed JPEG, read a block at a time in the order it is
+/// coded, so that no more than a block of its symbols is held.
+///
+/// `unpadded`, each block past its component's edge is read as libjpeg codes
+/// it: its DC that of the block before, so a difference of zero, and no AC.
+/// An interleaved scan codes whole MCUs, so where a component does not fill
+/// out the last one, the encoder codes blocks past the image's edge that no
+/// decoder shows; `jpeg-encoder` fills them by repeating the image's last row
+/// or column, at a real cost in a dithered image. Every other block keeps its
+/// coefficients, its DC difference worked out again from the block that now
+/// comes before it.
+struct Blocks<'a> {
+    parsed: &'a Parsed<'a>,
+    decoders: Vec<Option<Decoder>>,
+    reader: BitReader<'a>,
+    unpadded: bool,
+    mcus_x: u32,
+    mcus: u32,
+    /// Each component's extent in blocks (A.1.1).
+    extents: Vec<(u32, u32)>,
+    /// Each component's DC as the scan has it, and as it is rewritten.
+    written: Vec<i32>,
+    rewritten: Vec<i32>,
+    /// Where the next block is: its MCU, its component, and which of that
+    /// component's blocks in the MCU it is.
+    mcu: u32,
+    component: usize,
+    block: u32,
+    /// The symbols of the block last read: its DC, and the AC that follow it
+    /// up to an end of block or the 63rd coefficient, at most 63 of them.
+    symbols: [Sym; 64],
+}
 
-    let hmax = parsed.components.iter().map(|c| c.h).max()?;
-    let vmax = parsed.components.iter().map(|c| c.v).max()?;
-    let mcus_x = parsed.width.div_ceil(8 * hmax);
-    let mcus_y = parsed.height.div_ceil(8 * vmax);
-
-    let mut reader = BitReader::new(parsed.entropy);
-    let mut symbols = Vec::new();
-
-    for _ in 0..mcus_y * mcus_x {
-        for component in &parsed.components {
-            let dc_slot = component.dc as usize;
-            let ac_slot = 4 + component.ac as usize;
-            let dc = decoders.get(dc_slot)?.as_ref()?;
-            let ac = decoders.get(ac_slot)?.as_ref()?;
-
-            for _ in 0..component.h * component.v {
-                // DC: one symbol giving the magnitude category.
-                let category = dc.decode(&mut reader)?;
-                if category > 15 {
-                    return None;
-                }
-                symbols.push(Sym {
-                    slot: component.dc,
-                    symbol: category,
-                    extra: reader.bits(category)?,
-                    extra_len: category,
-                });
-
-                // AC: run-length/size pairs until end-of-block or 63 coefficients.
-                let mut k = 1;
-                while k <= 63 {
-                    let rs = ac.decode(&mut reader)?;
-                    let (run, size) = (rs >> 4, rs & 15);
-                    symbols.push(Sym {
-                        slot: 4 + component.ac,
-                        symbol: rs,
-                        extra: reader.bits(size)?,
-                        extra_len: size,
-                    });
-
-                    if size == 0 {
-                        // 0xF0 is a run of sixteen zeroes; 0x00 ends the block.
-                        if run == 15 {
-                            k += 16;
-                            continue;
-                        }
-                        break;
-                    }
-                    k += run as u32 + 1;
-                }
-            }
-        }
+impl<'a> Blocks<'a> {
+    fn new(parsed: &'a Parsed<'a>, unpadded: bool) -> Option<Self> {
+        let hmax = parsed.components.iter().map(|c| c.h).max()?;
+        let vmax = parsed.components.iter().map(|c| c.v).max()?;
+        let mcus_x = parsed.width.div_ceil(8 * hmax);
+        let mcus_y = parsed.height.div_ceil(8 * vmax);
+        let extents = parsed
+            .components
+            .iter()
+            .map(|c| {
+                let width = (parsed.width * c.h).div_ceil(hmax);
+                let height = (parsed.height * c.v).div_ceil(vmax);
+                (width.div_ceil(8), height.div_ceil(8))
+            })
+            .collect();
+        Some(Self {
+            parsed,
+            decoders: parsed
+                .tables
+                .iter()
+                .map(|t| t.as_ref().map(Decoder::new))
+                .collect(),
+            reader: BitReader::new(parsed.entropy),
+            unpadded,
+            mcus_x,
+            mcus: mcus_x * mcus_y,
+            extents,
+            written: vec![0; parsed.components.len()],
+            rewritten: vec![0; parsed.components.len()],
+            mcu: 0,
+            component: 0,
+            block: 0,
+            symbols: [Sym {
+                slot: 0,
+                symbol: 0,
+                extra: 0,
+                extra_len: 0,
+            }; 64],
+        })
     }
 
-    Some(symbols)
+    /// The symbols of the next block, or `Some(None)` past the last. `None`
+    /// where the scan does not read: a code no table has, or data that ends
+    /// too soon.
+    fn next(&mut self) -> Option<Option<&[Sym]>> {
+        if self.mcu >= self.mcus {
+            return Some(None);
+        }
+        let index = self.component;
+        let component = *self.parsed.components.get(index)?;
+        let dc_table = self.decoders.get(usize::from(component.dc))?.as_ref()?;
+        let ac_slot = 4 + component.ac;
+        let ac_table = self.decoders.get(usize::from(ac_slot))?.as_ref()?;
+
+        // DC: one symbol giving the magnitude category.
+        let category = dc_table.decode(&mut self.reader)?;
+        if category > 15 {
+            return None;
+        }
+        let dc = Sym {
+            slot: component.dc,
+            symbol: category,
+            extra: self.reader.bits(category)?,
+            extra_len: category,
+        };
+        self.symbols[0] = dc;
+        let mut len = 1;
+
+        // AC: run-length/size pairs until end-of-block or 63 coefficients.
+        let mut k = 1;
+        while k <= 63 {
+            let rs = ac_table.decode(&mut self.reader)?;
+            let (run, size) = (rs >> 4, rs & 15);
+            *self.symbols.get_mut(len)? = Sym {
+                slot: ac_slot,
+                symbol: rs,
+                extra: self.reader.bits(size)?,
+                extra_len: size,
+            };
+            len += 1;
+
+            if size == 0 {
+                // 0xF0 is a run of sixteen zeroes; 0x00 ends the block.
+                if run == 15 {
+                    k += 16;
+                    continue;
+                }
+                break;
+            }
+            k += u32::from(run) + 1;
+        }
+
+        if self.unpadded {
+            let (mcu_x, mcu_y) = (self.mcu % self.mcus_x, self.mcu / self.mcus_x);
+            let x = mcu_x * component.h + self.block % component.h;
+            let y = mcu_y * component.v + self.block / component.h;
+            let past_edge = x >= self.extents[index].0 || y >= self.extents[index].1;
+
+            self.written[index] += extend(dc.extra, dc.extra_len);
+            if past_edge {
+                let nothing = Sym {
+                    symbol: 0,
+                    extra: 0,
+                    extra_len: 0,
+                    ..dc
+                };
+                self.symbols[0] = nothing;
+                self.symbols[1] = Sym {
+                    slot: ac_slot,
+                    ..nothing
+                };
+                len = 2;
+            } else {
+                let (category, extra) = magnitude(self.written[index] - self.rewritten[index]);
+                self.rewritten[index] = self.written[index];
+                self.symbols[0] = Sym {
+                    symbol: category,
+                    extra,
+                    extra_len: category,
+                    ..dc
+                };
+            }
+        }
+
+        self.block += 1;
+        if self.block == component.h * component.v {
+            self.block = 0;
+            self.component += 1;
+            if self.component == self.parsed.components.len() {
+                self.component = 0;
+                self.mcu += 1;
+            }
+        }
+        Some(Some(&self.symbols[..len]))
+    }
+}
+
+/// The value `extra_len` magnitude bits stand for (F.2.2.1, EXTEND).
+fn extend(extra: u16, extra_len: u8) -> i32 {
+    if extra_len == 0 {
+        0
+    } else if i32::from(extra) < 1 << (extra_len - 1) {
+        i32::from(extra) - (1 << extra_len) + 1
+    } else {
+        i32::from(extra)
+    }
+}
+
+/// A difference's magnitude category and the bits that follow it (F.1.2.1).
+fn magnitude(value: i32) -> (u8, u16) {
+    let category = (32 - value.unsigned_abs().leading_zeros()) as u8;
+    let extra = if value < 0 {
+        value + (1 << category) - 1
+    } else {
+        value
+    };
+    (category, extra as u16)
 }
 
 // ------------------------------------------------------------ table building
@@ -571,12 +783,7 @@ fn optimal_table(counts: &[u32; 256]) -> Option<Table> {
     })
 }
 
-fn build_tables(parsed: &Parsed, symbols: &[Sym]) -> Option<Vec<Option<Table>>> {
-    let mut counts = vec![[0u32; 256]; 8];
-    for sym in symbols {
-        counts[sym.slot as usize][sym.symbol as usize] += 1;
-    }
-
+fn build_tables(parsed: &Parsed, counts: &[[u32; 256]; 8]) -> Option<Vec<Option<Table>>> {
     let mut tables = vec![None; 8];
     for (slot, counts) in counts.iter().enumerate() {
         if counts.iter().all(|&c| c == 0) {
@@ -648,31 +855,13 @@ impl BitWriter {
     }
 }
 
-fn encode_symbols(symbols: &[Sym], tables: &[Option<Table>]) -> Vec<u8> {
-    let codes: Vec<Option<[(u8, u16); 256]>> =
-        tables.iter().map(|t| t.as_ref().map(codes_for)).collect();
-
-    let mut writer = BitWriter {
-        out: Vec::new(),
-        acc: 0,
-        held: 0,
-    };
-
-    for sym in symbols {
-        let (length, code) = codes[sym.slot as usize].as_ref().expect("table present")
-            [sym.symbol as usize];
-        debug_assert!(length > 0, "symbol {} has no code", sym.symbol);
-        writer.put(code, length);
-        if sym.extra_len > 0 {
-            writer.put(sym.extra, sym.extra_len);
-        }
-    }
-
-    writer.finish()
-}
-
-fn assemble(parsed: &Parsed, tables: &[Option<Table>], entropy: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(entropy.len() + 1024);
+/// The file `parsed` again with `tables` in place of its own, and its scan,
+/// its padding coded afresh, coded against them; `Some(None)` if that comes
+/// to `limit` bytes or more, a rewrite no smaller than the original being of
+/// no use. It is written into the one buffer, `limit` bytes long, and given
+/// up on once it fills it. `None` where the scan does not read.
+fn rewrite(parsed: &Parsed, tables: &[Option<Table>], limit: usize) -> Option<Option<Vec<u8>>> {
+    let mut out = Vec::with_capacity(limit);
     out.extend_from_slice(&[0xFF, 0xD8]);
     for segment in &parsed.head {
         out.extend_from_slice(segment);
@@ -688,11 +877,33 @@ fn assemble(parsed: &Parsed, tables: &[Option<Table>], entropy: &[u8]) -> Vec<u8
         out.extend_from_slice(&table.bits);
         out.extend_from_slice(&table.values);
     }
-
     out.extend_from_slice(parsed.sos);
-    out.extend_from_slice(entropy);
+
+    let codes: Vec<Option<[(u8, u16); 256]>> =
+        tables.iter().map(|t| t.as_ref().map(codes_for)).collect();
+    let mut writer = BitWriter {
+        out,
+        acc: 0,
+        held: 0,
+    };
+    let mut blocks = Blocks::new(parsed, true)?;
+    while let Some(block) = blocks.next()? {
+        if writer.out.len() >= limit {
+            return Some(None);
+        }
+        for sym in block {
+            let (length, code) = codes[usize::from(sym.slot)].as_ref()?[usize::from(sym.symbol)];
+            debug_assert!(length > 0, "symbol {} has no code", sym.symbol);
+            writer.put(code, length);
+            if sym.extra_len > 0 {
+                writer.put(sym.extra, sym.extra_len);
+            }
+        }
+    }
+
+    let mut out = writer.finish();
     out.extend_from_slice(&[0xFF, 0xD9]);
-    out
+    Some((out.len() < limit).then_some(out))
 }
 
 #[cfg(test)]
@@ -770,7 +981,97 @@ mod tests {
     #[test]
     fn a_marker_ends_the_entropy_data() {
         let mut reader = BitReader::new(&[0xFF, 0xD9]);
-        assert_eq!(reader.bit(), None);
+        assert_eq!(reader.bits(1), None);
+        let mut reader = BitReader::new(&[0xA5, 0xFF, 0x00, 0x3C, 0xFF, 0xD9, 0x12]);
+        assert_eq!(reader.bits(4), Some(0xA));
+        assert_eq!(reader.bits(12), Some(0x5FF));
+        assert_eq!(reader.bits(4), Some(0x3));
+        assert_eq!(
+            reader.bits(5),
+            None,
+            "only four bits are left before the marker"
+        );
+        assert_eq!(reader.bits(4), Some(0xC));
+    }
+
+    /// A code is read from the bits ahead, as far as they go: one that ends
+    /// before the data does is read, and one that would run past it is not.
+    #[test]
+    fn a_code_is_read_only_as_far_as_the_data_goes() {
+        let mut bits = [0u8; 16];
+        // One code of one bit, `0`, then one of three, `100`.
+        bits[0] = 1;
+        bits[2] = 1;
+        let decoder = Decoder::new(&Table {
+            bits,
+            values: vec![7, 9],
+        });
+        let mut reader = BitReader::new(&[0b0100_0100, 0xFF, 0xD9]);
+        assert_eq!(decoder.decode(&mut reader), Some(7));
+        assert_eq!(decoder.decode(&mut reader), Some(9));
+        assert_eq!(decoder.decode(&mut reader), Some(7));
+        assert_eq!(decoder.decode(&mut reader), Some(9));
+        assert_eq!(decoder.decode(&mut reader), None, "the data has ended");
+        let mut reader = BitReader::new(&[0b1000_0000, 0x00]);
+        assert_eq!(decoder.decode(&mut reader), Some(9));
+        assert_eq!(decoder.decode(&mut reader), Some(7));
+        assert_eq!(decoder.decode(&mut reader), Some(7));
+    }
+
+    /// An interleaved scan codes whole MCUs, so where an image's luma does
+    /// not fill out the last MCU, it codes blocks past the image's edge that
+    /// no decoder shows. libjpeg codes each as its DC unchanged and no AC;
+    /// `jpeg-encoder` repeats the image's last row or column into them, at a
+    /// cost of a quarter of the size of a strip eight pixels high.
+    #[test]
+    fn blocks_past_the_edge_are_coded_as_nothing() {
+        // 4-level noise, so a block repeating the edge has AC to code.
+        let (width, height) = (40u16, 24u16);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rgb = Vec::new();
+        for _ in 0..width as usize * height as usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let v = [0u8, 85, 170, 255][(seed >> 33) as usize % 4];
+            rgb.extend_from_slice(&[v, v, v]);
+        }
+        let mut plain = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut plain, 70);
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+        encoder
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+
+        let rewritten = optimize_huffman(&plain).expect("rewritten");
+        let parsed = parse(&rewritten).unwrap();
+        let mut blocks = Blocks::new(&parsed, false).unwrap();
+
+        // Walk the blocks as they are coded, and look at the luma ones past
+        // the image's edge: 40 x 24 is coded as 48 x 32.
+        let mut padding = 0;
+        for mcu in 0..(3 * 2) {
+            let (mcu_x, mcu_y) = (mcu % 3, mcu / 3);
+            for (index, component) in parsed.components.iter().enumerate() {
+                for block in 0..component.h * component.v {
+                    let x = mcu_x * component.h + block % component.h;
+                    let y = mcu_y * component.v + block / component.h;
+                    let coded = blocks.next().unwrap().unwrap();
+
+                    if index == 0 && (x >= 5 || y >= 3) {
+                        padding += 1;
+                        let symbols: Vec<u8> = coded.iter().map(|sym| sym.symbol).collect();
+                        assert_eq!(
+                            symbols,
+                            [0, 0],
+                            "block ({x}, {y}) is past the edge: a DC difference of 0 and an end of block"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(padding, 6 * 4 - 5 * 3, "luma blocks past the edge");
+        assert!(blocks.next().unwrap().is_none(), "every block was walked");
     }
 
     #[test]

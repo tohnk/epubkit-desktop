@@ -1089,7 +1089,10 @@ dependencies = [
  "anyhow",
  "clap",
  "epubkit-core",
+ "image",
+ "jpeg-encoder",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

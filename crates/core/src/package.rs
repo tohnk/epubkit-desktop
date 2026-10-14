@@ -16,6 +16,8 @@ use crate::{Error, Result};
 pub const MIMETYPE: &str = "application/epub+zip";
 
 const MIMETYPE_ENTRY: &str = "mimetype";
+/// More than a `mimetype` entry ever needs to say what it is.
+const MAX_MIMETYPE_BYTES: u64 = 1024;
 const CONTAINER_ENTRY: &str = "META-INF/container.xml";
 const ENCRYPTION_ENTRY: &str = "META-INF/encryption.xml";
 
@@ -90,9 +92,14 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
 
     // 1. mimetype.
     let mimetype_path = source_dir.join(MIMETYPE_ENTRY);
-    let mimetype = fs::read_to_string(&mimetype_path)
-        .map(|text| text.trim().to_string())
-        .unwrap_or_else(|_| MIMETYPE.to_string());
+    // No more of it than a media type takes.
+    let mut mimetype = String::new();
+    let read = File::open(&mimetype_path)
+        .and_then(|file| file.take(MAX_MIMETYPE_BYTES).read_to_string(&mut mimetype));
+    let mimetype = match read {
+        Ok(_) => mimetype.trim().to_string(),
+        Err(_) => MIMETYPE.to_string(),
+    };
     zip.start_file(MIMETYPE_ENTRY, stored)?;
     zip.write_all(mimetype.as_bytes())
         .map_err(|e| Error::io(output_path, e))?;
@@ -214,7 +221,7 @@ pub fn validate_epub(epub_path: &Path) -> Result<Validation> {
     }
 
     match archive.by_name(MIMETYPE_ENTRY) {
-        Ok(mut entry) => {
+        Ok(entry) => {
             if entry.compression() != CompressionMethod::Stored {
                 validation
                     .problems
@@ -222,6 +229,7 @@ pub fn validate_epub(epub_path: &Path) -> Result<Validation> {
             }
             let mut content = String::new();
             entry
+                .take(MAX_MIMETYPE_BYTES)
                 .read_to_string(&mut content)
                 .map_err(|e| Error::io(epub_path, e))?;
             if content.trim() != MIMETYPE {
@@ -254,8 +262,12 @@ pub fn validate_epub(epub_path: &Path) -> Result<Validation> {
 /// could be hiding anything, so it is taken for DRM rather than handing the
 /// pipeline a book it cannot read.
 pub fn has_drm(epub_path: &Path) -> Result<bool> {
-    let Some(bytes) = read_optional_entry(epub_path, ENCRYPTION_ENTRY)? else {
-        return Ok(false);
+    let bytes = match read_optional_entry(epub_path, ENCRYPTION_ENTRY) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(false),
+        // Too large to read is as good as unreadable.
+        Err(Error::DocumentTooLarge { .. }) => return Ok(true),
+        Err(error) => return Err(error),
     };
 
     // An empty file declares nothing encrypted.
@@ -278,7 +290,8 @@ pub fn has_drm(epub_path: &Path) -> Result<bool> {
 pub fn find_opf_path(epub_dir: &Path) -> Result<String> {
     let container_path = epub_dir.join("META-INF").join("container.xml");
 
-    if container_path.is_file() {
+    // One too large to read is no use either.
+    if container_path.is_file() && !crate::too_large_to_read(&container_path) {
         let bytes = fs::read(&container_path).map_err(|e| Error::io(&container_path, e))?;
         // A path out of the book is no use, and the pipeline would rewrite
         // whatever it named. Neither is one to nothing in it. The search
@@ -359,16 +372,26 @@ fn is_font_uri(uri: &str) -> bool {
         .is_some_and(|ext| FONT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+/// An entry's bytes, `None` if there is no such entry. One larger than a
+/// document may be is not read: the size it declares can lie, so no more
+/// than that is ever read.
 fn read_optional_entry(epub_path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
     let file = File::open(epub_path).map_err(|e| Error::io(epub_path, e))?;
     let mut archive = ZipArchive::new(file)?;
 
     let result = match archive.by_name(name) {
-        Ok(mut entry) => {
+        Ok(entry) => {
             let mut bytes = Vec::new();
             entry
+                .take(crate::MAX_DOCUMENT_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|e| Error::io(epub_path, e))?;
+            if bytes.len() as u64 > crate::MAX_DOCUMENT_BYTES {
+                return Err(Error::DocumentTooLarge {
+                    path: PathBuf::from(name),
+                    size: bytes.len() as u64,
+                });
+            }
             Ok(Some(bytes))
         }
         Err(zip::result::ZipError::FileNotFound) => Ok(None),

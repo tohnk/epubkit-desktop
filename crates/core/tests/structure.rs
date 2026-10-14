@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use epubkit_core::structure::{
     add_image_to_opf, build_rename_map, declare_reshaped_pages, find_content_files, fix_svg_covers,
-    fix_toc, manifest_items, resolve_href, show_reshaped_pages, spine_hrefs, update_css_references,
-    update_opf, update_opf_remove_fonts, update_xhtml_references, Renames, ReshapedPages,
-    TocOutcome,
+    fix_toc, manifest_items, reachable_stylesheets, resolve_href, show_reshaped_pages, spine_hrefs,
+    update_css_references, update_opf, update_opf_remove_fonts, update_xhtml_references, Renames,
+    ReshapedPages, TocOutcome,
 };
 use epubkit_core::xml;
 
@@ -776,6 +776,14 @@ fn svg_wrapped_covers_become_plain_images() {
         !out.contains("<svg"),
         "the svg wrapper should be gone:\n{out}"
     );
+    // The `<img>` pins `box-sizing: content-box`, so a chapter's
+    // `box-sizing: border-box` cannot combine with padding or a border to
+    // collapse its content box to nothing; and no padding and no border, so
+    // a chapter's cannot make it larger than the SVG was, for a box that hides
+    // what overflows it to cut off.
+    assert!(out.contains("box-sizing:content-box"), "{out}");
+    assert!(out.contains("padding:0"), "{out}");
+    assert!(out.contains("border:0"), "{out}");
 }
 
 /// An SVG holding several images is an illustration, not a cover wrapper.
@@ -1584,4 +1592,551 @@ fn hrefs_resolve_inside_the_book_or_not_at_all() {
     assert_eq!(inside("../../etc/passwd"), None);
     assert_eq!(inside("Text/../../../x"), None);
     assert_eq!(inside("/../x"), None);
+}
+
+/// An SVG with nothing in it but its image can still show only part of it:
+/// a viewBox over the right half of a spread, or an image slid out of the
+/// box, or sliced to fill it. An `<img>` in its place showed the whole
+/// picture. Only an SVG whose box is its image's own is unwrapped.
+#[test]
+fn an_svg_that_shows_part_of_its_image_is_not_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" {svg}><image {image} xlink:href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cases = [
+        // The right half only.
+        (
+            r#"width="500" height="400" viewBox="500 0 500 400""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // A box smaller than the image, which shows its left part.
+        (
+            r#"viewBox="0 0 500 400""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // The image slid down inside its box.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"y="100" width="1000" height="400""#,
+            false,
+        ),
+        // Sliced to fill a box of another shape.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="1000" height="400" preserveAspectRatio="xMidYMid slice""#,
+            false,
+        ),
+        (
+            r#"viewBox="0 0 1000 400" preserveAspectRatio="xMinYMin slice""#,
+            r#"width="1000" height="400""#,
+            false,
+        ),
+        // Faded or clipped by a style.
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="1000" height="400" style="clip-path: inset(0 50% 0 0)""#,
+            false,
+        ),
+        // The whole image, as cover wrappers have it.
+        (
+            r#"width="100%" height="100%" viewBox="0 0 1000 400" preserveAspectRatio="xMidYMid meet""#,
+            r#"width="1000" height="400""#,
+            true,
+        ),
+        (
+            r#"viewBox="0,0,1000,400""#,
+            r#"x="0" y="0" width="1000px" height="400px""#,
+            true,
+        ),
+        (
+            r#"viewBox="0 0 1000 400""#,
+            r#"width="100%" height="100%""#,
+            true,
+        ),
+    ];
+
+    for (svg, image, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>: {after}"
+        );
+        assert_eq!(
+            after.contains("<svg"),
+            !unwrapped,
+            "<svg {svg}><image {image}/>"
+        );
+    }
+}
+
+/// An SVG that shows the whole of its image can still draw it otherwise than
+/// an `<img>` would: clipped, masked, filtered, faded, blended or hidden, by an
+/// attribute of its own or of its image, or by the chapter's stylesheets,
+/// which can slide, turn or size the image too. An `<img>` in its place
+/// showed the whole picture, as it is. Such an SVG stays as it is, and so
+/// does one whose `<img>` the stylesheets would draw otherwise than it, as
+/// a rule for images may; one the stylesheets only lay out, or draw as it is
+/// after all, is unwrapped.
+#[test]
+fn an_svg_that_draws_its_image_otherwise_is_not_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><defs><clipPath id="crop"><rect width="500" height="400"/></clipPath></defs></svg>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="cover" viewBox="0 0 1000 400" {svg}><image width="1000" height="400" {image} xlink:href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let cases = [
+        // Its own attributes, or its image's.
+        (r#"clip-path="url(#crop)""#, "", "", false),
+        (r#"opacity="0.25""#, "", "", false),
+        (r#"mask="url(#fade)""#, "", "", false),
+        (r#"filter="url(#blur)""#, "", "", false),
+        (r#"visibility="hidden""#, "", "", false),
+        (r#"style="opacity: 0.5""#, "", "", false),
+        ("", r#"opacity="0.5""#, "", false),
+        ("", r#"transform="translate(-500)""#, "", false),
+        // The chapter's stylesheets.
+        ("", "", ".cover { clip-path: url(#crop) }", false),
+        ("", "", "svg { -webkit-mask-image: url(fade.png) }", false),
+        ("", "", "svg { border-radius: 50% }", false),
+        ("", "", "body > svg { filter: grayscale(1) }", false),
+        ("", "", "svg { mix-blend-mode: multiply }", false),
+        ("", "", "svg.cover { display: none }", false),
+        (
+            "",
+            "",
+            "@media (min-width: 600px) { svg { opacity: .5 } }",
+            false,
+        ),
+        ("", "", "image { transform: translateX(-500px) }", false),
+        ("", "", "svg image { translate: -500px 0 }", false),
+        ("", "", "image { x: -500px }", false),
+        ("", "", "image { width: 500px }", false),
+        // The image in its place, which rules for images would hide, fade or
+        // clip.
+        ("", "", "img { visibility: hidden }", false),
+        ("", "", "img { opacity: .2 }", false),
+        ("", "", "body > img { clip-path: inset(10%) }", false),
+        // Laid out, or drawn as it is after all.
+        ("", "", "img { margin: 1em }", true),
+        (
+            "",
+            "",
+            "svg { display: block; margin: 0 auto; width: 100%; height: 100% }",
+            true,
+        ),
+        (r#"opacity="1" display="inline""#, "", "", true),
+        ("", "", "svg { opacity: .5 } svg { opacity: 1 }", true),
+        (r#"opacity="0.25""#, "", "svg { opacity: 1 }", true),
+        ("", "", "svg { border-radius: 0 }", true),
+        ("", "", "p svg { clip-path: url(#crop) }", true),
+        ("", "", "@media print { svg { opacity: .5 } }", true),
+    ];
+
+    for (svg, image, css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>, {css}: {after}"
+        );
+        assert_eq!(
+            after.contains(r#"class="cover""#),
+            !unwrapped,
+            "<svg {svg}><image {image}/>, {css}"
+        );
+    }
+}
+
+/// The `<img>` that takes a wrapper's place takes after what it is in as the
+/// SVG did not: hidden as the box around it is, where the SVG was shown,
+/// `visible` by a rule of its own. And a rule for images may style it beyond
+/// any list of what draws an image otherwise: sized to nothing, zoomed,
+/// floated, its content replaced. A wrapper stays as it is where a rule that
+/// may style its `<img>` sets anything but colours, fonts, borders without
+/// rounded corners, backgrounds, padding, how text is aligned, where pages
+/// break, margins that are not negative, and sizes left to the image. What
+/// the `<img>`'s own style sets, its size and margins and that it is a
+/// block, a rule cannot, unless it is important.
+#[test]
+fn an_svg_whose_img_a_rule_would_style_beyond_harmless_styling_is_not_unwrapped() {
+    let cases = [
+        (
+            "div { visibility: hidden } svg { visibility: visible }",
+            false,
+        ),
+        ("div { visibility: hidden }", false),
+        // Visibility inherits, so a reset keyword on the img, inside a hidden
+        // box but beside an SVG kept visible, takes the box's hidden, not the
+        // initial visible: the cover would vanish, so the wrapper stays.
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: unset }",
+            false,
+        ),
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: revert }",
+            false,
+        ),
+        (
+            "div { visibility: hidden } svg { visibility: visible } img { visibility: revert-layer }",
+            false,
+        ),
+        // With nothing hiding the box around it, a reset is the visible
+        // default, and the cover is unwrapped.
+        ("svg { visibility: visible } img { visibility: unset }", true),
+        ("img { width: 0 }", false),
+        ("div > * { height: 1px }", false),
+        ("img { zoom: 0.1 }", false),
+        ("img { float: left }", false),
+        ("img { content: url(other.png) }", false),
+        ("img { border-radius: 50% }", false),
+        ("img { margin-top: -100% !important }", false),
+        ("img { display: none !important }", false),
+        ("img { max-width: 50% !important }", false),
+        ("img { width: var(--w) }", false),
+        ("* { box-sizing: border-box; margin: 0; padding: 0 }", true),
+        // Important `box-sizing: border-box` beats the `<img>`'s pinned
+        // `content-box`, and with padding or a border can leave no content
+        // box, so the wrapper stays.
+        ("img { box-sizing: border-box !important }", false),
+        // Important padding, a border or margins beat the `<img>`'s pinned
+        // ones, and make it larger than the SVG was, for a box that hides what
+        // overflows it to cut off: the wrapper stays. None of them, important
+        // or not, is harmless.
+        (
+            "div { overflow: hidden; height: 300px } img { padding: 1em !important }",
+            false,
+        ),
+        ("img { border: 4px solid black !important }", false),
+        ("img { margin: 1em !important }", false),
+        (
+            "img { padding: 0 !important; margin: 0 !important; border: none !important }",
+            true,
+        ),
+        // Not important, they are the pinned style's to override.
+        (
+            "div { overflow: hidden; height: 300px } img { padding: 1em; border: 2px solid; margin: 1em }",
+            true,
+        ),
+        (
+            "img { max-width: 100%; height: auto; border: none; color: red; font-size: 2em; \
+             text-align: center; page-break-inside: avoid; background: white; padding: 1em }",
+            true,
+        ),
+        (
+            "img { width: auto; min-height: 0; max-width: none !important }",
+            true,
+        ),
+        // What its own style sets.
+        (
+            "img { display: inline; max-height: 50%; margin: -1em }",
+            true,
+        ),
+        (
+            "div { visibility: hidden } div > * { visibility: visible }",
+            true,
+        ),
+    ];
+
+    for (css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(
+            dir.path(),
+            "page.xhtml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="cover" viewBox="0 0 600 800"><image width="600" height="800" xlink:href="images/cover.png"/></svg></div>
+</body>
+</html>
+"#,
+        );
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(fixed == 1, unwrapped, "{css}: {after}");
+        assert_eq!(after.contains(r#"class="cover""#), !unwrapped, "{css}");
+    }
+}
+
+/// An SVG with no viewBox draws its image at the size it gives it, unscaled,
+/// in a box of the SVG's own width and height. An image of that very size at
+/// its origin is all it shows, and the SVG is unwrapped, as one with a viewBox
+/// is. One whose box is smaller than its image, or of a size that is not a
+/// number, or that CSS may size otherwise, may crop it, and stays.
+#[test]
+fn an_svg_with_no_view_box_that_its_image_fills_is_unwrapped() {
+    let wrapper = |svg: &str, image: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" {svg}><image {image} href="images/spread.png"/></svg>
+</body>
+</html>
+"#
+        )
+    };
+    let whole = r#"width="1000" height="400""#;
+    let cases = [
+        (whole, whole, "", true),
+        (r#"width="1000px" height="400px""#, whole, "", true),
+        (whole, r#"width="100%" height="100%""#, "", true),
+        (whole, whole, "svg { display: block; margin: 0 auto }", true),
+        (whole, whole, "svg { height: auto; max-width: none }", true),
+        // A box that crops it, or that may.
+        (r#"width="500" height="400""#, whole, "", false),
+        (whole, r#"width="500" height="400""#, "", false),
+        (r#"width="100%" height="100%""#, whole, "", false),
+        ("", whole, "", false),
+        (whole, whole, "svg { max-width: 100% }", false),
+        (whole, whole, "svg { width: 500px }", false),
+        (
+            r#"width="1000" height="400" style="height: 200px""#,
+            whole,
+            "",
+            false,
+        ),
+    ];
+
+    for (svg, image, css, unwrapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "style.css", css);
+        let page = put(dir.path(), "page.xhtml", wrapper(svg, image));
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+        let fixed = fix_svg_covers(dir.path(), dir.path(), &doc).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            fixed == 1,
+            unwrapped,
+            "<svg {svg}><image {image}/>, {css}: {after}"
+        );
+        assert_eq!(
+            after.contains("<svg"),
+            !unwrapped,
+            "<svg {svg}><image {image}/>, {css}"
+        );
+    }
+}
+
+/// A stylesheet a document reaches is found by its name as written: a `%23`
+/// in a link's href is a `#` in the file's name, not the start of a fragment,
+/// and a `%2520` is a literal `%20`. Each is decoded once, as a reader decodes
+/// it, whether a `<link>` names it or an `<?xml-stylesheet?>` instruction.
+#[test]
+fn stylesheets_a_document_reaches_are_found_by_their_encoded_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let hash = put(root, "styles/#sheet.css", "p { color: red }");
+    let literal = put(root, "styles/literal%20.css", "p { color: red }");
+    let instruction = put(root, "styles/pi#.css", "p { color: red }");
+    let chapter = put(
+        root,
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="../styles/pi%23.css" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>
+<link rel="stylesheet" type="text/css" href="../styles/%23sheet.css"/>
+<link rel="stylesheet" type="text/css" href="../styles/literal%2520.css"/>
+</head><body><p>Text.</p></body></html>
+"#,
+    );
+
+    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    for sheet in [&hash, &literal, &instruction] {
+        assert!(
+            reachable.readable.contains(sheet),
+            "{} not found among {:?}",
+            sheet.display(),
+            reachable.readable
+        );
+    }
+    assert!(!reachable.too_large);
+}
+
+/// A document's own `<style>` element can import a stylesheet, which is
+/// reached as one a `<link>` names is, in either way an import is written.
+#[test]
+fn a_stylesheet_a_style_element_imports_is_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let quoted = put(root, "styles/quoted.css", "p { color: red }");
+    let url = put(root, "styles/url.css", "p { color: red }");
+    let chapter = put(
+        root,
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title>
+<style type="text/css">@import "../styles/quoted.css";</style>
+<style type="text/css">@import url(../styles/url.css); p { margin: 0 }</style>
+</head><body><p>Text.</p></body></html>
+"#,
+    );
+
+    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    for sheet in [&quoted, &url] {
+        assert!(
+            reachable.readable.contains(sheet),
+            "{} not found among {:?}",
+            sheet.display(),
+            reachable.readable
+        );
+    }
+}
+
+/// An `<?xml-stylesheet?>` href may hold character references, decimal or
+/// hex, which a reader decodes before it loads the stylesheet: `s&#104;eet.css`
+/// is `sheet.css`, however many zeros lead its digits. And a reference is
+/// decoded once: `&#38;lt;` is `&lt;`.
+#[test]
+fn a_stylesheet_instruction_href_with_character_references_is_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let decimal = put(root, "styles/sheet.css", "p { color: red }");
+    let hex = put(root, "styles/hexed.css", "p { color: red }");
+    let once = put(root, "styles/a&lt;b.css", "p { color: red }");
+    let zeros = put(root, "styles/zeros.css", "p { color: red }");
+    let chapter = put(
+        root,
+        "text/chapter.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="../styles/s&#104;eet.css" type="text/css"?>
+<?xml-stylesheet href="../styles/&#x68;exed.css" type="text/css"?>
+<?xml-stylesheet href="../styles/a&#38;lt;b.css" type="text/css"?>
+<?xml-stylesheet href="../styles/zero&#00000000000000115;.css" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>
+<body><p>Text.</p></body></html>
+"#,
+    );
+
+    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    for sheet in [&decimal, &hex, &once, &zeros] {
+        assert!(
+            reachable.readable.contains(sheet),
+            "{} not found among {:?}",
+            sheet.display(),
+            reachable.readable
+        );
+    }
+}
+
+/// The cascade reads a stylesheet an instruction names through a character
+/// reference too: one that hides every image keeps an SVG cover wrapped,
+/// where unwrapped its `<img>` would vanish.
+#[test]
+fn a_stylesheet_an_instruction_names_by_reference_styles_the_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    put(dir.path(), "style.css", "img { display: none !important }");
+    let page = put(
+        dir.path(),
+        "page.xhtml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="st&#121;le.css" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>T</title></head>
+<body>
+<div><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="cover" viewBox="0 0 600 800"><image width="600" height="800" xlink:href="images/cover.png"/></svg></div>
+</body>
+</html>
+"#,
+    );
+    let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/><item id="css" href="style.css" media-type="text/css"/></manifest>
+  <spine><itemref idref="page"/></spine>
+</package>
+"#);
+
+    assert_eq!(fix_svg_covers(dir.path(), dir.path(), &doc).unwrap(), 0);
+    let after = fs::read_to_string(&page).unwrap();
+    assert!(after.contains(r#"class="cover""#), "{after}");
+}
+
+/// An instruction's pseudo-attributes are decoded in time that grows with
+/// them: each `&` that starts no reference is passed over without searching
+/// all that follows it for a `;`. A value of half a million ampersands took
+/// seconds, in time that grew as their square, before any image was touched.
+#[test]
+fn an_instruction_full_of_ampersands_is_read_in_linear_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let ampersands = "&".repeat(512_000);
+    let chapter = put(
+        &root,
+        "text/chapter.xhtml",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="{ampersands}" type="text/css"?>
+<?xml-stylesheet href="{ampersands};" type="text/css"?>
+<?xml-stylesheet href="{digits}" type="text/css"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>
+<body><p>Text.</p></body></html>
+"#,
+            digits = "&#1".repeat(200_000),
+        ),
+    );
+
+    let reachable = common::finishes_within(Duration::from_secs(5), move || {
+        reachable_stylesheets(&root, &root, &[chapter.as_path()]).unwrap()
+    });
+    assert!(reachable.readable.is_empty());
 }

@@ -64,6 +64,12 @@ fn cases() -> Vec<(&'static str, RgbImage)> {
         // pads and the block walk has to agree about how many there are.
         ("odd", textured(101, 67)),
         ("tiny", textured(9, 3)),
+        // Sizes that leave whole blocks of luma past the edge at 4:2:0, which
+        // the rewrite codes as nothing: a column, a row, both.
+        ("strip", dithered(480, 8)),
+        ("column", dithered(8, 800)),
+        ("corner", dithered(17, 33)),
+        ("x3 cover", dithered(528, 792)),
         ("white", solid(64, 64, 255)),
         ("black", solid(64, 64, 0)),
         ("dithered", dithered(240, 320)),

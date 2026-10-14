@@ -13,12 +13,16 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Condvar, Mutex, PoisonError};
+
+use crate::memory::MemoryBudget;
 
 use crate::html::{self, HtmlRepair};
 use crate::image::{self, DeviceProfile, ImageOptions};
 use crate::metadata::{self, FilenameFormat, FilenameOptions, MetadataEdits};
 use crate::text::{TextCleanOptions, TextCleanReport};
-use crate::{css, package, structure, xml, Error, Result};
+use crate::{css, package, structure, worker, xml, Error, Result};
 
 /// Everything the user can turn on or off for a run.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,7 +92,14 @@ pub struct ProcessingReport {
 
     /// Source images converted. A split spread counts once.
     pub images_converted: usize,
+    /// The images the image step tried: every one the book holds that its
+    /// manifest declares or a document shows, but for SVG.
     pub images_total: usize,
+    /// Images the image step could not convert, left as they were.
+    pub images_unconverted: usize,
+    /// Images the book shows that its manifest left out, declared once
+    /// converted.
+    pub images_declared: usize,
     /// Double-page spreads Light Novel mode split into pages.
     pub spreads_split: usize,
     /// e.g. `{"PNG→JPEG": 5}` — how the images were transformed.
@@ -105,6 +116,8 @@ pub struct ProcessingReport {
     pub documents_recovered: usize,
     /// Content documents nothing could parse, left exactly as they were.
     pub documents_unreadable: usize,
+    /// Documents too large to read whole, left exactly as they were.
+    pub documents_too_large: usize,
     pub text: TextCleanReport,
     pub os_artifacts_removed: usize,
 }
@@ -133,6 +146,22 @@ impl ProcessingReport {
                 self.images_total,
                 formats.join(", ")
             ));
+        }
+        if self.images_unconverted > 0 {
+            let n = self.images_unconverted;
+            let (plural, as_it_was) = if n == 1 {
+                ("", "it was")
+            } else {
+                ("s", "they were")
+            };
+            parts.push(format!(
+                "Left {n} image{plural} that could not be converted as {as_it_was}"
+            ));
+        }
+        if self.images_declared > 0 {
+            let n = self.images_declared;
+            let plural = if n == 1 { "" } else { "s" };
+            parts.push(format!("Declared {n} image{plural} the manifest left out"));
         }
         if self.spreads_split > 0 {
             let plural = if self.spreads_split == 1 { "" } else { "s" };
@@ -165,6 +194,17 @@ impl ProcessingReport {
             };
             parts.push(format!(
                 "Left {n} unreadable document{plural} as {as_it_was}"
+            ));
+        }
+        if self.documents_too_large > 0 {
+            let n = self.documents_too_large;
+            let (plural, as_it_was) = if n == 1 {
+                ("", "it was")
+            } else {
+                ("s", "they were")
+            };
+            parts.push(format!(
+                "Left {n} document{plural} too large to process as {as_it_was}"
             ));
         }
         if self.documents_recovered > 0 {
@@ -281,29 +321,24 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
     let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;
 
-    // --- images (15-60%) -------------------------------------------------
-    progress(15, "Processing images...");
-    let converted = convert_images(
-        &content.images,
-        work_dir,
-        &opf_dir,
-        options,
-        &mut report,
-        &mut progress,
-    )?;
-
     // --- content documents ------------------------------------------------
     // Repair runs before anything else reads a chapter. The reference did this
     // *after* rewriting references, which meant the rewriting step silently
     // repaired the file first and the repair count came out as zero. Going
-    // first also means every later step sees a well-formed tree.
+    // first also means every later step sees a well-formed tree, the image
+    // step's look at how images are shown included.
     //
     // A chapter nothing can parse, an empty file say, is left exactly as it
     // was rather than sinking the book; every later step works only on the
     // chapters that did parse.
-    progress(62, "Repairing HTML...");
+    progress(12, "Repairing HTML...");
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
+    // Whether the run leaves a document exactly as it is that it has not
+    // read, so that what it names and uses cannot be known: one too large to
+    // read whole, or one nothing can parse that is not blank.
+    let mut left_unread = !content.too_large.is_empty();
+    report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
         if !path.is_file() {
             continue;
@@ -312,6 +347,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         let Ok(repaired) = backend.repair(&bytes) else {
             report.documents_unreadable += 1;
+            left_unread |= !is_blank(&bytes);
             continue;
         };
         if repaired.recovered {
@@ -323,6 +359,66 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         fs::write(path, stripped).map_err(|e| Error::io(path, e))?;
         chapters.push(path);
+    }
+
+    // A stylesheet a chapter or SVG document reaches but the manifest leaves
+    // out is followed all the same: its references are rewritten with the
+    // rest, and one too large to read leaves every image as it is, as any
+    // document left unread does.
+    let reachable = {
+        let mut documents: Vec<&Path> = chapters.clone();
+        documents.extend(svg_documents(&content));
+        structure::reachable_stylesheets(work_dir, &opf_dir, &documents)?
+    };
+    left_unread |= reachable.too_large;
+
+    // --- images (15-60%) -------------------------------------------------
+    // Light Novel mode reshapes an image only where it is shown as a page of
+    // its own, so first it looks at how each is shown.
+    let keep_shape = if options.light_novel_mode {
+        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content)?
+    } else {
+        HashSet::new()
+    };
+    progress(15, "Processing images...");
+    // Every image the manifest declares, whatever its name or media type, but
+    // for SVG, which is drawn and stays as it is; then those the book shows
+    // that the manifest leaves out.
+    let undeclared = structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content)?;
+    let mut rasters: Vec<PathBuf> = content
+        .images
+        .iter()
+        .filter(|path| !content.svg.contains(path))
+        .chain(&undeclared)
+        .cloned()
+        .collect();
+    // Which images a document left as it is names cannot be known without
+    // reading it as a reader does, escapes and all, and an image it names
+    // must keep its name, so the reference there still leads to it. So where
+    // there is one, every image keeps its name, and stays as it is.
+    let mut kept: Vec<PathBuf> = if left_unread {
+        let rasters = std::mem::take(&mut rasters);
+        rasters.into_iter().filter(|path| path.is_file()).collect()
+    } else {
+        Vec::new()
+    };
+    let converted = convert_images(
+        &rasters,
+        work_dir,
+        &opf_dir,
+        options,
+        &keep_shape,
+        &mut report,
+        &mut progress,
+    )?;
+    report.images_total += kept.len();
+    report.images_unconverted += kept.len();
+    kept.sort();
+    for path in &kept {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        report.image_details.push(format!(
+            "{name}: kept as it is (a document left as it is may name it)"
+        ));
     }
 
     progress(66, "Fixing SVG covers...");
@@ -342,12 +438,40 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         for path in svg_documents(&content) {
             structure::update_svg_references(path, &renames).ok();
         }
-        for path in &content.css {
+        // Every stylesheet the manifest lists, and every one a document
+        // reaches that it leaves out, each rewritten once.
+        let mut stylesheets: Vec<&Path> = content.css.iter().map(PathBuf::as_path).collect();
+        stylesheets.extend(
+            reachable
+                .readable
+                .iter()
+                .filter(|path| !content.css.contains(path))
+                .map(PathBuf::as_path),
+        );
+        for path in stylesheets {
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
             }
         }
     }
+    // A renamed image's entry is declared a JPEG as it is pointed at its new
+    // file. One that kept its name is a JPEG now all the same.
+    structure::declare_jpegs(&opf, work_dir, &opf_dir, &converted.in_place)?;
+    // One the manifest left out is declared, as the JPEG it became.
+    let declared: Vec<String> = undeclared
+        .iter()
+        .filter_map(|path| {
+            let relative = structure::relative_path(work_dir, &opf_dir, path)?;
+            let name = converted.renames.get(&relative)?;
+            Some(
+                Path::new(&relative)
+                    .with_file_name(name)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        })
+        .collect();
+    report.images_declared = structure::declare_images(&opf, &declared)?;
 
     // A rotated image or a split spread no longer has the shape its pages
     // describe, and a split one has pages no page shows yet.
@@ -360,7 +484,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
     }
 
-    if options.remove_unused_css {
+    // What a document left unread uses cannot be known, so no rule is known
+    // to be unused.
+    if options.remove_unused_css && !left_unread {
         progress(76, "Removing unused CSS...");
         let mut used = css::UsedSelectors::default();
         for &path in &chapters {
@@ -486,6 +612,18 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
 // ---------------------------------------------------------------- internals
 
+/// Whether a document, as `bytes`, is blank: nothing but whitespace, in UTF-8
+/// or UTF-16, after a byte order mark if it has one. A blank one names no
+/// image.
+fn is_blank(bytes: &[u8]) -> bool {
+    let text = [&b"\xEF\xBB\xBF"[..], b"\xFF\xFE", b"\xFE\xFF"]
+        .iter()
+        .find_map(|mark| bytes.strip_prefix(*mark))
+        .unwrap_or(bytes);
+    text.iter()
+        .all(|&byte| byte.is_ascii_whitespace() || byte == 0)
+}
+
 /// The SVG documents in a book that are there to read.
 fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Path> {
     content
@@ -497,20 +635,33 @@ fn svg_documents(content: &structure::ContentFiles) -> impl Iterator<Item = &Pat
 
 /// What the image step leaves for the steps after it. Paths are relative to
 /// the OPF's directory.
+#[derive(Default)]
 struct ConvertedImages {
     /// Source path → the filename of its (first) output.
     renames: BTreeMap<String, String>,
     /// For each image Light Novel mode rotated or split: its pages in reading
     /// order, keyed by the first.
     reshaped: BTreeMap<String, Vec<String>>,
+    /// Sources replaced in place by an image of their own name, which no
+    /// rename points the manifest at.
+    in_place: Vec<String>,
 }
 
-/// Convert every image in the manifest.
+/// Convert `images`, whatever they are named: what each is, is read from its
+/// bytes. Those in `keep_shape`, by path, are converted as they are shaped,
+/// whatever Light Novel mode would make of them. One that cannot be is left
+/// as it is, and counted.
+///
+/// Images are converted on as many threads as the machine runs at once. What
+/// is then done with each, naming, writing, deleting its source, reporting,
+/// is done in manifest order, so that a book converts the same however its
+/// threads ran.
 fn convert_images<P: FnMut(u8, &str)>(
     images: &[PathBuf],
     root: &Path,
     opf_dir: &Path,
     options: &ProcessingOptions,
+    keep_shape: &HashSet<PathBuf>,
     report: &mut ProcessingReport,
     progress: &mut P,
 ) -> Result<ConvertedImages> {
@@ -518,45 +669,144 @@ fn convert_images<P: FnMut(u8, &str)>(
     const SPAN: f64 = 45.0;
 
     let image_options = options.image_options();
-    let mut renames = BTreeMap::new();
-    let mut reshaped = BTreeMap::new();
+    let as_shaped = ImageOptions {
+        light_novel_mode: false,
+        ..image_options.clone()
+    };
+
+    let jobs: Vec<ImageJob> = images
+        .iter()
+        .filter_map(|path| {
+            if !path.is_file() {
+                return None;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // What the rename map calls the image: its path from the OPF's
+            // directory, which may climb out of it. An image the map could
+            // not name would lose its references, so it is left as it is.
+            let relative = structure::relative_path(root, opf_dir, path)?;
+            let options = if keep_shape.contains(path) {
+                &as_shaped
+            } else {
+                &image_options
+            };
+            Some(ImageJob {
+                path,
+                name,
+                relative,
+                options,
+            })
+        })
+        .collect();
+    report.images_total = jobs.len();
+
+    let mut converted = ConvertedImages::default();
     let mut taken = TakenNames::default();
-    report.images_total = images.len();
 
-    for (index, path) in images.iter().enumerate() {
-        let percent = START + SPAN * (index as f64 / images.len().max(1) as f64);
-        progress(
-            percent as u8,
-            &format!("Processing image {}/{}...", index + 1, images.len()),
-        );
-
-        if !path.is_file() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !image::should_process(&name) {
-            continue;
-        }
-        // What the rename map calls the image: its path from the OPF's
-        // directory, which may climb out of it. An image the map could not
-        // name would lose its references, so it is left as it is.
-        let Some(relative) = structure::relative_path(root, opf_dir, path) else {
-            continue;
-        };
-
-        let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
-
-        // A single unreadable image must not sink the whole book.
-        let Ok(outputs) = image::process_image(&bytes, &name, &image_options) else {
+    in_order_in_parallel(
+        &jobs,
+        |job| -> Result<Converted> {
+            // Set aside before the file is read, so a thread waiting its turn
+            // holds nothing; and an image that would need more than all
+            // there is to set aside is left as it is. Reading its header to
+            // know holds a little too, which is set aside while it is read.
+            let needed = {
+                let _reading = IMAGE_MEMORY.hold(image::HEADER_MEMORY);
+                image::memory_needed(job.path, job.options)
+            };
+            // One that will not be decoded is not tried.
+            let Some(needed) = needed else {
+                return Ok(Converted::Undecodable);
+            };
+            if needed > IMAGE_MEMORY.total() {
+                return Ok(Converted::TooLarge(needed));
+            }
+            let _held = IMAGE_MEMORY.hold(needed);
+            // Decoded in a worker held to `needed` bytes, where workers are on,
+            // so an image crafted to make a decoder allocate wildly cannot. The
+            // worker reads the file itself, so the parent keeps no second copy.
+            // A single image that will not decode, or overruns the worker, must
+            // not sink the whole book; a file that cannot be read still does.
+            Ok(
+                match worker::convert(job.path, &job.name, job.options, needed)? {
+                    worker::Converted::Done(outputs) => Converted::Done(outputs),
+                    worker::Converted::Undecodable => Converted::Undecodable,
+                    worker::Converted::Overran => Converted::Overran(needed),
+                },
+            )
+        },
+        |finished| {
+            let percent = START + SPAN * (finished as f64 / jobs.len() as f64);
+            progress(
+                percent as u8,
+                &format!("Processing image {finished}/{}...", jobs.len()),
+            );
+        },
+        |job, outcome| {
+            let skipped = match outcome? {
+                Converted::Done(outputs) => {
+                    return converted.take(job, outputs, &mut taken, opf_dir, report)
+                }
+                Converted::Undecodable => "could not be decoded".to_string(),
+                Converted::TooLarge(needed) => format!(
+                    "converting it would take {} MB, more than the {} MB set aside",
+                    needed >> 20,
+                    IMAGE_MEMORY.total() >> 20
+                ),
+                Converted::Overran(needed) => format!(
+                    "could not be decoded within the {} MB set aside for it",
+                    needed >> 20
+                ),
+            };
+            report.images_unconverted += 1;
             report
                 .image_details
-                .push(format!("{name}: skipped (could not be decoded)"));
-            continue;
-        };
+                .push(format!("{}: skipped ({skipped})", job.name));
+            Ok(())
+        },
+    )?;
 
+    Ok(converted)
+}
+
+/// What became of one image the image step tried.
+enum Converted {
+    /// Converted to these, a page or two.
+    Done(Vec<image::ProcessedImage>),
+    /// Not decoded: not an image after all, or one in a form the decoders do
+    /// not read.
+    Undecodable,
+    /// Not tried: converting it would need this much memory, more than there
+    /// is to set aside.
+    TooLarge(u64),
+    /// The worker could not decode it within this much memory, set aside for
+    /// it, and was stopped, or died before it could answer.
+    Overran(u64),
+}
+
+/// One image the image step tries to convert.
+struct ImageJob<'a> {
+    path: &'a Path,
+    name: String,
+    /// Its path from the OPF's directory.
+    relative: String,
+    options: &'a ImageOptions,
+}
+
+impl ConvertedImages {
+    /// Write what `job`'s image converted to, and note it.
+    fn take(
+        &mut self,
+        job: &ImageJob,
+        outputs: Vec<image::ProcessedImage>,
+        taken: &mut TakenNames,
+        opf_dir: &Path,
+        report: &mut ProcessingReport,
+    ) -> Result<()> {
+        let (path, name, relative) = (job.path, &job.name, &job.relative);
         let parent = path.parent().unwrap_or(opf_dir);
 
         // Settle every output's name before writing any. One named like its
@@ -568,7 +818,7 @@ fn convert_images<P: FnMut(u8, &str)>(
         let names: Vec<String> = outputs
             .iter()
             .map(|output| {
-                if same_name(&output.filename, &name) {
+                if same_name(&output.filename, name) {
                     name.clone()
                 } else {
                     taken.claim(parent, &output.filename)
@@ -582,44 +832,185 @@ fn convert_images<P: FnMut(u8, &str)>(
             report.image_details.push(output.details.clone());
         }
 
-        // Counted once per source, however many pages it became. The leading
-        // clause of the details line is the format change, which is what the
-        // summary counts.
+        // Counted once per source, however many pages it became.
         report.images_converted += 1;
         if names.len() > 1 {
             report.spreads_split += 1;
         }
-        let kind = outputs[0]
-            .details
-            .split(',')
-            .next()
-            .unwrap_or("processed")
-            .trim()
-            .to_string();
-        *report.image_formats.entry(kind).or_insert(0) += 1;
+        *report
+            .image_formats
+            .entry(outputs[0].conversion.clone())
+            .or_insert(0) += 1;
 
         if outputs[0].reshaped {
             let pages: Vec<String> = names
                 .iter()
                 .map(|page| {
-                    Path::new(&relative)
+                    Path::new(relative)
                         .with_file_name(page)
                         .to_string_lossy()
                         .replace('\\', "/")
                 })
                 .collect();
-            reshaped.insert(pages[0].clone(), pages);
+            self.reshaped.insert(pages[0].clone(), pages);
         }
-        renames.insert(relative, names[0].clone());
+        if names[0] == *name {
+            self.in_place.push(relative.clone());
+        }
+        self.renames.insert(relative.clone(), names[0].clone());
 
         // The source only goes once its replacement is safely written, and
         // never when the replacement took its place.
-        if !names.contains(&name) && path.is_file() {
+        if !names.contains(name) && path.is_file() {
             fs::remove_file(path).ok();
         }
+        Ok(())
+    }
+}
+
+/// Memory the image step's threads may hold at once for the images they are
+/// converting, as [`image::memory_needed`] reckons it, in every run in the
+/// process together. Enough for the four or so a machine converts at once,
+/// unless they are very large, when they wait their turn; an image that
+/// would need more than all of it is not converted.
+static IMAGE_MEMORY: MemoryBudget = MemoryBudget::new(1 << 30);
+
+/// Run `work` on each of `jobs` on as many threads as the machine runs at
+/// once, telling `finished` how many are done each time one is, and hand
+/// each result to `take` in the order of `jobs`, as soon as it and every one
+/// before it are done. Stops at the first error `take` returns; threads
+/// finish only the jobs they have begun.
+///
+/// A result waits in memory until every one before it is taken, so the
+/// threads run at most twice their number of jobs ahead of what has been
+/// taken: one slow job early on does not leave the rest of the book
+/// converted and waiting behind it.
+fn in_order_in_parallel<J: Sync, T: Send>(
+    jobs: &[J],
+    work: impl Fn(&J) -> T + Sync,
+    mut finished: impl FnMut(usize),
+    mut take: impl FnMut(&J, T) -> Result<()>,
+) -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(jobs.len());
+    if threads <= 1 {
+        for (index, job) in jobs.iter().enumerate() {
+            let result = work(job);
+            finished(index + 1);
+            take(job, result)?;
+        }
+        return Ok(());
     }
 
-    Ok(ConvertedImages { renames, reshaped })
+    let ahead = threads * 2;
+    let next = AtomicUsize::new(0);
+    let order = Order::default();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..threads {
+            let sender = sender.clone();
+            let (next, work, order) = (&next, &work, &order);
+            scope.spawn(move || {
+                // One thread's panic must not leave the others waiting.
+                let _stop = order.stop_on_drop(true);
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else {
+                        break;
+                    };
+                    if !order.wait_until_taken(index.saturating_sub(ahead - 1)) {
+                        break;
+                    }
+                    if sender.send((index, work(job))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        // However this ends, no thread is left waiting on what will now never
+        // be taken.
+        let _stop = order.stop_on_drop(false);
+        let mut ready = BTreeMap::new();
+        let mut taken = 0;
+        for (count, (index, result)) in receiver.iter().enumerate() {
+            finished(count + 1);
+            ready.insert(index, result);
+            while let Some(result) = ready.remove(&taken) {
+                take(&jobs[taken], result)?;
+                taken += 1;
+                order.taken(taken);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// How many results have been taken in order, for threads waiting to run no
+/// further ahead.
+#[derive(Default)]
+struct Order {
+    state: Mutex<OrderState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct OrderState {
+    taken: usize,
+    stopped: bool,
+}
+
+impl Order {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OrderState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait until `count` results have been taken. False if the work stopped
+    /// first.
+    fn wait_until_taken(&self, count: usize) -> bool {
+        let mut state = self.lock();
+        while state.taken < count && !state.stopped {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        !state.stopped
+    }
+
+    fn taken(&self, count: usize) {
+        self.lock().taken = count;
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.changed.notify_all();
+    }
+
+    /// Something that stops the work when it is dropped: while unwinding
+    /// only, if `only_on_panic`.
+    fn stop_on_drop(&self, only_on_panic: bool) -> StopOnDrop<'_> {
+        StopOnDrop {
+            order: self,
+            only_on_panic,
+        }
+    }
+}
+
+struct StopOnDrop<'a> {
+    order: &'a Order,
+    only_on_panic: bool,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.only_on_panic || std::thread::panicking() {
+            self.order.stop();
+        }
+    }
 }
 
 /// Filenames in use, per directory, so that a converted image never lands on
@@ -680,4 +1071,43 @@ fn format_size(bytes: u64) -> String {
         size /= 1024.0;
     }
     format!("{size:.1} TB")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Results are taken in order, so a slow job holds up every one after it,
+    /// and those wait in memory. With nothing to stop them, the other threads
+    /// went on to convert the whole rest of a book behind it.
+    #[test]
+    fn work_runs_only_so_far_ahead_of_what_is_taken() {
+        let jobs: Vec<usize> = (0..64).collect();
+        let done = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        let most_waiting = AtomicUsize::new(0);
+
+        in_order_in_parallel(
+            &jobs,
+            |&job| {
+                if job == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                let waiting =
+                    done.fetch_add(1, Ordering::SeqCst) + 1 - taken.load(Ordering::SeqCst);
+                most_waiting.fetch_max(waiting, Ordering::SeqCst);
+            },
+            |_| {},
+            |_, ()| {
+                taken.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let most_waiting = most_waiting.load(Ordering::SeqCst);
+        assert!(most_waiting <= 2 * threads, "{most_waiting} results waited");
+        assert_eq!(taken.load(Ordering::SeqCst), 64);
+    }
 }

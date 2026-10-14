@@ -39,10 +39,10 @@ const GROUPING_RULES: &[&str] = &[
     "starting-style",
 ];
 
-/// How deep into grouping rules to look for fonts. Real books nest a level or
-/// two. One nested deeper is left as it is there, rather than followed down a
-/// stack that has to end somewhere.
-const MAX_NESTING: usize = 16;
+/// How deep into grouping rules to look for fonts, or rules that size boxes.
+/// Real books nest a level or two. One nested deeper is left as it is there,
+/// rather than followed down a stack that has to end somewhere.
+pub(crate) const MAX_NESTING: usize = 16;
 
 /// A `<style>` element's start tag, prefixed or not and in any case, as bytes:
 /// what a chapter must have for [`remove_embedded_fonts_from_styles`] to have
@@ -181,7 +181,7 @@ pub fn remove_unused_css(css_text: &str, used: &UsedSelectors) -> (String, usize
     let unused: Vec<Range<usize>> = rules(css_text, 0)
         .into_iter()
         .filter_map(|rule| match rule.kind {
-            RuleKind::Style { selectors } => {
+            RuleKind::Style { selectors, .. } => {
                 (!selector_matches_used(&css_text[selectors], used)).then_some(rule.span)
             }
             RuleKind::At { .. } => None,
@@ -513,7 +513,7 @@ fn embedded_font_cuts(css: &str) -> Vec<Edit> {
 /// Where the `@font-face` rules among `rules`, and inside them, are.
 fn font_faces(rules: Vec<Rule>, found: &mut Vec<Range<usize>>) {
     for rule in rules {
-        if let RuleKind::At { name, children } = rule.kind {
+        if let RuleKind::At { name, children, .. } = rule.kind {
             if name == "font-face" {
                 found.push(rule.span);
             } else {
@@ -544,18 +544,27 @@ fn cuts(css: &str, spans: &[Range<usize>]) -> Vec<Edit> {
 }
 
 /// One rule of a stylesheet, where it stands in the text.
-struct Rule {
+pub(crate) struct Rule {
     /// From its first token through its closing `}` or `;`, in bytes.
-    span: Range<usize>,
-    kind: RuleKind,
+    pub(crate) span: Range<usize>,
+    pub(crate) kind: RuleKind,
 }
 
-enum RuleKind {
-    /// A style rule, and where its selectors are written.
-    Style { selectors: Range<usize> },
-    /// An at-rule, its name lowercased, and the rules inside it, if it is a
-    /// grouping rule read into.
-    At { name: String, children: Vec<Rule> },
+pub(crate) enum RuleKind {
+    /// A style rule, where its selectors are written, and where its
+    /// declarations are, inside its braces.
+    Style {
+        selectors: Range<usize>,
+        declarations: Range<usize>,
+    },
+    /// An at-rule, its name lowercased, where what follows the name is
+    /// written, up to its block or its end, and the rules inside it, if it
+    /// is a grouping rule read into.
+    At {
+        name: String,
+        prelude: Range<usize>,
+        children: Vec<Rule>,
+    },
 }
 
 /// The rules of `css`, reading into grouping rules `depth` levels deep.
@@ -564,7 +573,7 @@ enum RuleKind {
 /// like any other, which the selector test then keeps, so nothing is lost that
 /// was not understood. Blocks not read into are skipped without recursion,
 /// however deep they go.
-fn rules(css: &str, depth: usize) -> Vec<Rule> {
+pub(crate) fn rules(css: &str, depth: usize) -> Vec<Rule> {
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
     rules_in(&mut parser, depth)
@@ -585,6 +594,8 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
             Token::CDO | Token::CDC => continue,
             Token::AtKeyword(name) => {
                 let name = name.to_ascii_lowercase();
+                let prelude_start = parser.position().byte_index();
+                let mut prelude = prelude_start..prelude_start;
                 let mut children = Vec::new();
                 loop {
                     match parser.next() {
@@ -597,20 +608,41 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
                             break;
                         }
                         Ok(Token::Semicolon) | Err(_) => break,
-                        Ok(_) => {}
+                        // What follows the name runs through what a function
+                        // or a bracket it ends with holds.
+                        Ok(
+                            Token::Function(_)
+                            | Token::ParenthesisBlock
+                            | Token::SquareBracketBlock,
+                        ) => {
+                            skip_block(parser);
+                            prelude.end = parser.position().byte_index();
+                        }
+                        Ok(_) => prelude.end = parser.position().byte_index(),
                     }
                 }
-                RuleKind::At { name, children }
+                RuleKind::At {
+                    name,
+                    prelude,
+                    children,
+                }
             }
             first => {
                 // A style rule's selectors run up to its block. Skipping the
                 // blanks before each token also gets past the inside of a
                 // bracket the last one opened, so the selectors end after it.
                 let mut selectors_end = start;
+                let mut declarations = start..start;
                 let mut token = first;
                 loop {
                     if matches!(token, Token::CurlyBracketBlock) {
+                        let open = parser.position();
                         skip_block(parser);
+                        // Less the closing brace, which a block left open at
+                        // the end does not have.
+                        let block = parser.slice_from(open);
+                        let length = block.strip_suffix('}').unwrap_or(block).len();
+                        declarations = open.byte_index()..open.byte_index() + length;
                         break;
                     }
                     parser.skip_whitespace();
@@ -622,6 +654,7 @@ fn rules_in(parser: &mut Parser<'_, '_>, depth: usize) -> Vec<Rule> {
                 }
                 RuleKind::Style {
                     selectors: start..selectors_end,
+                    declarations,
                 }
             }
         };

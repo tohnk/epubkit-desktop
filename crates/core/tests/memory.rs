@@ -1,0 +1,706 @@
+//! What reading and converting an image holds, counted by an allocator that
+//! keeps a tally. Tests here run one at a time, so the tally is theirs.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use epubkit_core::image::{
+    is_raster_image, memory_needed, process_image, thumbnail, ImageOptions, HEADER_MEMORY,
+    PAGE_MEMORY,
+};
+use epubkit_core::memory::MemoryBudget;
+use image::ImageEncoder;
+
+/// The system's allocator, counting what is live and the most that was.
+struct Tally;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn grew(by: usize) {
+    let live = LIVE.fetch_add(by, Ordering::SeqCst) + by;
+    PEAK.fetch_max(live, Ordering::SeqCst);
+}
+
+unsafe impl GlobalAlloc for Tally {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = System.alloc(layout);
+        if !pointer.is_null() {
+            grew(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        System.dealloc(pointer, layout);
+        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let moved = System.realloc(pointer, layout, size);
+        if !moved.is_null() {
+            if size > layout.size() {
+                grew(size - layout.size());
+            } else {
+                LIVE.fetch_sub(layout.size() - size, Ordering::SeqCst);
+            }
+        }
+        moved
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Tally = Tally;
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// What `work` returns, and the most it held at once beyond what was held
+/// before it.
+fn peak_of<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    let before = LIVE.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let done = work();
+    (done, PEAK.load(Ordering::SeqCst) - before)
+}
+
+/// A JPEG of 16 x 16 pixels with `extra` bytes of comments after its start,
+/// which a decoder passes over.
+fn jpeg_with_comments(extra: usize) -> Vec<u8> {
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        16,
+        16,
+        image::Rgb([90, 120, 150]),
+    ))
+    .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+    .unwrap();
+
+    let mut out = jpeg[..2].to_vec();
+    let mut left = extra;
+    while left > 0 {
+        let body = left.min(65533);
+        out.extend_from_slice(&[0xFF, 0xFE]);
+        out.extend_from_slice(&(body as u16 + 2).to_be_bytes());
+        out.resize(out.len() + body, b'c');
+        left -= body;
+    }
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+/// A PNG of one pixel whose ICC profile is `size` bytes, which pack small.
+fn png_with_profile(size: usize) -> Vec<u8> {
+    let mut png = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder.set_icc_profile(vec![0; size]).unwrap();
+    encoder
+        .write_image(&[200, 100, 50], 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    png
+}
+
+/// Reckoning what converting an image takes, or whether it is one, reads its
+/// header, and no more. A JPEG's decoder copied the whole file as it was made,
+/// comments it passes over and all, and a PNG's unpacked its ICC profile, all
+/// before anything was set aside for either.
+#[test]
+fn reading_a_header_holds_little_of_the_file() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let jpeg = dir.path().join("comments.jpg");
+    std::fs::write(&jpeg, jpeg_with_comments(8 << 20)).unwrap();
+    let png = dir.path().join("profile.png");
+    std::fs::write(&png, png_with_profile(64 << 20)).unwrap();
+    let options = ImageOptions::default();
+
+    for (path, most) in [(&jpeg, 1 << 20), (&png, HEADER_MEMORY as usize)] {
+        let (needed, peak) = peak_of(|| memory_needed(path, &options).unwrap());
+        assert!(needed > std::fs::metadata(path).unwrap().len());
+        assert!(peak <= most, "{}: reckoning held {peak}", path.display());
+        let (raster, peak) = peak_of(|| is_raster_image(path));
+        assert!(raster);
+        assert!(peak <= most, "{}: telling held {peak}", path.display());
+    }
+}
+
+/// Converting an image holds no more than was set aside for it: the file, and
+/// what decoding and converting it hold, a JPEG decoder's copy of the file
+/// and what a PNG decoder keeps of its chunks among it.
+#[test]
+fn converting_an_image_holds_no_more_than_was_set_aside() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in [
+        ("comments.jpg", jpeg_with_comments(48 << 20)),
+        ("profile.png", png_with_profile(64 << 20)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        drop(bytes);
+        for light_novel_mode in [false, true] {
+            let options = ImageOptions {
+                light_novel_mode,
+                ..ImageOptions::default()
+            };
+            let needed = memory_needed(&path, &options).unwrap();
+            let file = std::fs::read(&path).unwrap();
+            let (converted, peak) = peak_of(|| process_image(&file, name, &options));
+            assert!(converted.is_ok(), "{name}");
+            let held = (file.len() + peak) as u64;
+            assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+        }
+    }
+}
+
+/// `body` as a RIFF chunk named `fourcc`, padded to an even length.
+fn chunk(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut chunk = fourcc.to_vec();
+    chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        chunk.push(0);
+    }
+    chunk
+}
+
+/// An extended WebP of 2 x 1 pixels whose EXIF, `size` bytes of it, says in
+/// its first entry to turn it a quarter.
+fn webp_with_exif(size: usize) -> Vec<u8> {
+    let mut simple = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut simple)
+        .write_image(
+            &[200, 100, 50, 10, 20, 30],
+            2,
+            1,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    // TIFF's little-endian form: one entry, an orientation of 6.
+    let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+    exif.resize(size, 0);
+    // EXIF present; a canvas of 2 x 1.
+    let header = [0x08, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+
+    let mut body = b"WEBP".to_vec();
+    body.extend(chunk(b"VP8X", &header));
+    // The image's own chunk, after RIFF, its size and WEBP.
+    body.extend_from_slice(&simple[12..]);
+    body.extend(chunk(b"EXIF", &exif));
+    let mut riff = b"RIFF".to_vec();
+    riff.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    riff.extend(body);
+    riff
+}
+
+/// A WebP's decoder reads its whole EXIF chunk to say how the image is
+/// turned, held to no limit. A WebP of two pixels with 48 MiB of EXIF held
+/// 48 MiB to be reckoned, and converting it held 96 MiB where 80 were set
+/// aside. Its EXIF is read now no further than it has to be, and it comes out
+/// turned all the same.
+#[test]
+fn a_webps_exif_is_read_no_further_than_its_turn() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exif.webp");
+    std::fs::write(&path, webp_with_exif(48 << 20)).unwrap();
+    let options = ImageOptions::default();
+
+    let (needed, peak) = peak_of(|| memory_needed(&path, &options).unwrap());
+    assert!(peak <= HEADER_MEMORY as usize, "reckoning held {peak}");
+    let (raster, peak) = peak_of(|| is_raster_image(&path));
+    assert!(raster);
+    assert!(peak <= HEADER_MEMORY as usize, "telling held {peak}");
+
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "exif.webp", &options));
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+    let page = image::load_from_memory(&converted.unwrap()[0].bytes).unwrap();
+    assert_eq!((page.width(), page.height()), (1, 2));
+}
+
+/// A GIF whose canvas is `canvas` and whose one frame, of one colour, is
+/// `frame`, each width by height: an encoder's GIF of the frame's size, its
+/// canvas then made smaller.
+fn gif_with_frame(canvas: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+    let mut gif = Vec::new();
+    let pixels = usize::from(frame.0) * usize::from(frame.1);
+    image::codecs::gif::GifEncoder::new(&mut gif)
+        .encode(
+            &[90, 120, 150, 255].repeat(pixels),
+            u32::from(frame.0),
+            u32::from(frame.1),
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    gif[6..8].copy_from_slice(&canvas.0.to_le_bytes());
+    gif[8..10].copy_from_slice(&canvas.1.to_le_bytes());
+    gif
+}
+
+/// A GIF's decoder decodes a frame that does not lie across its canvas in
+/// RGBA of the frame's own size. One of 4000 x 3000 on a canvas of one pixel
+/// was reckoned at the canvas's size: 32 MiB set aside, 57 MiB held, and a
+/// thumbnail of it made past a budget too small for it.
+#[test]
+fn a_gif_frame_larger_than_its_canvas_is_reckoned_at_its_own_size() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frame.gif");
+    std::fs::write(&path, gif_with_frame((1, 1), (4000, 3000))).unwrap();
+    let options = ImageOptions::default();
+
+    let needed = memory_needed(&path, &options).unwrap();
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "frame.gif", &options));
+    assert!(converted.is_ok());
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+
+    let budget = MemoryBudget::new(40 << 20);
+    let (made, peak) = peak_of(|| thumbnail(&file, 480, 720, &budget));
+    assert!(
+        made.is_err() || peak <= 40 << 20,
+        "a thumbnail held {peak} of 40 MiB"
+    );
+}
+
+/// A GIF of one pixel with `size` bytes of `kind`, an ICC profile or XMP, in
+/// an application extension before its frame, which its decoder collects as
+/// it is made.
+fn gif_with_metadata(kind: &[u8; 11], size: usize) -> Vec<u8> {
+    let gif = gif_with_frame((1, 1), (1, 1));
+    // After the signature and the screen, and its colours if it has them.
+    let flags = gif[10];
+    let colours = if flags & 0x80 != 0 {
+        3 << ((flags & 7) + 1)
+    } else {
+        0
+    };
+    let at = 13 + colours;
+    let mut extension = vec![0x21, 0xFF, 11];
+    extension.extend_from_slice(kind);
+    let data = vec![0x5A; size];
+    for block in data.chunks(255) {
+        extension.push(block.len() as u8);
+        extension.extend_from_slice(block);
+    }
+    extension.push(0);
+    [&gif[..at], &extension[..], &gif[at..]].concat()
+}
+
+/// A GIF's decoder collects its ICC profile and XMP as it is made, to 50 MB
+/// each, held to no limit of the image step's. A GIF of one pixel with a
+/// 40 MiB profile held 64 MiB while its header was read, where 16 were set
+/// aside, and more to convert than was set aside; its header is read now
+/// without the decoder, and what that collects is reckoned.
+#[test]
+fn a_gifs_profile_and_xmp_are_reckoned() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for kind in [b"ICCRGBG1012", b"XMP DataXMP"] {
+        let path = dir.path().join("metadata.gif");
+        std::fs::write(&path, gif_with_metadata(kind, 40 << 20)).unwrap();
+        let name = String::from_utf8_lossy(kind);
+
+        let (needed, peak) = peak_of(|| memory_needed(&path, &options).unwrap());
+        assert!(
+            peak <= HEADER_MEMORY as usize,
+            "{name}: reckoning held {peak}"
+        );
+        let (raster, peak) = peak_of(|| is_raster_image(&path));
+        assert!(raster, "{name}");
+        assert!(
+            peak <= HEADER_MEMORY as usize,
+            "{name}: telling held {peak}"
+        );
+
+        let file = std::fs::read(&path).unwrap();
+        let (converted, peak) = peak_of(|| process_image(&file, "metadata.gif", &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (file.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+
+        let budget = MemoryBudget::new(33 << 20);
+        let (made, peak) = peak_of(|| thumbnail(&file, 480, 720, &budget));
+        assert!(
+            made.is_err() || peak <= 33 << 20,
+            "{name}: a thumbnail held {peak} of 33 MiB"
+        );
+    }
+}
+
+/// A TIFF (little-endian) whose directory claims `strips` strips of one row,
+/// so a decoder reading its StripOffsets and StripByteCounts up front holds
+/// arrays that size. The strip data need not exist.
+fn tiff_with_strips(strips: u32) -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(b"II");
+    t.extend_from_slice(&42u16.to_le_bytes());
+    t.extend_from_slice(&8u32.to_le_bytes());
+    let entries: [(u16, u16, u32, u32); 9] = [
+        (256, 3, 1, 16),
+        (257, 4, 1, strips),
+        (258, 3, 1, 8),
+        (259, 3, 1, 1),
+        (262, 3, 1, 1),
+        (273, 4, strips, 1000),
+        (277, 3, 1, 1),
+        (278, 4, 1, 1),
+        (279, 4, strips, 2000),
+    ];
+    t.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, ty, count, value) in entries {
+        t.extend_from_slice(&tag.to_le_bytes());
+        t.extend_from_slice(&ty.to_le_bytes());
+        t.extend_from_slice(&count.to_le_bytes());
+        t.extend_from_slice(&value.to_le_bytes());
+    }
+    t.extend_from_slice(&0u32.to_le_bytes());
+    t.resize(3_000 + strips as usize * 4, 0);
+    t
+}
+
+/// A TIFF's decoder reads its image file directory as it is made, holding
+/// arrays of whatever counts it claims, held to no limit of the image step's.
+/// A TIFF claiming five million strips held 234 MiB while its header was read,
+/// where 16 MiB were set aside. Its header is read now without the decoder,
+/// from the directory alone.
+#[test]
+fn a_tiffs_directory_is_read_without_its_decoder() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let path = dir.path().join("strips.tiff");
+    std::fs::write(&path, tiff_with_strips(5_000_000)).unwrap();
+
+    let (_needed, reckoning) = peak_of(|| memory_needed(&path, &options).unwrap());
+    assert!(
+        reckoning <= HEADER_MEMORY as usize,
+        "reckoning held {reckoning}"
+    );
+    let (raster, telling) = peak_of(|| is_raster_image(&path));
+    assert!(raster, "a 16 x 5,000,000 TIFF is still an image");
+    assert!(telling <= HEADER_MEMORY as usize, "telling held {telling}");
+}
+
+/// An uncompressed big-endian RGB TIFF of `width` x `height`, sixteen bits a
+/// sample, in one strip.
+fn tiff_be_rgb16(width: u32, height: u32) -> Vec<u8> {
+    let short = |v: u16| {
+        let b = v.to_be_bytes();
+        [b[0], b[1], 0, 0]
+    };
+    let long = |v: u32| v.to_be_bytes();
+    // The header, then the directory of ten entries, then the three
+    // BitsPerSample values, then the pixels.
+    let bits_at = 8 + 2 + 10 * 12 + 4;
+    let data_at = bits_at + 6;
+    let entries: [(u16, u16, u32, [u8; 4]); 10] = [
+        (256, 4, 1, long(width)),
+        (257, 4, 1, long(height)),
+        (258, 3, 3, long(bits_at)),
+        (259, 3, 1, short(1)),
+        (262, 3, 1, short(2)),
+        (273, 4, 1, long(data_at)),
+        (277, 3, 1, short(3)),
+        (278, 4, 1, long(height)),
+        (279, 4, 1, long(width * height * 6)),
+        (284, 3, 1, short(1)),
+    ];
+    let mut tiff = b"MM".to_vec();
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (tag, kind, count, value) in entries {
+        tiff.extend_from_slice(&tag.to_be_bytes());
+        tiff.extend_from_slice(&kind.to_be_bytes());
+        tiff.extend_from_slice(&count.to_be_bytes());
+        tiff.extend_from_slice(&value);
+    }
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for _ in 0..3 {
+        tiff.extend_from_slice(&16u16.to_be_bytes());
+    }
+    tiff.resize(tiff.len() + (width * height * 6) as usize, 0x55);
+    tiff
+}
+
+/// A TIFF of `width` x `height` in floating-point RGB, or RGBA.
+fn tiff_float(width: u32, height: u32, alpha: bool) -> Vec<u8> {
+    let image = if alpha {
+        image::DynamicImage::ImageRgba32F(image::Rgba32FImage::from_pixel(
+            width,
+            height,
+            image::Rgba([0.3, 0.5, 0.7, 0.9]),
+        ))
+    } else {
+        image::DynamicImage::ImageRgb32F(image::Rgb32FImage::from_pixel(
+            width,
+            height,
+            image::Rgb([0.3, 0.5, 0.7]),
+        ))
+    };
+    let mut out = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Tiff)
+        .unwrap();
+    out
+}
+
+/// An uncompressed little-endian TIFF of `width` x `height`, `samples`
+/// eight-bit samples a pixel (grey, or RGB and alpha), in one strip, its
+/// numbers written as BYTEs where they fit: its width, if it is under 256,
+/// and its samples a pixel. Its BitsPerSample is one value, for every sample.
+fn tiff_of_bytes(width: u32, height: u32, samples: u8) -> Vec<u8> {
+    let data = width as usize * height as usize * usize::from(samples);
+    let alpha = samples == 4;
+    let count = 9 + u16::from(alpha);
+    let data_at = 8 + 2 + 12 * u32::from(count) + 4;
+    let long = |v: u32| (4u16, v.to_le_bytes());
+    let short = |v: u16| (3u16, [v.to_le_bytes()[0], v.to_le_bytes()[1], 0, 0]);
+    let byte = |v: u8| (1u16, [v, 0, 0, 0]);
+    let mut entries = vec![
+        (256, u8::try_from(width).map_or_else(|_| long(width), byte)),
+        (257, long(height)),
+        (258, short(8)),
+        (259, short(1)),
+        (262, short(if samples > 2 { 2 } else { 1 })),
+        (273, long(data_at)),
+        (277, byte(samples)),
+        (278, long(height)),
+        (279, long(data as u32)),
+    ];
+    if alpha {
+        entries.push((338, short(2)));
+    }
+    let mut tiff = b"II".to_vec();
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&count.to_le_bytes());
+    for (tag, (kind, value)) in entries {
+        tiff.extend_from_slice(&u16::to_le_bytes(tag));
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&value);
+    }
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff.extend((0..data).map(|i| (i % 251) as u8));
+    tiff
+}
+
+/// A TIFF's numbers can be BYTEs, which its decoder reads as it reads SHORTs
+/// and LONGs, and its header is read so too. Its directory was read for
+/// SHORTs and LONGs alone: a width of a BYTE did not read, so nothing was
+/// reckoned for an image that converts; and samples a pixel of a BYTE were
+/// taken as one, so RGBA of 4000 x 3000 was reckoned as grey, and held 144 MB
+/// where 117 MB were set aside.
+#[test]
+fn a_tiffs_numbers_are_read_as_bytes_too() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for (name, bytes) in [
+        ("byte-width.tiff", tiff_of_bytes(200, 300, 1)),
+        ("byte-samples.tiff", tiff_of_bytes(4000, 3000, 4)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let needed = memory_needed(&path, &options).expect(name);
+        let (converted, peak) = peak_of(|| process_image(&bytes, name, &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (bytes.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+    }
+}
+
+/// A TIFF is reckoned at the depth its decoder decodes it to. Its directory's
+/// entry counts are of 32 bits, and a big-endian one's sixteen-bit RGB was
+/// read as eight-bit, its count taken from the wrong half: one of 4000 x 3000
+/// held 211 MiB where 173 were set aside. And floating-point RGB and RGBA,
+/// which the decoder takes at 32 bits a sample, were reckoned at sixteen: 119
+/// MiB held where 103 were set aside, and 141 where 127 were.
+#[test]
+fn a_deep_tiff_is_reckoned_at_its_depth() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for (name, bytes) in [
+        ("big-endian.tiff", tiff_be_rgb16(4000, 3000)),
+        ("float.tiff", tiff_float(2000, 1500, false)),
+        ("float-alpha.tiff", tiff_float(2000, 1500, true)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let needed = memory_needed(&path, &options).unwrap();
+        let (converted, peak) = peak_of(|| process_image(&bytes, name, &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (bytes.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+    }
+}
+
+/// A floating-point RGB TIFF is shrunk where it lies, as an eight- or
+/// sixteen-bit image is. It was copied whole first, the copy as large as the
+/// image: one of 3000 x 5000 held 556 MiB where 547 were set aside.
+#[test]
+fn a_floating_point_image_is_shrunk_without_a_copy() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    let bytes = tiff_float(3000, 5000, false);
+    let path = dir.path().join("float.tiff");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let needed = memory_needed(&path, &options).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&bytes, "float.tiff", &options));
+    assert!(converted.is_ok());
+    let held = (bytes.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+}
+
+/// Noise, `width` x `height`: each pixel one of the eight corners of the RGB
+/// cube, at random, which in colour codes denser than any other content
+/// tried, at quality 100 nearly five bytes a pixel.
+fn noise(width: u32, height: u32) -> image::RgbImage {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state >> 40
+    };
+    image::RgbImage::from_fn(width, height, |_, _| {
+        let corner = next();
+        image::Rgb([0, 1, 2].map(|bit| if corner >> bit & 1 == 0 { 0 } else { 255 }))
+    })
+}
+
+/// Options that keep a page in colour, at `quality`, or make it grey and
+/// dither it as a Kindle's are.
+fn page_options(grayscale: bool, quality: u8) -> ImageOptions {
+    ImageOptions {
+        max_width: 1024,
+        max_height: 1024,
+        grayscale,
+        eink_quantize: grayscale,
+        contrast_boost: grayscale,
+        quality,
+        ..ImageOptions::default()
+    }
+}
+
+/// A page is coded with its Huffman tables made optimal for it, which read
+/// the whole scan into a list of its symbols, then copied it to code the
+/// padding afresh, then read the rewritten file back into another to check
+/// it: ten times the JPEG at once. In colour at 1024 x 1024, the most a page
+/// may be, noise held 69 MiB to convert at quality 100 where 38 were set
+/// aside, and 56 at quality 70, so a worker held to that skipped it. The scan
+/// is read a block at a time now, and converting holds no more than is set
+/// aside, in colour or in grey, at any quality: 22 MiB at quality 100.
+#[test]
+fn a_page_of_noise_at_the_largest_size_converts_within_what_is_set_aside() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let mut bmp = Vec::new();
+    image::DynamicImage::ImageRgb8(noise(1024, 1024))
+        .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .unwrap();
+    let path = dir.path().join("noise.bmp");
+    std::fs::write(&path, &bmp).unwrap();
+
+    for (grayscale, quality) in [(false, 70), (false, 95), (false, 100), (true, 100)] {
+        let options = page_options(grayscale, quality);
+        let needed = memory_needed(&path, &options).unwrap();
+        let (converted, peak) = peak_of(|| process_image(&bmp, "noise.bmp", &options));
+        assert!(converted.is_ok(), "grey {grayscale}, quality {quality}");
+        let held = (bmp.len() + peak) as u64;
+        assert!(
+            held <= needed,
+            "grey {grayscale}, quality {quality}: {held} held, {needed} set aside"
+        );
+    }
+}
+
+/// Making a JPEG's Huffman tables optimal holds the file it writes, no
+/// larger than the one it reads, and little else: a colour JPEG of noise at
+/// 1024 x 1024 and quality 100 held 51 MB to rewrite, ten times itself.
+#[test]
+fn making_huffman_tables_optimal_holds_little_beside_the_file_it_writes() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let rgb = noise(1024, 1024);
+    let mut jpeg = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 100);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    encoder
+        .encode(rgb.as_raw(), 1024, 1024, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+    drop(rgb);
+
+    let (optimized, peak) = peak_of(|| epubkit_core::jpeg::optimize_huffman(&jpeg));
+    assert!(optimized.is_some(), "the tables were not made optimal");
+    assert!(
+        peak <= jpeg.len() + (1 << 20),
+        "{peak} held to rewrite a JPEG of {}",
+        jpeg.len()
+    );
+}
+
+/// A page is coded once it is grey or RGB, without the page it was made from
+/// beside it. One of floating point is four times the RGB it comes to, and
+/// coding the second half of a split spread of it, with the first half
+/// coded, held 32.5 MiB beside the image, more than the 32 set aside for a
+/// page; only the room reckoned for decoding the image covered it.
+#[test]
+fn a_page_holds_no_more_than_is_set_aside_for_one_beside_its_image() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tiff = Vec::new();
+    let spread = image::DynamicImage::ImageRgb8(noise(2048, 1024)).into_rgb32f();
+    image::DynamicImage::ImageRgb32F(spread)
+        .write_to(&mut Cursor::new(&mut tiff), image::ImageFormat::Tiff)
+        .unwrap();
+    let options = ImageOptions {
+        light_novel_mode: true,
+        ..page_options(false, 100)
+    };
+
+    let (converted, peak) = peak_of(|| process_image(&tiff, "spread.tiff", &options));
+    assert_eq!(converted.unwrap().len(), 2, "the spread is split");
+    let image = 2048 * 1024 * 12;
+    assert!(
+        peak as u64 <= image + PAGE_MEMORY,
+        "{peak} held beside the file, for an image of {image}"
+    );
+}
+
+/// A lossless WebP without alpha is decoded in RGBA beside the RGB it comes
+/// out as, where a byte a pixel was reckoned for it: one of 2000 x 10000
+/// held more than was set aside.
+#[test]
+fn an_opaque_lossless_webp_is_reckoned_with_its_rgba() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opaque.webp");
+    let (width, height) = (2000u32, 10000u32);
+    let mut webp = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+        .write_image(
+            &[90, 120, 150].repeat((width * height) as usize),
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    std::fs::write(&path, webp).unwrap();
+    let options = ImageOptions::default();
+
+    let needed = memory_needed(&path, &options).unwrap();
+    let file = std::fs::read(&path).unwrap();
+    let (converted, peak) = peak_of(|| process_image(&file, "opaque.webp", &options));
+    assert!(converted.is_ok());
+    let held = (file.len() + peak) as u64;
+    assert!(held <= needed, "{held} held, {needed} set aside");
+}

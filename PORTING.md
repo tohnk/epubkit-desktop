@@ -432,18 +432,39 @@ symbols. No dequantization and no IDCT are involved, so nothing is
 approximated; SOF, DQT, scan header, component order and every DCT coefficient
 are copied through byte for byte. It is what `jpegtran -optimize` does.
 
-The output is therefore structurally identical to what the reference emits, and
-it is verified three ways: the rewritten file must decode to the same pixels,
-must be smaller, and must re-decode to the exact symbol stream it was built
-from — that last check runs inside `optimize_huffman` itself, so a bug degrades
-to "no saving" rather than to a corrupt book. Anything unrecognized
-(progressive, restart markers, multiple scans, 12-bit) is declined and the
-original kept. Set `EPUBKIT_JPEG_TRACE=1` to see why a file was declined.
+The scan is decoded a block at a time, three times over, to count, to code and
+to check, so the rewrite holds the file it writes and little else. It decoded
+the whole scan into a list of its symbols, copied that to code the padding
+afresh, as below, and decoded the rewritten file into another to check it: ten
+times the JPEG at once, 51 MB for a 1024 x 1024 page of colour noise at
+quality 100. Codes are looked up ten bits ahead, as libjpeg looks them up, so
+the three passes take less time than the two did.
+
+One more thing changes, as libjpeg would have it. An interleaved scan codes
+whole MCUs, so where an image's luma does not fill out the last one, 4:2:0
+greyscale being the case here, blocks past the image's edge are coded that no
+decoder shows. libjpeg codes each as the DC of the block before it and no AC;
+`jpeg-encoder` fills them with the image's last row or column repeated, which
+in a dithered image cost 0.4% of a page-sized file and a quarter of a strip
+eight pixels high. The rewrite codes them as libjpeg does.
+
+The output is therefore built as the reference's is, but for two legal
+differences that come from `jpeg-encoder`: its frame header comes before its
+quantization tables, and its components are numbered 0 to 2 rather than 1 to
+3. No decoder tried minds either, but they are the first thing to look at if
+a reader ever cannot show an image. The rewrite is verified three ways: the
+rewritten file must decode to the same pixels, must be smaller, and must
+re-decode to the exact symbol stream it was built from — that last check runs
+inside `optimize_huffman` itself, so a bug degrades to "no saving" rather than
+to a corrupt book. Anything unrecognized (progressive, restart markers,
+multiple scans, 12-bit) is declined and the original kept. Set
+`EPUBKIT_JPEG_TRACE=1` to see why a file was declined.
 
 Measured against the unoptimized file, on images that have been through the
 full pipeline: ~7.5% on photographic content, ~6% on line art, ~3% on a page of
 text, ~4% on 4-level dithered noise, and 40–55% on near-empty images. Sizes
-land within 0.05% of what libjpeg produces from the same pixels.
+land within 0.3% of what libjpeg produces from the same pixels at the same
+quality, whose quantization tables are the same.
 
 ### Pixel operations are checked against Pillow, not eyeballed
 
@@ -471,6 +492,52 @@ visible: Lanczos resampling (same algorithm — the `image` crate scales the
 filter kernel on downscale exactly as Pillow does — but `f32` coefficients
 rather than fixed-point) and error diffusion (classic Floyd–Steinberg on the
 grey channel, where Pillow diffuses against a palette in RGB).
+
+### Photos are turned the way their EXIF data says
+
+The reference decoded an image as stored and dropped its EXIF data,
+orientation tag and all. A phone photo stored sideways, with a tag saying
+to turn it a quarter clockwise, is shown upright by a reader, but came out
+of the reference sideways for good; in Light Novel mode, taken for
+landscape art and turned the other way, it came out upside down. The port
+turns each image as its orientation tag says (JPEG, PNG, WebP and TIFF can
+carry one) before anything looks at its shape.
+
+### Images are decoded by the `image` crate, not Pillow
+
+The two read what a book's images are normally in alike: JPEG (progressive,
+CMYK and YCCK included), PNG, GIF, WebP and BMP. A few rarer kinds Pillow
+reads, the `image` crate does not: arithmetic-coded JPEG, and TIFF that is
+fax-compressed (CCITT G3, or G4 written least significant bit first),
+JPEG-compressed, paletted, or grey at 2 or 4 bits. Two more TIFF variants it
+reads differently: an extra channel marked "unspecified" is taken for alpha,
+and premultiplied alpha is not undone. An image that cannot be decoded stays
+in the book as it was, and the summary counts it. TIFF is not among the image
+types EPUB requires a reader to show, and few readers decode arithmetic-coded
+JPEG either.
+
+One kind the `image` crate's JPEG decoder (zune-jpeg) reads, but reads
+wrongly: a sequential JPEG whose components are in separate scans. It decodes
+those a way of its own, and libjpeg's reading of the same files shows it
+wrong in more than one way. It lays a scan's blocks in the order of a scan
+that holds every component, wrong wherever a component is subsampled: a
+4:2:0 JPEG with each component in a scan of its own came out off by 117 of
+255 in every channel on average. And with every component sampled in full it
+still went wrong: an illustration on white came out with its bottom eight
+rows black, and the same illustration rewritten by `jpegtran` into one scan a
+component, with restart markers at some intervals, came out off by up to 46.
+Each was converted all the same, the original replaced. `jpeg-encoder` writes
+JPEGs that way when its Huffman tables are optimized, and `jpegtran` can
+rewrite one so. The port refuses every such JPEG, however its components are
+sampled, and leaves it as it is; progressive JPEGs, which zune-jpeg decodes
+another way, and the usual JPEG with all its components in one scan, restart
+markers or not, it converts as before, true to libjpeg's pixels.
+
+Both refuse an image of more than 178,956,970 pixels as a likely
+decompression bomb. The `image` crate on its own refuses one whose decoded
+pixels take more than 512 MiB, which left a 12000 x 12000 RGBA image, 144
+million pixels, unconverted at full size; the port lets decoding allocate
+enough for an image at Pillow's limit, at sixteen bits a channel.
 
 ### Cover generation is omitted
 
@@ -500,6 +567,167 @@ as written, and links to other sites are left alone. A `srcset` is split
 into candidates as the HTML standard splits it, so a URL with a comma in it
 is one URL, and a `data:` URL or another site's is left whole.
 
+### Converted images are counted and declared as what they became
+
+The reference's summary counted images by the first thing said about each,
+meant to be the format change (its own comment gives
+`{"PNG→JPEG": 5, "baseline JPEG": 3}`), but for a JPEG that was how it was
+resized, so a book of JPEGs listed one entry per size. The port counts by
+the format change, a JPEG written again as `baseline JPEG`. And an image
+converted under its own name, a PNG named `plate.jpg` say, is declared
+`image/jpeg` in the manifest as a renamed one is; the reference changed the
+media type only of an image it renamed.
+
+### Images are known by what they are, not by their names
+
+The reference tried only images named `.png`, `.gif`, `.webp`, `.bmp`,
+`.jpg`, `.jpeg`, `.tif` or `.tiff`, and passed over the rest in silence: a PNG
+the manifest declared with no extension, or as `spread.bin`, or a JPEG named
+`.jpe` or `.jfif`, stayed as it was, and the summary did not mention it. The
+port tries every image the manifest declares but an SVG, known by its media
+type, or by its name where its bytes do not read as a raster image, and reads
+each one's format from its bytes. The converted
+file takes the name with `.jpg` for whatever extension it had, references
+follow it, and the summary counts it by what it was: a PNG named `plate.jpg`
+is a `PNG→JPEG`. One no decoder reads is left as it was and counted as such.
+
+Nor does the port go by the media type alone. An item the manifest calls
+something else, `application/octet-stream` say, or nothing, is an image if
+it reads as one: in a format the image step decodes, with a header that
+reads, so that text which merely starts "BM", as a BMP does, is not one. And
+an image a chapter, an SVG document or a stylesheet shows, which the manifest
+leaves out, is part of the book as it is read: it is converted like the
+rest, its references follow it, and it is declared, as the JPEG it became.
+An image nothing names, or a file under `META-INF`, is left alone. The
+reference left both kinds as they were.
+The summary's total is these images, the ones in the book that are not SVG,
+so it no longer counts SVG images, which are drawn and never converted, or
+images the manifest declares and the book lacks.
+
+### Images are converted on every core
+
+The reference converted one image after another. The port converts as many
+at once as the machine runs threads, each holding while it converts about as
+much memory as its image needs, out of 1 GiB for all of them, so very large
+images wait their turn. Each image is then named, written and reported in the
+manifest's order, so the book that comes out is the same whatever order they
+finished in.
+
+What an image needs is reckoned from its header before its file is read, by
+what each step of converting it holds at once, measured for each format: the
+file; the image decoded at its own depth, with what its decoder keeps beside
+it, every coefficient of a progressive JPEG say, or of a sequential one
+whose components are in separate scans, which it decodes whole before making
+any pixels, a JPEG decoder's copy of the
+file and of the segments it reads, a PNG decoder's of its chunks, a TIFF
+decoder's own copy, a WebP decoder's luma and chroma and the RGBA it decodes
+a lossless image without alpha or an alpha plane in, or a GIF decoder's
+first frame at its own size, where that does not lie across the canvas; a
+copy made to flatten a deeper image's alpha; a copy turned as the
+EXIF data says, or as Light Novel mode might; and the buffer resampling it
+holds, four `f32` for every source column at each row of the result. Never
+less than the conversion takes, and some 32 MB more. The 1 GiB is shared by
+every book converted in the process, and an image that would need more than
+all of it is left as it is and counted with those that could not be
+converted, before any of it is decoded: a 16-bit RGBA PNG at Pillow's limit
+of 179 megapixels needs about 2 GB, and took 2.7 GB. In practice that is
+only an image of 90 megapixels or more, with alpha or progressive or turned.
+
+To need less, an image of eight bits a channel is flattened where it lies,
+not copied, and turned only once flat; and a split spread's pages are read
+from the image where they lie, not cut out of it first. The same image comes
+out of either. A 179-megapixel RGBA PNG took 1207 MB to convert, and takes
+794 MB. Floating-point RGB, which a TIFF can be, is shrunk where it lies as
+eight- and sixteen-bit images are; it was copied whole first, which a 3000 x
+5000 one held 9 MiB past what was set aside for.
+
+A page, at most 1024 x 1024, is reckoned to hold 32 MiB beside the image as it
+is made grey or RGB and coded: the page, at as much as twelve bytes a pixel,
+let go once it is grey or RGB; the JPEG, in a buffer up to twice its size, and
+the JPEG rewritten with optimal Huffman tables; and in Light Novel mode the
+first half of a split spread as the second is coded. Noise in colour at quality
+100, which codes as densely as any content tried, holds 20.5 MiB of that at
+most. Before the Huffman tables were made optimal a block at a time, such a
+page held 69 MiB to convert where 38 were set aside, and a worker held to that
+left it unconverted; and a page in floating point, four times the RGB it comes
+to, was kept until it was coded, past the 32 MiB.
+
+Reading the header holds little, and that is set aside too while it is read.
+A JPEG's is read marker by marker, passing over every segment but its frame
+and its EXIF, as its decoder copies the whole file as it is made. A GIF's is
+read block by block to its first frame, as its decoder collects an ICC
+profile and XMP on the way as it is made, to 50 MB each, held to no limit of
+the image step's; what those come to, twice what is collected as the buffer
+doubles as it grows, is reckoned in what decoding it holds, and a GIF too
+large to decode is refused before its decoder is made. A TIFF's is read from
+its image file directory, as its decoder reads it when it is made, but
+without the decoder, which would hold arrays of whatever counts the directory
+claims — a TIFF claiming five million strips held 234 MiB reading its header;
+its size, its samples and their bits, and its turn are read from the
+directory alone, the colour taken no narrower than the decoder would decode
+it to: eight or sixteen bits a sample at that depth, and 32 as the
+floating-point RGB or RGBA the decoder takes it as. An entry's count is of
+32 bits, in either byte order; a BitsPerSample entry that does not read is
+taken at the widest the decoder takes, and only a missing one at TIFF's
+default of a bit. Its numbers are read as BYTEs, SHORTs or LONGs, as the
+decoder takes any of them: a width of a BYTE did not read at all, and samples
+a pixel of a BYTE were taken as one, so RGBA of 4000 x 3000 was reckoned as
+grey and held 144 MB where 117 were set aside. A SamplesPerPixel entry that
+does not read is taken as four samples, not one. Any other
+image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
+its text and EXIF chunks and unpack of its ICC profile, which with the
+buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set
+aside. A larger profile, which nothing here uses, is let go of unread, and an
+image with more text than that is left as it is and counted. Decoding it
+holds the same, and that is reckoned in what it needs. A WebP's decoder is
+held to no limit, and reads the whole of its EXIF to say how it is turned, so
+that is read here instead, from the chunk the decoder would find, among those
+it takes the container to hold: the first 64 KiB of it, where the turn is,
+and a WebP whose EXIF is longer and does not say within them is reckoned as
+turned. Converting one reads the turn where it lies in the file. A JPEG that
+a thumbnail of a book's cover or a check of the file had copied whole,
+comments and all, before anything was set aside, is read now for a few
+kilobytes, a one-pixel PNG whose ICC profile unpacks to 64 MiB holds 9 MB
+rather than 69, a WebP of two pixels with 48 MiB of EXIF a few kilobytes
+rather than 48 MiB, and a one-pixel GIF with a 40 MiB ICC profile a few
+kilobytes rather than 64 MiB.
+
+A thumbnail for the desktop's book list is reckoned the same way, out of
+512 MiB for all of them, and one that would need more is not made: the book
+is shown without its cover.
+
+What a decoder holds is reckoned from an image's header, but a crafted image
+can make one allocate far past what its size or its pixels suggest, past any
+limit the decoder takes: a lossless WebP names up to 65,536 groups of five
+Huffman tables, and a few-megabyte file can ask for gigabytes, a
+few-megabyte one for more than the little a one-pixel image reckons. So the
+work that decodes an image — converting it, or making a thumbnail — is done
+in a worker process, under a counting allocator held to the memory set aside
+for that image. One that asks for more is stopped by the allocator, and the
+image is left as it is, or the cover is not made; the book, the other images
+and the program go on untouched. The CLI and the desktop each serve as their
+own worker, re-run with a hidden argument that is handled before anything
+else; run as a library, or in the tests, decoding is done in the same process
+as before, with no cap. The worker decodes with the very code the pipeline
+would have run, so a book comes out identical whether or not it was used.
+
+For converting, the worker reads the image file itself, from the path the
+parent sends, under the cap. The parent keeps no copy of its own, so only the
+one process ever holds the image, and its size is set aside once, not twice: a
+tiny image padded to a large file no longer sits in two buffers at once. A
+cover thumbnail has no file to name, so its bytes are sent to the worker, and
+the memory set aside counts that copy. A file that cannot be read fails the
+book, as reading it in the parent once did; one that will not decode leaves
+its image alone. An image whose header does not read, or that is past 179
+megapixels, is not sent to a worker at all, but counted as one that will not
+decode, and its cover is refused the same way: nothing could be reckoned for
+it, so the worker was held to its file alone and stopped before it could say
+the image would not decode. Each was counted as having overrun the 0 MB set
+aside for it, and every such cover cost a worker. And where the cap refuses an allocation that fails with an
+error rather than stopping the worker — reading the file allocates that way,
+as some decoders do — the image is left as one that overran, not taken for a
+file that cannot be read or an image that will not decode.
+
 ### Light Novel mode keeps every page it makes
 
 The reference split a double-page spread into two images but pointed the book
@@ -512,6 +740,84 @@ page. An SVG wrapper,
 common around full-page illustrations and sized to the spread in its viewBox,
 gives way to a plain image per page. A rotated image sheds its old size and
 wrapper the same way. The report counts a split spread as one image.
+
+### Light Novel mode reshapes only pages of art
+
+The reference turned or split every image wider than tall, however the book
+showed it. Most ways of showing an image cannot take one of another shape:
+an SVG document or a CSS background showed the first half of a split image
+and nothing showed the second, an SVG illustration's labels no longer lay
+over what they labelled, a small image in a line of text was split in two in
+the line or stood on end, a heading's image read right half first, and the
+cover lay on its side in a reader's library.
+
+Before converting images in Light Novel mode, the port reads how the book
+shows each one, and reshapes only an image shown as a page of its own: an
+`<img>` outside a heading with nothing else in its line, or an SVG that shows
+nothing but its image, as it is, on its own the same way. Anything else that names
+the file keeps its shape: an SVG that draws more, an SVG document, a
+stylesheet or `style`, an image in text or a heading, a link to the file, a
+`srcset` other than the image's own, and the cover. For this the chapters are
+repaired before the image step rather than after it, which changes nothing
+else, since neither step reads what the other writes.
+
+Nor is an image reshaped in a box the book's CSS sizes for it, as a split
+image's pages take more room down the page than it did and a turned one is
+another shape. A box around it of a set height or `max-height`, in pixels,
+ems or the like or a screen high in `vh`, of a set `aspect-ratio`, or sized
+by `contain: size`, cut the second page off or let it run over what came
+after. A height that is a percentage is one where it holds: where the box it
+is a share of has a height set, or is the page, through every box between.
+A `transform`, or a `rotate`, `scale` or `translate`, which apply beside it,
+or `position: absolute` or `fixed`, on the box or the image turned the pages
+again or laid them over each other. A `clip-path`, `clip`, `mask`, a mask
+over the border, or `offset-path` on either showed only part of it, which
+each page would show again of itself, as would a `filter` that draws it
+through an SVG filter, whose region can crop it, and rounded corners on the
+image, or on a box that hides what overflows it. CSS's own filter functions,
+`blur()` or `grayscale()` say, show all of it, and its pages each all of
+theirs. And the image's own
+height, which each page keeps, gave every page its size, as a screen high
+with a set width gave them its proportions. The page's own boxes, `<html>`
+and `<body>`, frame nothing by their height alone, as what they hold runs on
+onto the pages after: as common as `html, body { height: 100% }` is, every
+image would otherwise stay whole. They frame an image only if they hide what
+overflows them.
+
+The CSS is read as a reader reads it, through the cascade of the few
+properties that matter: the stylesheets each chapter links, by `<link>` or an
+`xml-stylesheet` instruction, and what they `@import`, its `<style>` elements
+and `style` attributes, and the `height` attributes of tables and the like,
+with each selector matched against the chapter and the winner settled by
+`!important`, specificity and order. What it cannot know, it takes to hold or
+not as either would keep the image whole: a media query of the screen's size
+or shape, an alternate stylesheet, an instruction not every reader follows, a
+pseudo-class it does not read, a selector it cannot read, a rule nested in
+another, a logical size, which is a height or a width as the page is written
+across or down. Such a rule can frame an image, but never undoes another's
+frame. The image's pages are matched as they will be: all of them without its
+`width`, `height`, `srcset` and `sizes`, all but the first without its id,
+each naming a file of its own, and where they are added, which siblings an
+element has is not known. An SVG wrapper's pages are plain images styled to
+fit the page, and one stands in for them while the chapter is matched.
+
+A stylesheet too large to read, too deeply imported or held in a `data:` URL
+could say anything, and the images of a chapter it styles keep their shape.
+So do those of a chapter matched once the book's CSS has asked for 2^27
+steps of matching, some eight seconds' worth, and of one a stylesheet styles
+that would come to more than 2^18 pieces, compounds of selectors and
+declarations, some tens of megabytes. Real books ask for thousands of steps
+in a chapter, and come to a few thousand pieces. Matching a selector tells how far a failure
+goes, as browsers' engines do, so that no element is tried again where it
+failed before; a selector that fails only at its far end once took a step for
+every way through the boxes, which a deep chapter made billions.
+
+Even shown as a page, an image is reshaped only if that shows it at least
+15% bigger: the panel never enlarges an image, so one it already shows whole,
+a small figure or an ornament on a line of its own, gains nothing from being
+turned, and nor does one nearly square. And an image more than 2.6 times as
+wide as it is tall, wider than two pages side by side, is a rule or a banner
+and stays whole; the reference split a 600 x 10 rule into two.
 
 ### One unreadable file does not sink the book
 
@@ -570,9 +876,89 @@ The reference took any SVG in the first three chapters holding exactly one
 `<image>` for a cover wrapper and replaced it with a plain `<img>`. One that
 also held text or shapes, a labelled map say, lost them. The port unwraps an
 SVG only when the image is all it draws, beside a title or a description, and
-leaves an illustration alone. Light Novel mode does the same for an SVG around
-an image it split: an illustration stays, followed by the image's further
-pages.
+leaves an illustration alone. Light Novel mode does the same: an illustration
+stays, and its image keeps its shape.
+
+Nor does it unwrap one that shows only part of its image: a viewBox over the
+right half of a spread, an image slid out of its box, or one sliced to fill a
+box of another shape. An `<img>` in its place showed the whole picture. The
+port replaces only an SVG whose box is its image's own: a viewBox from the
+origin the image's size, or none and an image filling the SVG, all of it or
+the very width and height the SVG gives itself in numbers. With no viewBox
+nothing scales the image to the box, so CSS may not size that box either:
+`max-width: 100%`, say, could make it narrower than the image.
+
+Nor one that draws its image otherwise than an `<img>` would: turned or
+slid, clipped by `clip-path`, `clip` or rounded corners, masked, filtered,
+faded, blended with what is behind it, or hidden. The SVG's attributes or its
+image's can do that, their `style`, or the chapter's stylesheets, read
+through the cascade as Light Novel mode reads them, where an attribute is a
+declaration that any rule setting the same takes the place of; and the
+stylesheets can put the image elsewhere or at another size, as SVG 2 lets
+`x`, `y`, `width` and `height` do. Nor one whose `<img>` the stylesheets
+would draw otherwise than the SVG, which they style apart from it: under
+`img { visibility: hidden }` a cover in plain sight was hidden once it was
+an `<img>`. The `<img>` is put where the SVG is, as it will be, and the
+cascade asked of it too, where it takes after the box it is in as the SVG
+need not: hidden in a hidden `<div>`, where the SVG was made `visible`.
+Visibility inherits, so `unset`, `revert` and `revert-layer` on it take the
+box's visibility rather than the initial `visible`, hidden in a hidden box as
+a reader has them. And
+as no list of what draws an image otherwise can foresee what a rule for
+images may do, `img { width: 0 }` say, which left nothing of the cover, a
+wrapper stays wherever a rule that may style its `<img>` sets anything but
+colours, fonts and how text is laid out, a border's colour, backgrounds,
+where pages break, no padding, no border and no margin, sizes left to the
+image, `box-sizing: content-box`, or that it is visible. What the `<img>`'s
+own style sets, its size, its margins, that it is a block, `box-sizing:
+content-box`, no padding and no border, a rule does not unless it is
+important. Those pins matter. Padding or a border with `box-sizing:
+border-box` and the `<img>`'s `max-width: 100%` would leave no content box
+and so no picture; and padding, a border or a margin at all make the
+`<img>`'s box larger than the SVG's was, so a box around it that hides what
+overflows it cuts the picture off. So an important one of any of them keeps
+the wrapper; the rounding of a border's corners, which the `border` shorthand
+does not set, keeps it whether important or not. A chapter styled by a
+stylesheet too large to read keeps its wrappers. Light Novel mode keeps such an image whole, and asks the
+same of the pages that would take a wrapper's place.
+
+### A document too large to read whole is left as it is
+
+The reference read every chapter, stylesheet and table of contents whole and
+parsed it, whatever its size, and parsing takes some fifteen times a
+document's size: a 40 MB chapter took 598 MB and 25 seconds. The port reads
+none larger than 32 MiB. Such a chapter, SVG document, stylesheet or table of
+contents is left exactly as it is and counted in the summary; a package
+document that large leaves nothing to go on, and the book is refused, as it
+is if `encryption.xml` is that large, which could hide anything.
+
+Since no reference in such a document is rewritten, an image it names must
+keep its name. Which images it names cannot be known short of reading it as
+a reader does, entities, character references, CSS escapes and
+percent-escapes and all: `art&period;png` names `art.png` to a reader that
+knows HTML's entities, and so does a CSS string that carries the name on to
+the next line with a backslash. So in a book with such a document every
+image keeps its name and stays as it is, each counted with the reason. A
+chapter nothing can parse is treated the same way, unless it is blank, as
+nothing but whitespace after a byte order mark, which names nothing. And as
+what such a document's markup uses cannot be known, no CSS rule is removed
+as unused in a book that has one.
+
+A stylesheet counts as a document here even where the manifest leaves it
+out, as long as a chapter or SVG document reaches it: a `<link>`, an
+`<?xml-stylesheet?>`, or an `@import` in a `<style>` element or in another
+stylesheet leads to it, to any depth, inside the book, its reference
+percent-decoded once, as a reader decodes it. An instruction's pseudo-
+attributes have their character references, decimal or hex, and XML's five
+entities decoded first, in one pass that reads them forward once, as XML has
+a reader decode them, so
+`href="s&#104;eet.css"` names `sheet.css` — for the stylesheets the cascade
+reads as for these. Its references are rewritten with the manifest's stylesheets', so an
+image it names still leads to it once converted; and one too large to read
+leaves every image in the book as it is, as any document left unread does. A
+well-formed book lists all its stylesheets, so this changes nothing there; a
+malformed one that links a stylesheet it does not declare no longer loses the
+images that stylesheet names.
 
 ### The HTML repair pass runs earlier
 
