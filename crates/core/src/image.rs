@@ -919,9 +919,11 @@ fn tiff_header(
     reader.read_exact(&mut count).ok()?;
 
     // What a tag whose value is a single number holds, from the entry's value
-    // field, by its type: a SHORT or a LONG.
+    // field, by its type: a BYTE, a SHORT or a LONG, as the decoder takes any
+    // of them.
     let number = |entry: &[u8; 12]| -> Option<u32> {
         match u16_at(&entry[2..4]) {
+            1 => Some(u32::from(entry[8])),
             3 => Some(u32::from(u16_at(&entry[8..10]))),
             4 => Some(u32_at(&entry[8..12])),
             _ => None,
@@ -938,7 +940,9 @@ fn tiff_header(
         match u16_at(&entry[0..2]) {
             256 => width = number(&entry),
             257 => height = number(&entry),
-            277 => samples = number(&entry).unwrap_or(1),
+            // An entry that does not read is taken at the most samples a
+            // pixel is reckoned with, never the fewest.
+            277 => samples = number(&entry).unwrap_or(4),
             258 => bits_entry = Some(entry),
             // A quarter turn, 90 or 270 degrees, is EXIF orientation 5 to 8.
             274 => turned = matches!(number(&entry), Some(5..=8)),
@@ -948,21 +952,24 @@ fn tiff_header(
     let width = width?;
     let height = height?;
     // The widest a sample is, from the BitsPerSample entry. Its count is of
-    // 32 bits, as every entry's is; its values, SHORTs or LONGs, are in the
-    // value field if they fit, or at the offset it holds, read no further than
-    // the samples a pixel has, so a crafted count holds nothing. With no entry
-    // a sample is TIFF's default of one bit; with one that does not read, it
-    // is taken at the widest the decoder takes, never the narrowest.
+    // 32 bits, as every entry's is; its values, BYTEs, SHORTs or LONGs, are in
+    // the value field if they all fit there, or at the offset it holds, read
+    // no further than the samples a pixel has, so a crafted count holds
+    // nothing. With no entry a sample is TIFF's default of one bit; with one
+    // that does not read, it is taken at the widest the decoder takes, never
+    // the narrowest.
     let bits = match bits_entry {
         None => 1,
         Some(entry) => (|| {
             let size = match u16_at(&entry[2..4]) {
+                1 => 1,
                 3 => 2,
                 4 => 4,
                 _ => return None,
             };
-            let n = (u32_at(&entry[4..8]) as usize).min(samples.clamp(1, 16) as usize);
-            let values = if n * size <= 4 {
+            let count = u32_at(&entry[4..8]) as usize;
+            let n = count.min(samples.clamp(1, 16) as usize);
+            let values = if count.saturating_mul(size) <= 4 {
                 entry[8..12].to_vec()
             } else {
                 reader
@@ -975,10 +982,10 @@ fn tiff_header(
             (0..n)
                 .filter_map(|i| {
                     let value = values.get(size * i..size * (i + 1))?;
-                    Some(if size == 2 {
-                        u32::from(u16_at(value))
-                    } else {
-                        u32_at(value)
+                    Some(match size {
+                        1 => u32::from(value[0]),
+                        2 => u32::from(u16_at(value)),
+                        _ => u32_at(value),
                     })
                 })
                 .max()

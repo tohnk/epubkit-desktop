@@ -669,7 +669,11 @@ it to: eight or sixteen bits a sample at that depth, and 32 as the
 floating-point RGB or RGBA the decoder takes it as. An entry's count is of
 32 bits, in either byte order; a BitsPerSample entry that does not read is
 taken at the widest the decoder takes, and only a missing one at TIFF's
-default of a bit. Any other
+default of a bit. Its numbers are read as BYTEs, SHORTs or LONGs, as the
+decoder takes any of them: a width of a BYTE did not read at all, and samples
+a pixel of a BYTE were taken as one, so RGBA of 4000 x 3000 was reckoned as
+grey and held 144 MB where 117 were set aside. A SamplesPerPixel entry that
+does not read is taken as four samples, not one. Any other
 image's decoder is held to 8 MiB as it is made, the most a PNG's may keep of
 its text and EXIF chunks and unpack of its ICC profile, which with the
 buffers it doubles as they grow is 16 MiB at most, and 16 MiB is what is set

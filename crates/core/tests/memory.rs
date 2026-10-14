@@ -451,6 +451,72 @@ fn tiff_float(width: u32, height: u32, alpha: bool) -> Vec<u8> {
     out
 }
 
+/// An uncompressed little-endian TIFF of `width` x `height`, `samples`
+/// eight-bit samples a pixel (grey, or RGB and alpha), in one strip, its
+/// numbers written as BYTEs where they fit: its width, if it is under 256,
+/// and its samples a pixel. Its BitsPerSample is one value, for every sample.
+fn tiff_of_bytes(width: u32, height: u32, samples: u8) -> Vec<u8> {
+    let data = width as usize * height as usize * usize::from(samples);
+    let alpha = samples == 4;
+    let count = 9 + u16::from(alpha);
+    let data_at = 8 + 2 + 12 * u32::from(count) + 4;
+    let long = |v: u32| (4u16, v.to_le_bytes());
+    let short = |v: u16| (3u16, [v.to_le_bytes()[0], v.to_le_bytes()[1], 0, 0]);
+    let byte = |v: u8| (1u16, [v, 0, 0, 0]);
+    let mut entries = vec![
+        (256, u8::try_from(width).map_or_else(|_| long(width), byte)),
+        (257, long(height)),
+        (258, short(8)),
+        (259, short(1)),
+        (262, short(if samples > 2 { 2 } else { 1 })),
+        (273, long(data_at)),
+        (277, byte(samples)),
+        (278, long(height)),
+        (279, long(data as u32)),
+    ];
+    if alpha {
+        entries.push((338, short(2)));
+    }
+    let mut tiff = b"II".to_vec();
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&count.to_le_bytes());
+    for (tag, (kind, value)) in entries {
+        tiff.extend_from_slice(&u16::to_le_bytes(tag));
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&value);
+    }
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff.extend((0..data).map(|i| (i % 251) as u8));
+    tiff
+}
+
+/// A TIFF's numbers can be BYTEs, which its decoder reads as it reads SHORTs
+/// and LONGs, and its header is read so too. Its directory was read for
+/// SHORTs and LONGs alone: a width of a BYTE did not read, so nothing was
+/// reckoned for an image that converts; and samples a pixel of a BYTE were
+/// taken as one, so RGBA of 4000 x 3000 was reckoned as grey, and held 144 MB
+/// where 117 MB were set aside.
+#[test]
+fn a_tiffs_numbers_are_read_as_bytes_too() {
+    let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let options = ImageOptions::default();
+    for (name, bytes) in [
+        ("byte-width.tiff", tiff_of_bytes(200, 300, 1)),
+        ("byte-samples.tiff", tiff_of_bytes(4000, 3000, 4)),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        let needed = memory_needed(&path, &options).expect(name);
+        let (converted, peak) = peak_of(|| process_image(&bytes, name, &options));
+        assert!(converted.is_ok(), "{name}");
+        let held = (bytes.len() + peak) as u64;
+        assert!(held <= needed, "{name}: {held} held, {needed} set aside");
+    }
+}
+
 /// A TIFF is reckoned at the depth its decoder decodes it to. Its directory's
 /// entry counts are of 32 bits, and a big-endian one's sixteen-bit RGB was
 /// read as eight-bit, its count taken from the wrong half: one of 4000 x 3000
