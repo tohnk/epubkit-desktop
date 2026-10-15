@@ -259,6 +259,33 @@ fn a_walk_through_a_drop_stops_when_told() {
     assert_eq!(found.books.len(), 50);
 }
 
+/// A book reached twice in what was dropped, as itself and through a link to
+/// it or to its folder, is listed once, as it was first reached. Listed
+/// twice, it was made twice, the second as "… (2).epub".
+#[cfg(unix)]
+#[test]
+fn a_book_reached_twice_in_a_drop_is_listed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(root.join("Shelf")).unwrap();
+    let book = root.join("Shelf").join("book.epub");
+    std::fs::write(&book, b"").unwrap();
+    std::os::unix::fs::symlink(root.join("Shelf"), root.join("Again")).unwrap();
+    std::os::unix::fs::symlink(&book, root.join("Linked.epub")).unwrap();
+
+    let dropped = [&root, &book].map(|path| path.to_string_lossy().to_string());
+    let found = commands::find_books_until(&dropped, || false);
+
+    assert_eq!(
+        found.books,
+        [root
+            .join("Again")
+            .join("book.epub")
+            .to_string_lossy()
+            .to_string()]
+    );
+}
+
 /// A link to nothing, to a book on a card no longer in its reader say, is
 /// passed over: followed, it was named as a folder that could not be looked
 /// in, though it was looked in well enough, and was a file at that.

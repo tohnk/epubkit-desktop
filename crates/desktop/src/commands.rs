@@ -144,10 +144,10 @@ impl BookInfo {
 
 /// The books among what was dropped on the window: each EPUB itself, and
 /// those in each folder and the folders in it, linked in or not, folder by
-/// folder in the order a listing gives them; a link back up the tree is not
-/// followed. What is hidden is left out, a folder or a file: on a drive it
-/// does not format, an SD card say, macOS writes a `._` file beside each
-/// book, and it too ends in `.epub`.
+/// folder in the order a listing gives them, each once; a link back up the
+/// tree is not followed. What is hidden is left out, a folder or a file: on a
+/// drive it does not format, an SD card say, macOS writes a `._` file beside
+/// each book, and it too ends in `.epub`.
 ///
 /// Runs on a blocking worker: a library takes a while to walk. Stops, with
 /// what it found so far, once [`stop_finding`] is called.
@@ -181,6 +181,14 @@ pub fn find_books_until(paths: &[String], stopped: impl Fn() -> bool) -> Found {
     let hidden = |entry: &walkdir::DirEntry| {
         entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
     };
+    // A book reached twice, as itself and through a link to it or to its
+    // folder, is listed once, as it was first reached: listed twice, it was
+    // made twice. Its name stays the one it was reached by, which a book
+    // named after the file it came from is named by.
+    let mut reached = std::collections::HashSet::new();
+    let mut first = |path: &Path| {
+        reached.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    };
 
     let mut found = Found::default();
     for path in paths.iter().map(Path::new) {
@@ -204,7 +212,7 @@ pub fn find_books_until(paths: &[String], stopped: impl Fn() -> bool) -> Found {
                 }
                 match entry {
                     Ok(entry) => {
-                        if is_epub(entry.path()) && entry.path().is_file() {
+                        if is_epub(entry.path()) && entry.path().is_file() && first(entry.path()) {
                             found.books.push(entry.path().to_string_lossy().to_string());
                         }
                     }
@@ -222,7 +230,7 @@ pub fn find_books_until(paths: &[String], stopped: impl Fn() -> bool) -> Found {
                     Err(_) => {}
                 }
             }
-        } else if is_epub(path) && path.is_file() {
+        } else if is_epub(path) && path.is_file() && first(path) {
             found.books.push(path.to_string_lossy().to_string());
         }
     }
