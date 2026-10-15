@@ -292,25 +292,36 @@ async function addBooks(paths) {
     const list = listing;
     const pending = reading;
 
-    // What was dropped can be folders of books as well as books.
+    // What was dropped can be folders of books as well as books, which take a
+    // while to look through.
     let found;
     try {
+        note('Looking for books…');
         found = await invoke('find_books', { paths });
     } catch (error) {
         setStatus(`Could not look through what was dropped: ${error}`, true);
         return;
     }
     if (list !== listing) return;
-    if (found.length === 0) {
-        note('Nothing to add: no EPUB files in what was dropped.');
+    // A folder that could not be looked in is named, not passed over.
+    const shut = found.unreadable;
+    const unlooked = shut.length === 1
+        ? `could not look in ${basename(shut[0])}.`
+        : `could not look in ${shut.length} folders.`;
+    if (found.books.length === 0) {
+        note(`Nothing to add: ${shut.length > 0 ? unlooked : 'no EPUB files in what was dropped.'}`);
         return;
     }
+    const done = () => (shut.length > 0 ? note(`Books listed, but ${unlooked}`) : showReady());
 
     // A book dropped again while it is still being read is not listed twice.
-    const fresh = [...new Set(found)].filter(
+    const fresh = [...new Set(found.books)].filter(
         (path) => !pending.has(path) && !books.some((b) => b.path === path),
     );
-    if (fresh.length === 0) return;
+    if (fresh.length === 0) {
+        done();
+        return;
+    }
     for (const path of fresh) pending.add(path);
 
     // A large drop, a folder of books say, is read a few books at a time:
@@ -339,7 +350,7 @@ async function addBooks(paths) {
             renderBooks(from);
             read += batch.length;
         }
-        showReady();
+        done();
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
     } finally {

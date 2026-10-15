@@ -172,7 +172,8 @@ fn a_dropped_folder_gives_the_books_in_it() {
     .iter()
     .map(|path| text(path))
     .collect();
-    assert_eq!(found, expected);
+    assert_eq!(found.books, expected);
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
 }
 
 /// A folder linked into a dropped one is looked through as any other: a
@@ -196,9 +197,38 @@ fn a_dropped_folder_gives_the_books_in_folders_linked_into_it() {
     .unwrap();
 
     assert_eq!(
-        found,
+        found.books,
         [root.join("Linked/f.epub").to_string_lossy().to_string()]
     );
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
+}
+
+/// A folder that cannot be looked in is named: its books were left out with
+/// nothing said, and a drop of only such a folder read "Nothing to add".
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cannot_be_looked_in_is_named() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    let shut = root.join("Shut");
+    std::fs::create_dir_all(&shut).unwrap();
+    std::fs::write(shut.join("away.epub"), b"").unwrap();
+    std::fs::write(root.join("open.epub"), b"").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]));
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let found = found.unwrap();
+
+    assert_eq!(
+        found.books,
+        [root.join("open.epub").to_string_lossy().to_string()]
+    );
+    assert_eq!(found.unreadable, [shut.to_string_lossy().to_string()]);
 }
 
 /// A bad file must not sink the whole drop — it comes back as one failed entry

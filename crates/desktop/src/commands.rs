@@ -151,7 +151,7 @@ impl BookInfo {
 ///
 /// Runs on a blocking worker: a library takes a while to walk.
 #[tauri::command]
-pub async fn find_books(paths: Vec<String>) -> Response<Vec<String>> {
+pub async fn find_books(paths: Vec<String>) -> Response<Found> {
     tauri::async_runtime::spawn_blocking(move || {
         let is_epub = |path: &Path| {
             path.extension()
@@ -161,7 +161,7 @@ pub async fn find_books(paths: Vec<String>) -> Response<Vec<String>> {
             entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
         };
 
-        let mut found = Vec::new();
+        let mut found = Found::default();
         for path in paths.iter().map(Path::new) {
             if path.is_dir() {
                 let entries = walkdir::WalkDir::new(path)
@@ -173,21 +173,40 @@ pub async fn find_books(paths: Vec<String>) -> Response<Vec<String>> {
                         name(a).cmp(&name(b))
                     })
                     .into_iter()
-                    .filter_entry(|entry| !hidden(entry))
-                    .flatten();
+                    .filter_entry(|entry| !hidden(entry));
                 for entry in entries {
-                    if is_epub(entry.path()) && entry.path().is_file() {
-                        found.push(entry.path().to_string_lossy().to_string());
+                    match entry {
+                        Ok(entry) => {
+                            if is_epub(entry.path()) && entry.path().is_file() {
+                                found.books.push(entry.path().to_string_lossy().to_string());
+                            }
+                        }
+                        // A link back up the tree is no folder to look in.
+                        Err(error) if error.loop_ancestor().is_some() => {}
+                        Err(error) => found
+                            .unreadable
+                            .push(error.path().unwrap_or(path).to_string_lossy().to_string()),
                     }
                 }
             } else if is_epub(path) && path.is_file() {
-                found.push(path.to_string_lossy().to_string());
+                found.books.push(path.to_string_lossy().to_string());
             }
         }
         found
     })
     .await
     .map_err(to_message)
+}
+
+/// What was dropped on the window holds.
+#[derive(Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Found {
+    /// The books, in the order they were found.
+    pub books: Vec<String>,
+    /// The folders that could not be looked in. Left out with nothing said,
+    /// a drop of only such a folder read as one with no books in it.
+    pub unreadable: Vec<String>,
 }
 
 /// Read metadata and a cover thumbnail for each dropped book.
