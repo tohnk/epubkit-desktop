@@ -305,6 +305,8 @@ fn store_metadata_is_stripped_but_real_metadata_survives() {
     <dc:creator>Keep Me Too</dc:creator>
     <meta name="calibre:timestamp" content="2020-01-01"/>
     <meta name="calibre:title_sort" content="Keep Me"/>
+    <meta name="calibre:series" content="Keepers"/>
+    <meta name="calibre:series_index" content="2"/>
     <meta name="ibooks:version" content="1.0"/>
     <meta name="amazon:asin" content="B00X"/>
     <meta name="cover" content="cov"/>
@@ -323,6 +325,10 @@ fn store_metadata_is_stripped_but_real_metadata_survives() {
     assert_eq!(metadata.author, "Keep Me Too");
     // The cover pointer is not store cruft and must be left alone.
     assert_eq!(metadata.cover_id, "cov");
+    // Nor is a series, which Calibre's tags give an EPUB 2 book, having no
+    // tag of its own for one: CrossInk sorts its library by them.
+    assert_eq!(metadata.series, "Keepers");
+    assert_eq!(metadata.series_index, "2");
 }
 
 #[test]

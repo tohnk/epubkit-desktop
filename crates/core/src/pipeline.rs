@@ -318,8 +318,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     if !options.metadata_edits.is_empty() {
         metadata::update_metadata(&opf, &options.metadata_edits)?;
     }
-    // What the book is named from, read now: cleaning the metadata strips an
-    // EPUB 2 book's series, kept in Calibre's tags, before the name is made.
+    // What the book is named from, read now, before cleaning the metadata
+    // takes anything out of it.
     let naming = metadata::extract_metadata(&opf)?;
 
     let content = structure::find_content_files(work_dir, &opf_dir, &opf)?;

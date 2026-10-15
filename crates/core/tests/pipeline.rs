@@ -1757,13 +1757,14 @@ fn the_output_is_named_as_chosen() {
     assert_eq!(report.output_filename, "The Long Afternoon (in).epub");
 }
 
-/// A book's series names it however its metadata is cleaned. Under EPUB 2 a
-/// series is kept in Calibre's `<meta>` tags, which cleaning the metadata
-/// strips from the book, and the name was made from what was left, so
-/// `{series} {series_index} - {title}` named the book `The Long
-/// Afternoon.epub` under the default preset, as the Python original did.
+/// A book's series names it, and stays in it, however its metadata is
+/// cleaned. Under EPUB 2 a series is kept in Calibre's `<meta>` tags, which
+/// cleaning the metadata stripped from the book, as the Python original does,
+/// and the name was made from what was left: `{series} {series_index} -
+/// {title}` named the book `The Long Afternoon.epub` under the default
+/// preset, and CrossInk, which sorts its library by series, found none.
 #[test]
-fn a_series_names_the_book_however_its_metadata_is_cleaned() {
+fn a_series_names_the_book_and_stays_in_it_however_its_metadata_is_cleaned() {
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -1802,6 +1803,16 @@ fn a_series_names_the_book_however_its_metadata_is_cleaned() {
         let report = process_epub(&input, &output, &options, |_, _| {}).unwrap();
         assert_eq!(
             report.output_filename, "Afternoons 2 - The Long Afternoon.epub",
+            "metadata cleaned: {clean_metadata}"
+        );
+
+        let work = tempfile::tempdir().unwrap();
+        package::extract_epub(&output, work.path()).unwrap();
+        let opf = xml::parse_file(&work.path().join("OEBPS/content.opf")).unwrap();
+        let kept = metadata::extract_metadata(&opf).unwrap();
+        assert_eq!(
+            (kept.series.as_str(), kept.series_index.as_str()),
+            ("Afternoons", "2"),
             "metadata cleaned: {clean_metadata}"
         );
     }

@@ -25,8 +25,6 @@ const STORE_META_NAMES: &[&str] = &[
     "calibre:timestamp",
     "calibre:title_sort",
     "calibre:author_link_map",
-    "calibre:series",
-    "calibre:series_index",
     "calibre:rating",
     "calibre:user_categories",
     "calibre:user_metadata",
@@ -37,6 +35,11 @@ const STORE_META_NAMES: &[&str] = &[
 ];
 
 const STORE_META_PREFIXES: &[&str] = &["calibre:", "ibooks:", "amazon:", "kindle:"];
+
+/// Calibre's tags for a book's series, kept with the book's own metadata:
+/// EPUB 2 has none of its own for one, and readers take these, CrossInk to
+/// sort its library by.
+const SERIES_META_NAMES: &[&str] = &["calibre:series", "calibre:series_index"];
 
 /// Characters that cause trouble in filenames, and what to put in their place.
 const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
@@ -288,7 +291,8 @@ fn set_text(doc: &Document, element: &mut Node, value: &str) {
     element.append_text(value).ok();
 }
 
-/// Remove store- and reader-specific `<meta>` entries. Returns how many went.
+/// Remove store- and reader-specific `<meta>` entries, all but a book's
+/// series. Returns how many went.
 pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
     let Some(metadata_el) = xml::find_first(doc, &format!("//{}", xml::local("metadata")))? else {
         return Ok(0);
@@ -302,10 +306,11 @@ pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
         let name = meta.get_attribute("name").unwrap_or_default();
         let property = meta.get_attribute("property").unwrap_or_default();
 
-        let is_store_tag = STORE_META_NAMES.contains(&name.as_str())
-            || STORE_META_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix) || property.starts_with(prefix));
+        let is_store_tag = !SERIES_META_NAMES.contains(&name.as_str())
+            && (STORE_META_NAMES.contains(&name.as_str())
+                || STORE_META_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix) || property.starts_with(prefix)));
 
         if is_store_tag {
             xml::discard(doc, meta);
