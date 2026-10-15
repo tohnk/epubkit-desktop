@@ -16,6 +16,9 @@ Finder.
   Pressed twice, Cmd+Q should quit at once.
 - [ ] **Closing the window during a run.** As above, with the window's close
   button.
+- [ ] **Closing the window with no run.** The app should quit with it, and
+  not stay in the Dock. Tauri's source says it does: closing the last window
+  asks the app to exit, and nothing puts it off without a run.
 - [ ] **Quit from the Dock during a run.** Right-click the Dock icon, then
   Quit. The app may take a moment, then should quit, again leaving no
   `.part` file.

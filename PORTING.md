@@ -109,11 +109,19 @@ pinned by tests:
   against each other, and `the_page_listens_for_the_events_the_app_emits`
   holds the events the app emits to those the page listens for: renamed on
   one side only, a run's progress would stand still and no result would show.
+  So, too, `the_page_invokes_each_command_with_the_arguments_it_takes` holds
+  the arguments of each call to the command's parameters, camelCased as
+  Tauri looks for them; `the_page_reads_only_what_the_app_sends` holds each
+  field the page reads off a result, a book, an event or the settings to the
+  ones the app serializes, a result's camelCased sizes among them; and
+  `the_page_has_every_element_its_script_looks_up` holds the script's ids to
+  the page's.
 
 A run of books can be stopped. Stop, beside Processing, stops the book being
 made, which is not written, and begins no other, each then saying it was
 stopped; closed or quit during a run, the window says "Stopping, then
-closing…", stops the run, and goes once it has. The system's Quit, Cmd+Q's,
+closing…", stops the run, and goes once it has, the app with it: closing
+its one window ends the app, run or no run. The system's Quit, Cmd+Q's,
 ended the app with no exit request to put off, tao handling only
 `applicationWillTerminate`, so on macOS the menu's Quit is the window's own;
 ended any other way, quit from the Dock say, the app still waits up to ten
@@ -131,7 +139,8 @@ dropped with it.
 A folder dropped on the window, or chosen with "choose a folder", gives the
 books in it and in the folders in it, linked in or not, leaving out what is
 hidden, as the `._` file macOS writes beside each book on an SD card is; it
-did nothing. A folder that cannot be looked in is named, where it was passed
+did nothing. A book reached twice, as itself and through a link, is listed
+once. A folder that cannot be looked in is named, where it was passed
 over and a drop of only such a folder read "Nothing to add"; a link to
 nothing, a book on a card no longer in its reader say, is passed over. Looking
 through what was dropped can be stopped once it takes more than a moment, a
@@ -148,7 +157,13 @@ passes a dropped folder has not been tried, but the file chooser portal
 gives "choose a folder" the folder chosen.
 
 A stop is kept to while the book is packed, the last step, as at any other:
-the run went on to write the book there, having said it was stopping.
+the run went on to write the book there, having said it was stopping. Within
+a step, it is kept to before the next document, image or file the run would
+begin, not at the step's end: a step over every chapter of a long book took
+seconds, up to 1.7 on a Bible of 1196 documents, and a quit from the Dock
+gives a run ten. A run is over however it ends, a panic past every book's
+own catch too, which left it running, so that the window waited on it to
+close.
 
 ## Using the CLI
 
