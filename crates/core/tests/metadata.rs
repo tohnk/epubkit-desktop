@@ -380,6 +380,25 @@ fn an_extension_is_found_once_the_name_is_clean() {
     assert_eq!(format_filename("Book - .epub", ""), "Book.epub");
 }
 
+/// A field a template leaves empty does not leave the dashes either side of
+/// it: `{author} - {series} - {title}` named a book in no series
+/// `Jane Author - - The Book Title.epub`.
+#[test]
+fn an_empty_field_does_not_leave_its_separators() {
+    let book = book("The Book Title", "Jane Author");
+    for (template, expected) in [
+        (
+            "{author} - {series} - {title}",
+            "Jane Author - The Book Title.epub",
+        ),
+        ("{series} - {series_index} - {title}", "The Book Title.epub"),
+        ("{title} - {series} -- {year}", "The Book Title.epub"),
+    ] {
+        let name = named(&book, FilenameFormat::Custom, template, "x.epub");
+        assert_eq!(name, expected, "{template}");
+    }
+}
+
 /// Truncation counts characters, not bytes — slicing a multi-byte codepoint
 /// would panic.
 #[test]

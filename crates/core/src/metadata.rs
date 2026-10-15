@@ -63,6 +63,10 @@ const MAX_TEMPLATE_CHARS: usize = 200;
 /// The year in a `dc:date`, which may be a bare year, a date, or a timestamp.
 static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{4})\b").unwrap());
 
+/// Dashes with only spaces between them, as a template leaves either side of
+/// a field it fills with nothing.
+static EMPTY_BETWEEN_DASHES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-(?: *-)+").unwrap());
+
 /// What a custom filename template can fill in.
 pub const TEMPLATE_FIELDS: &[&str] = &[
     "title",
@@ -675,5 +679,9 @@ fn sanitize_filename(name: &str) -> String {
 
     // A name ending in a dot or a dash looks broken, and Windows drops a
     // trailing dot altogether; leading ones hide the file or read as flags.
+    // A field a template fills with nothing leaves the dashes either side of
+    // it, `Author - - Title`; one of them is enough.
+    let collapsed = EMPTY_BETWEEN_DASHES.replace_all(&collapsed, "-");
+
     collapsed.trim_matches([' ', '.', '-']).to_string()
 }
