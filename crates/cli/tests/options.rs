@@ -102,6 +102,62 @@ fn a_broken_saved_template_stops_only_a_run_it_would_name() {
     }
 }
 
+/// Each option the command line sets, it sets either way, and the run after
+/// it, the window's too, starts from what it set. The flags only turned
+/// options off, Light Novel mode only on, and contrast boost not at all: one
+/// `--no-grayscale` took grayscale from every run after it, with no flag to
+/// give it back but a preset, which reset everything else.
+#[test]
+fn every_option_can_be_turned_on_and_off() {
+    let home = tempfile::tempdir().unwrap();
+    write_book(&home.path().join("in.epub"));
+    let run = |flags: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_epubkit"))
+            .args(["optimize", "in.epub", "-o", "out.epub"])
+            .args(flags)
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(output.status.success(), "{flags:?}: {said}");
+        settings_files(home.path())
+            .iter()
+            .find_map(|file| std::fs::read_to_string(file).ok())
+            .expect("the run saved its settings")
+    };
+
+    for (option, on, off) in [
+        ("grayscale", "--grayscale", "--no-grayscale"),
+        ("contrast_boost", "--contrast-boost", "--no-contrast-boost"),
+        ("remove_fonts", "--font-removal", "--no-font-removal"),
+        ("remove_unused_css", "--css-cleanup", "--no-css-cleanup"),
+        ("text_cleanup", "--text-cleanup", "--no-text-cleanup"),
+        (
+            "clean_metadata",
+            "--metadata-cleanup",
+            "--no-metadata-cleanup",
+        ),
+        ("light_novel_mode", "--light-novel", "--no-light-novel"),
+    ] {
+        for (flags, value) in [
+            (vec![off], false),
+            (vec![], false),
+            (vec![on], true),
+            (vec![], true),
+            (vec![on, off], false),
+            (vec![off, on], true),
+        ] {
+            let saved = run(&flags);
+            assert!(
+                saved.contains(&format!("\n{option} = {value}\n")),
+                "{flags:?} should leave {option} {value}:\n{saved}"
+            );
+        }
+    }
+}
+
 /// JPEG quality is 20 to 95, as the CLI's help says and the app's slider
 /// allows. Any byte was taken, and remembered for every run after it:
 /// `--quality 9`, for 90, made each book from then on at the worst quality the

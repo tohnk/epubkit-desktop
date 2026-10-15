@@ -58,8 +58,11 @@ enum Command {
         )]
         quality: Option<u8>,
         /// Rotate and split landscape artwork for vertical reading.
-        #[arg(long)]
+        #[arg(long, overrides_with = "no_light_novel")]
         light_novel: bool,
+        /// Leave landscape artwork as it is.
+        #[arg(long, overrides_with = "light_novel")]
+        no_light_novel: bool,
         /// Override the book's title.
         #[arg(long)]
         title: Option<String>,
@@ -75,20 +78,41 @@ enum Command {
         /// --filename custom.
         #[arg(long, value_name = "TEMPLATE")]
         filename_template: Option<String>,
+        /// Turn images grayscale, in the panel's levels.
+        #[arg(long, overrides_with = "no_grayscale")]
+        grayscale: bool,
         /// Keep images in colour.
-        #[arg(long)]
+        #[arg(long, overrides_with = "grayscale")]
         no_grayscale: bool,
+        /// Raise the contrast of images.
+        #[arg(long, overrides_with = "no_contrast_boost")]
+        contrast_boost: bool,
+        /// Leave the contrast of images as it is.
+        #[arg(long, overrides_with = "contrast_boost")]
+        no_contrast_boost: bool,
+        /// Remove embedded fonts.
+        #[arg(long, overrides_with = "no_font_removal")]
+        font_removal: bool,
         /// Keep embedded fonts.
-        #[arg(long)]
+        #[arg(long, overrides_with = "font_removal")]
         no_font_removal: bool,
+        /// Remove unused CSS rules.
+        #[arg(long, overrides_with = "no_css_cleanup")]
+        css_cleanup: bool,
         /// Keep unused CSS rules.
-        #[arg(long)]
+        #[arg(long, overrides_with = "css_cleanup")]
         no_css_cleanup: bool,
+        /// Fix spacing, OCR errors and encoding in the text.
+        #[arg(long, overrides_with = "no_text_cleanup")]
+        text_cleanup: bool,
         /// Leave text content exactly as written.
-        #[arg(long)]
+        #[arg(long, overrides_with = "text_cleanup")]
         no_text_cleanup: bool,
+        /// Remove store and reader metadata, but for a book's series.
+        #[arg(long, overrides_with = "no_metadata_cleanup")]
+        metadata_cleanup: bool,
         /// Keep store and reader metadata.
-        #[arg(long)]
+        #[arg(long, overrides_with = "metadata_cleanup")]
         no_metadata_cleanup: bool,
         /// Process this book without remembering the choices.
         #[arg(long)]
@@ -157,14 +181,22 @@ fn main() -> Result<()> {
             device,
             quality,
             light_novel,
+            no_light_novel,
             title,
             author,
             filename,
             filename_template,
+            grayscale,
             no_grayscale,
+            contrast_boost,
+            no_contrast_boost,
+            font_removal,
             no_font_removal,
+            css_cleanup,
             no_css_cleanup,
+            text_cleanup,
             no_text_cleanup,
+            metadata_cleanup,
             no_metadata_cleanup,
             no_save,
         } => {
@@ -181,30 +213,38 @@ fn main() -> Result<()> {
                 settings.device = profile.id.to_string();
             }
 
-            // Each flag can only turn something off, so saved settings stay the
-            // base and an unmentioned option keeps whatever it had.
+            // Saved settings stay the base: each option is turned on or off by
+            // its pair of flags, the later one given, and one not mentioned
+            // keeps whatever it had.
             let mut customized = false;
-            let mut turn_off = |current: &mut bool, flag: bool| {
-                if flag && *current {
-                    *current = false;
+            let mut set = |current: &mut bool, on: bool, off: bool| {
+                if (on || off) && *current != on {
+                    *current = on;
                     customized = true;
                 }
             };
-            turn_off(&mut settings.options.grayscale, no_grayscale);
-            turn_off(&mut settings.options.remove_fonts, no_font_removal);
-            turn_off(&mut settings.options.remove_unused_css, no_css_cleanup);
-            turn_off(&mut settings.options.text_cleanup, no_text_cleanup);
-            turn_off(&mut settings.options.clean_metadata, no_metadata_cleanup);
+            let options = &mut settings.options;
+            set(&mut options.grayscale, grayscale, no_grayscale);
+            set(
+                &mut options.contrast_boost,
+                contrast_boost,
+                no_contrast_boost,
+            );
+            set(&mut options.remove_fonts, font_removal, no_font_removal);
+            set(&mut options.remove_unused_css, css_cleanup, no_css_cleanup);
+            set(&mut options.text_cleanup, text_cleanup, no_text_cleanup);
+            set(
+                &mut options.clean_metadata,
+                metadata_cleanup,
+                no_metadata_cleanup,
+            );
+            set(&mut options.light_novel_mode, light_novel, no_light_novel);
 
             if let Some(quality) = quality {
                 if settings.options.quality != quality {
                     settings.options.quality = quality;
                     customized = true;
                 }
-            }
-            if light_novel && !settings.options.light_novel_mode {
-                settings.options.light_novel_mode = true;
-                customized = true;
             }
             if customized {
                 settings.mark_customized();

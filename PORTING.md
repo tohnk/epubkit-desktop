@@ -139,8 +139,12 @@ every preset change. How finished books are named is kept apart the same way:
 it is about the user's library, not about any one way of processing.
 
 On the CLI, saved settings are the base and the flags are overrides: each
-`--no-*` flag can only turn something off, so an option nobody mentioned keeps
-whatever it had. `--filename` and `--filename-template` are remembered too.
+option has a pair, `--grayscale` and `--no-grayscale` and so on, the later
+given winning, and an option nobody mentioned keeps whatever it had. The flags
+only turned options off, Light Novel mode only on, and contrast boost not at
+all, so one `--no-grayscale`, remembered, took grayscale from every run after
+it, the window's too, with no flag to give it back but a preset, which reset
+everything else. `--filename` and `--filename-template` are remembered too.
 Metadata edits (`--title`, `--author`) are about one book and are never
 persisted. `--quality` is refused outside 20 to 95, the range the window's
 slider allows; any byte was taken, and remembered, so `--quality 9` meant as
