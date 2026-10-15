@@ -490,9 +490,17 @@ pub fn stop_before_closing<R: Runtime>(app: &AppHandle<R>) -> bool {
 }
 
 /// For an app ending with no say in it, quit from the Dock say: stop the run
-/// under way, and wait for it, a while, to take its files with it.
+/// under way, and wait for it, a while, to take its files with it. A run that
+/// has not stopped by then is left to end with the app, and leaves its
+/// staging file and the book unpacked behind it; with no window left to say
+/// so in, it is said where a terminal that started the app will show it.
 pub fn stop_before_exiting() {
-    RUN.stop_and_wait(Duration::from_secs(10));
+    if !RUN.stop_and_wait(Duration::from_secs(10)) {
+        eprintln!(
+            "epubkit: the run had not stopped when the app ended; \
+             its unfinished files may be left behind"
+        );
+    }
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.
