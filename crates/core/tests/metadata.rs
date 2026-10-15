@@ -420,8 +420,18 @@ fn an_empty_field_does_not_leave_its_brackets() {
         ("{title} [{series} - {series_index}]", "The Book Title.epub"),
         ("{title} ({series} [{series_index}])", "The Book Title.epub"),
         ("{title} {{{year}}}", "The Book Title.epub"),
-        // What is in them stays, with the brackets.
+        // What is in them stays, with the brackets: an empty pair beside
+        // one took its other half, `[Jane Author The Book Title.epub`.
         ("{title} (#{series_index})", "The Book Title (#).epub"),
+        (
+            "[{author} ({year})] {title}",
+            "[Jane Author] The Book Title.epub",
+        ),
+        (
+            "[({year}) {author}] {title}",
+            "[Jane Author] The Book Title.epub",
+        ),
+        ("({series} [{year}]) - {title}", "The Book Title.epub"),
     ] {
         let name = named(&book, FilenameFormat::Custom, template, "x.epub");
         assert_eq!(name, expected, "{template}");
