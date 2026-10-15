@@ -337,30 +337,81 @@ impl Outcome {
     }
 }
 
-/// Set to stop the run under way at its next step.
-static STOP: AtomicBool = AtomicBool::new(false);
-/// Set while books are being optimized.
-static RUNNING: AtomicBool = AtomicBool::new(false);
-/// Set when the window was closed during a run, to close once it has stopped.
-static CLOSE_WHEN_STOPPED: AtomicBool = AtomicBool::new(false);
+/// Whether books are being optimized, and what has been asked of the run.
+pub struct RunState {
+    /// Set to stop the run under way at its next step.
+    stop: AtomicBool,
+    /// Set while books are being optimized.
+    running: AtomicBool,
+    /// Set when the window was closed during a run, to close once it stops.
+    close_when_stopped: AtomicBool,
+}
+
+impl RunState {
+    pub const fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            close_when_stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// A run begins, forgetting any stop told to the last one. Gives the flag
+    /// that stops it.
+    pub fn begin(&self) -> &AtomicBool {
+        self.stop.store(false, Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
+        &self.stop
+    }
+
+    /// Stop the run under way.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the window, asked to close, must wait. During a run it stops
+    /// the run, and closes once that has stopped, so the run takes the files
+    /// it was making with it, as it cannot if the program simply ends. Asked
+    /// again meanwhile, it closes there and then.
+    pub fn stop_before_closing(&self) -> bool {
+        if self.running.load(Ordering::SeqCst)
+            && !self.close_when_stopped.swap(true, Ordering::SeqCst)
+        {
+            self.stop();
+            return true;
+        }
+        false
+    }
+
+    /// The run is over: whether the window is to close now, as it was asked
+    /// to during the run. The run is marked over first, so that the close
+    /// this asks for is not taken for one during a run, and put off again.
+    pub fn end(&self) -> bool {
+        self.running.store(false, Ordering::SeqCst);
+        self.close_when_stopped.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl Default for RunState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The window's run.
+static RUN: RunState = RunState::new();
 
 /// Stop the run under way: the book being made is not written, and no other
 /// is begun.
 #[tauri::command]
 pub fn stop_run() {
-    STOP.store(true, Ordering::SeqCst);
+    RUN.stop();
 }
 
-/// Whether the window, asked to close, must wait. During a run it stops the
-/// run, and closes once that has stopped, so the run takes the files it was
-/// making with it, as it cannot if the program simply ends. Asked again
-/// meanwhile, it closes there and then.
+/// Whether the window, asked to close, must wait for the run to stop: see
+/// [`RunState::stop_before_closing`].
 pub fn stop_before_closing() -> bool {
-    if RUNNING.load(Ordering::SeqCst) && !CLOSE_WHEN_STOPPED.swap(true, Ordering::SeqCst) {
-        STOP.store(true, Ordering::SeqCst);
-        return true;
-    }
-    false
+    RUN.stop_before_closing()
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.
@@ -376,14 +427,13 @@ pub async fn optimize_books(
     settings: Settings,
 ) -> Response<Vec<Outcome>> {
     tauri::async_runtime::spawn_blocking(move || {
-        STOP.store(false, Ordering::SeqCst);
-        RUNNING.store(true, Ordering::SeqCst);
+        let stop = RUN.begin();
         let total = jobs.len();
         let outcomes = optimize_all(
             &jobs,
             Path::new(&destination),
             &settings,
-            &STOP,
+            stop,
             |index, percent, message| {
                 let _ = app.emit(
                     "progress",
@@ -400,8 +450,7 @@ pub async fn optimize_books(
                 let _ = app.emit("finished", outcome.clone());
             },
         );
-        RUNNING.store(false, Ordering::SeqCst);
-        if CLOSE_WHEN_STOPPED.swap(false, Ordering::SeqCst) {
+        if RUN.end() {
             app.exit(0);
         }
         Ok(outcomes)

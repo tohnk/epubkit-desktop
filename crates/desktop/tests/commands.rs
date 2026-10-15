@@ -517,6 +517,34 @@ fn a_stopped_run_writes_nothing_more_and_says_so() {
     assert!(outcomes.iter().all(|outcome| !outcome.stopped));
 }
 
+/// Closed during a run, the window waits for the run to stop and then closes;
+/// closed again meanwhile, it closes at once. The close the run's end asks
+/// for is not put off in its turn as one asked during a run, which it was
+/// not only because the run was marked over before that close was asked.
+#[test]
+fn closing_during_a_run_stops_it_and_closes_once_it_has() {
+    let run = commands::RunState::new();
+    assert!(!run.stop_before_closing(), "with no run, the window closes");
+
+    let stop = run.begin();
+    assert!(run.stop_before_closing(), "during a run, it waits");
+    assert!(stop.load(Ordering::SeqCst), "and the run is told to stop");
+    assert!(
+        !run.stop_before_closing(),
+        "closed again, it closes at once"
+    );
+
+    assert!(run.end(), "the run over, the window closes");
+    assert!(!run.stop_before_closing(), "and that close is not put off");
+
+    // A run the window was not closed during leaves it open, and the next
+    // run forgets the stop told to the last.
+    run.stop();
+    let stop = run.begin();
+    assert!(!stop.load(Ordering::SeqCst));
+    assert!(!run.end());
+}
+
 /// A book whose run panics fails on its own, as one whose run errs does. The
 /// panic went up through the window's run of every book dropped with it:
 /// those after it were never made, and the page was told only that the run
