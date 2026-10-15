@@ -150,7 +150,13 @@ pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
     // Making each cover's thumbnail is most of the time a drop takes, so the
     // books are read a few at a time.
     tauri::async_runtime::spawn_blocking(move || {
-        map_in_parallel(&paths, |path| inspect_one(Path::new(path)))
+        map_in_parallel(&paths, |path| {
+            let path = Path::new(path);
+            unless_it_panics(
+                || inspect_one(path),
+                |message| BookInfo::failed(path, message),
+            )
+        })
     })
     .await
     .map_err(to_message)
@@ -338,9 +344,13 @@ pub fn optimize_one(
         Err(error) => return failed(error.to_string()),
     };
 
-    let report = match process_epub(&input, staging.path(), &options, progress) {
+    let run = unless_it_panics(
+        || process_epub(&input, staging.path(), &options, progress).map_err(to_message),
+        Err,
+    );
+    let report = match run {
         Ok(report) => report,
-        Err(error) => return failed(error.to_string()),
+        Err(error) => return failed(error),
     };
 
     let final_path = match metadata::publish(staging, &destination.join(&report.output_filename)) {
@@ -358,6 +368,20 @@ pub fn optimize_one(
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// What `work` gives, or if it panics, what `failed` makes of the panic. A
+/// panic is a bug, but one book's: it went up through every book read or run
+/// with it, and the window learned of none of them.
+fn unless_it_panics<R>(work: impl FnOnce() -> R, failed: impl FnOnce(String) -> R) -> R {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        failed(format!("internal error: {message}"))
+    })
+}
 
 fn file_name(path: &Path) -> String {
     path.file_name()

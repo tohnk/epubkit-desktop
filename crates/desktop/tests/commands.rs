@@ -373,6 +373,33 @@ fn a_failed_run_removes_nothing_it_did_not_make() {
     );
 }
 
+/// A book whose run panics fails on its own, as one whose run errs does. The
+/// panic went up through the window's run of every book dropped with it:
+/// those after it were never made, and the page was told only that the run
+/// had failed, not which of the books before it had been written.
+#[test]
+fn a_book_whose_run_panics_fails_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book.epub");
+    demo_epub(&book);
+    let out = tempfile::tempdir().unwrap();
+    let settings = naming(FilenameFormat::AuthorTitle);
+
+    let outcome = commands::optimize_one(&job(&book), out.path(), &settings, |percent, _| {
+        assert!(percent < 50, "a bug halfway through the book");
+    });
+
+    assert!(outcome.output.is_none());
+    let error = outcome.error.expect("the panic is the book's error");
+    assert!(error.contains("a bug halfway through the book"), "{error}");
+    // Its staging file went with it.
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    // And the next book is made as ever.
+    let next = commands::optimize_one(&job(&book), out.path(), &settings, |_, _| {});
+    assert!(next.error.is_none(), "{:?}", next.error);
+}
+
 /// A book is written to a file of its own making, not through a link that
 /// happens to sit where it might have been written.
 #[cfg(unix)]
