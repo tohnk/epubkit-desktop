@@ -3,8 +3,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use epubkit_core::pipeline::{process_epub, ProcessingOptions, ProcessingReport};
+use epubkit_core::pipeline::{
+    process_epub, process_epub_stoppable, ProcessingOptions, ProcessingReport,
+};
 use epubkit_core::{metadata, package, structure, xml, Error};
 
 /// A book exercising every step: two chapters (one malformed, with store
@@ -104,6 +107,43 @@ fn produces_a_valid_epub() {
 
     let validation = package::validate_epub(&output).unwrap();
     assert!(validation.is_valid(), "problems: {:?}", validation.problems);
+}
+
+/// A run told to stop stops at its next step, an image not begun among them,
+/// and writes no book. Nothing could stop one but ending the program, which
+/// left its staging file beside where the book was going, and the whole book
+/// unpacked in the temporary directory.
+#[test]
+fn a_run_told_to_stop_stops_at_its_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    write_demo_epub(&input);
+
+    // Before the book is unpacked, before its images, and after them.
+    for stop_at in [2, 15, 66] {
+        let stop = AtomicBool::new(false);
+        let mut reached = Vec::new();
+        let result = process_epub_stoppable(
+            &input,
+            &output,
+            &ProcessingOptions::default(),
+            |percent, _| {
+                reached.push(percent);
+                if percent == stop_at {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            &stop,
+        );
+
+        assert!(
+            matches!(result, Err(Error::Stopped)),
+            "{stop_at}: {result:?}"
+        );
+        assert_eq!(reached.last(), Some(&stop_at), "{reached:?}");
+        assert!(!output.exists(), "{stop_at}");
+    }
 }
 
 #[test]

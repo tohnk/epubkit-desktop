@@ -41,6 +41,10 @@ pub enum Error {
     #[error("this EPUB is DRM-protected; remove the DRM first (e.g. with DeDRM and Calibre)")]
     DrmProtected,
 
+    /// The run was told to stop, and took what it had made with it.
+    #[error("stopped before it was finished")]
+    Stopped,
+
     #[error(
         "{} is too large to read: {} MB, where a document may be {} MB",
         path.display(),
