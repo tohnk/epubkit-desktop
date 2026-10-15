@@ -39,6 +39,8 @@ let devices = [];
 let running = false;
 /** Set once Stop is pressed, until the run has stopped. */
 let stopping = false;
+/** Whether the footer shows the ready line, not a message to be read. */
+let readyShown = false;
 
 // ------------------------------------------------------------------- startup
 
@@ -70,6 +72,7 @@ function showReady() {
     const device = devices.find((d) => d.id === settings.device);
     const name = device ? `${device.label} · ${device.width}×${device.height}` : settings.device;
     setStatus(`Ready · ${name} · ${presetLabel()}`);
+    readyShown = true;
 }
 
 function presetLabel() {
@@ -232,19 +235,44 @@ function persist() {
     }, 250);
 }
 
-/// Write a change that is still waiting, for a command that reads the file.
+/// Write a change that is still waiting, and wait for any save under way, for
+/// a command that reads the file.
 async function flushPersist() {
-    if (persistTimer === null) return;
-    clearTimeout(persistTimer);
-    persistTimer = null;
-    await save();
+    if (persistTimer !== null) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+        save();
+    }
+    await saving;
 }
 
-async function save() {
-    try {
-        await invoke('save_settings', { settings });
-    } catch (error) {
+/** The save last begun, for a read of the file to wait for. */
+let saving = Promise.resolve();
+
+function save() {
+    saving = invoke('save_settings', { settings }).catch((error) => {
         setStatus(`Could not save settings: ${error}`, true);
+    });
+    return saving;
+}
+
+/// Read the settings again as the window comes back to the front: the
+/// command line may have changed them meanwhile, and the page's copy, saved
+/// whole at its next change, would undo what it did.
+async function reloadSettings() {
+    try {
+        await flushPersist();
+        const next = await invoke('load_settings');
+        const wasReady = readyShown;
+        settings = next;
+        renderDevices();
+        renderPresets();
+        renderOptions();
+        renderFilename();
+        // A run's outcome, or an error, stays in the footer until it is read.
+        if (wasReady) showReady();
+    } catch (error) {
+        setStatus(`Could not load settings: ${error}`, true);
     }
 }
 
@@ -441,6 +469,7 @@ function wireEvents() {
 
     // Tauri delivers OS drag-and-drop as a window event, not a DOM one.
     listen('tauri://drag-drop', (event) => addBooks(event.payload.paths ?? []));
+    listen('tauri://focus', reloadSettings);
     listen('tauri://drag-enter', () => dropZone.classList.add('dragover'));
     listen('tauri://drag-leave', () => dropZone.classList.remove('dragover'));
     listen('tauri://drag-drop', () => dropZone.classList.remove('dragover'));
@@ -598,6 +627,7 @@ function outcomeKind(outcome) {
 function setStatus(message, isError = false) {
     statusLine.textContent = message;
     statusLine.classList.toggle('error-text', isError);
+    readyShown = false;
 }
 
 function basename(path) {
