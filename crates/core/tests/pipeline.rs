@@ -112,7 +112,8 @@ fn produces_a_valid_epub() {
 /// A run told to stop stops at its next step, an image not begun among them,
 /// and writes no book. Nothing could stop one but ending the program, which
 /// left its staging file beside where the book was going, and the whole book
-/// unpacked in the temporary directory.
+/// unpacked in the temporary directory. Told while the book was packed, the
+/// last step, the run wrote it all the same, having said it was stopping.
 #[test]
 fn a_run_told_to_stop_stops_at_its_next_step() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,8 +121,9 @@ fn a_run_told_to_stop_stops_at_its_next_step() {
     let output = dir.path().join("out.epub");
     write_demo_epub(&input);
 
-    // Before the book is unpacked, before its images, and after them.
-    for stop_at in [2, 15, 66] {
+    // Before the book is unpacked, before its images, after them, and as it
+    // is packed.
+    for stop_at in [2, 15, 66, 95] {
         let stop = AtomicBool::new(false);
         let mut reached = Vec::new();
         let result = process_epub_stoppable(

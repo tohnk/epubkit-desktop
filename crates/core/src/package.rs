@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use percent_encoding::percent_decode_str;
 use walkdir::WalkDir;
@@ -84,6 +85,17 @@ pub fn extract_epub(epub_path: &Path, dest_dir: &Path) -> Result<()> {
 /// 2. `META-INF/container.xml` next, by convention.
 /// 3. Everything else, deflated, in sorted order for reproducible output.
 pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
+    package_epub_until(source_dir, output_path, &AtomicBool::new(false))
+}
+
+/// [`package_epub`], which once `stop` is set stops before the next file it
+/// would pack, with [`Error::Stopped`], leaving at `output_path` a book that is
+/// not whole, for the caller to take away.
+pub(crate) fn package_epub_until(
+    source_dir: &Path,
+    output_path: &Path,
+    stop: &AtomicBool,
+) -> Result<()> {
     let out = File::create(output_path).map_err(|e| Error::io(output_path, e))?;
     let mut zip = ZipWriter::new(BufWriter::new(out));
 
@@ -137,6 +149,9 @@ pub fn package_epub(source_dir: &Path, output_path: &Path) -> Result<()> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (name, path) in entries {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Stopped);
+        }
         zip.start_file(name, deflated)?;
         copy_into(&mut zip, &path, output_path)?;
     }

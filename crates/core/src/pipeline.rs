@@ -289,8 +289,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 }
 
 /// [`process_epub`], which once `stop` is set stops at its next step, before
-/// the next image it would begin, with [`Error::Stopped`]. It writes no book,
-/// and what it made meanwhile goes with it.
+/// the next image it would begin or file it would pack, with
+/// [`Error::Stopped`]. It writes no book, even one packed by then, and what it
+/// made meanwhile goes with it.
 pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     input_path: &Path,
     output_path: &Path,
@@ -625,7 +626,14 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     report.os_artifacts_removed = package::remove_os_artifacts(work_dir)?;
 
     step(95, "Repackaging EPUB...")?;
-    package::package_epub(work_dir, output_path)?;
+    // Told to stop as the book is packed, or once it is, the run keeps no book
+    // either: it said it was stopping, and wrote the book all the same.
+    let packed = package::package_epub_until(work_dir, output_path, stop);
+    if matches!(packed, Err(Error::Stopped)) || (packed.is_ok() && stop.load(Ordering::Relaxed)) {
+        let _ = fs::remove_file(output_path);
+        return Err(Error::Stopped);
+    }
+    packed?;
 
     let original = input_path
         .file_name()
@@ -636,7 +644,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         .map_err(|e| Error::io(output_path, e))?
         .len();
 
-    // The book is written: too late to stop.
+    // The book is written and named: too late to stop.
     progress(100, "Complete");
     Ok(report)
 }
