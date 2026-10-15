@@ -181,11 +181,18 @@ pub async fn find_books(paths: Vec<String>) -> Response<Found> {
                                 found.books.push(entry.path().to_string_lossy().to_string());
                             }
                         }
-                        // A link back up the tree is no folder to look in.
-                        Err(error) if error.loop_ancestor().is_some() => {}
-                        Err(error) => found
-                            .unreadable
-                            .push(error.path().unwrap_or(path).to_string_lossy().to_string()),
+                        // A folder shut to the app is named. A link back up
+                        // the tree, or to nothing, a book on a card no longer
+                        // in its reader say, is no folder to look in.
+                        Err(error)
+                            if error.io_error().map(std::io::Error::kind)
+                                == Some(std::io::ErrorKind::PermissionDenied) =>
+                        {
+                            found
+                                .unreadable
+                                .push(error.path().unwrap_or(path).to_string_lossy().to_string())
+                        }
+                        Err(_) => {}
                     }
                 }
             } else if is_epub(path) && path.is_file() {

@@ -231,6 +231,32 @@ fn a_folder_that_cannot_be_looked_in_is_named() {
     assert_eq!(found.unreadable, [shut.to_string_lossy().to_string()]);
 }
 
+/// A link to nothing, to a book on a card no longer in its reader say, is
+/// passed over: followed, it was named as a folder that could not be looked
+/// in, though it was looked in well enough, and was a file at that.
+#[cfg(unix)]
+#[test]
+fn a_link_to_nothing_is_passed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("here.epub"), b"").unwrap();
+    let gone = dir.path().join("Gone");
+    std::os::unix::fs::symlink(gone.join("away.epub"), root.join("away.epub")).unwrap();
+    std::os::unix::fs::symlink(&gone, root.join("Gone")).unwrap();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]))
+    .unwrap();
+
+    assert_eq!(
+        found.books,
+        [root.join("here.epub").to_string_lossy().to_string()]
+    );
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
+}
+
 /// A bad file must not sink the whole drop — it comes back as one failed entry
 /// alongside the books that were fine.
 #[test]
