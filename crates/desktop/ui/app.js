@@ -37,6 +37,8 @@ let books = [];
 let settings = null;
 let devices = [];
 let running = false;
+/** Set once Stop is pressed, until the run has stopped. */
+let stopping = false;
 
 // ------------------------------------------------------------------- startup
 
@@ -354,9 +356,13 @@ async function optimize() {
         progressItems.appendChild(item);
     }
 
+    stopping = false;
+    setStatus(`Optimizing book 1 of ${jobs.length}…`);
+
     try {
         const outcomes = await invoke('optimize_books', { jobs, destination, settings });
         showResults(outcomes);
+        setStatus(tally(outcomes));
     } catch (error) {
         setStatus(`Processing failed: ${error}`, true);
     } finally {
@@ -367,49 +373,59 @@ async function optimize() {
     }
 }
 
+/// Every book's result, in the order the books were run, as the run ends;
+/// each was shown as its book finished.
 function showResults(outcomes) {
+    resultsItems.replaceChildren(...outcomes.map(resultCard));
     resultsSection.hidden = false;
-    resultsItems.innerHTML = '';
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
 
-    for (const outcome of outcomes) {
-        const card = document.createElement('div');
-        card.className = `result-card ${outcomeKind(outcome)}`;
+/// What a run came to, for the footer: "9 optimized, 1 failed".
+function tally(outcomes) {
+    const count = (kind) => outcomes.filter((outcome) => outcomeKind(outcome) === kind).length;
+    const parts = [`${count('success')} optimized`];
+    if (count('error') > 0) parts.push(`${count('error')} failed`);
+    if (count('stopped') > 0) parts.push(`${count('stopped')} stopped`);
+    return parts.join(', ');
+}
 
-        if (outcome.error) {
-            card.innerHTML = `
-                <div class="result-header"><span class="filename">${escapeHtml(basename(outcome.path))}</span></div>
-                <div class="file-error">${escapeHtml(outcome.error)}</div>`;
-        } else {
-            const report = outcome.report;
-            const change = report.originalSize > 0
-                ? (1 - report.optimizedSize / report.originalSize) * 100
-                : 0;
-            // Dithering to four levels is noise to a DCT codec, so a book of
-            // smooth artwork can legitimately come out bigger.
-            const label = change < 0 ? 'larger' : 'smaller';
+function resultCard(outcome) {
+    const card = document.createElement('div');
+    card.className = `result-card ${outcomeKind(outcome)}`;
 
-            // The name written, which is the report's unless that was taken.
-            const written = outcome.output ? basename(outcome.output) : report.outputFilename;
-
-            card.innerHTML = `
-                <div class="result-header"><span class="filename">${escapeHtml(written)}</span></div>
-                <div class="result-size">
-                    <span class="size-original">${formatBytes(report.originalSize)}</span>
-                    <span class="size-arrow">&rarr;</span>
-                    <span class="size-new">${formatBytes(report.optimizedSize)}</span>
-                    <span class="size-reduction">${Math.abs(change).toFixed(1)}% ${label}</span>
-                </div>
-                <div class="result-summary">${escapeHtml(outcome.summary)}</div>
-                <div class="result-output">
-                    <span class="path" title="${escapeAttr(outcome.output ?? '')}">${escapeHtml(outcome.output ?? '')}</span>
-                    <button class="reveal-btn" data-reveal="${escapeAttr(outcome.output ?? '')}">Show</button>
-                </div>`;
-        }
-
-        resultsItems.appendChild(card);
+    if (outcome.error) {
+        card.innerHTML = `
+            <div class="result-header"><span class="filename">${escapeHtml(basename(outcome.path))}</span></div>
+            <div class="file-error">${escapeHtml(outcome.error)}</div>`;
+        return card;
     }
 
-    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const report = outcome.report;
+    const change = report.originalSize > 0
+        ? (1 - report.optimizedSize / report.originalSize) * 100
+        : 0;
+    // Dithering to four levels is noise to a DCT codec, so a book of
+    // smooth artwork can legitimately come out bigger.
+    const label = change < 0 ? 'larger' : 'smaller';
+
+    // The name written, which is the report's unless that was taken.
+    const written = outcome.output ? basename(outcome.output) : report.outputFilename;
+
+    card.innerHTML = `
+        <div class="result-header"><span class="filename">${escapeHtml(written)}</span></div>
+        <div class="result-size">
+            <span class="size-original">${formatBytes(report.originalSize)}</span>
+            <span class="size-arrow">&rarr;</span>
+            <span class="size-new">${formatBytes(report.optimizedSize)}</span>
+            <span class="size-reduction">${Math.abs(change).toFixed(1)}% ${label}</span>
+        </div>
+        <div class="result-summary">${escapeHtml(outcome.summary)}</div>
+        <div class="result-output">
+            <span class="path" title="${escapeAttr(outcome.output ?? '')}">${escapeHtml(outcome.output ?? '')}</span>
+            <button class="reveal-btn" data-reveal="${escapeAttr(outcome.output ?? '')}">Show</button>
+        </div>`;
+    return card;
 }
 
 // -------------------------------------------------------------------- wiring
@@ -430,13 +446,22 @@ function wireEvents() {
     listen('tauri://drag-drop', () => dropZone.classList.remove('dragover'));
 
     listen('progress', ({ payload }) => {
+        if (running && !stopping) {
+            setStatus(`Optimizing book ${payload.index + 1} of ${payload.total}…`);
+        }
         const item = progressItems.querySelector(`[data-path="${cssEscape(payload.path)}"]`);
         if (!item) return;
         item.querySelector('.progress-bar').style.width = `${payload.percent}%`;
         item.querySelector('.progress-message').textContent = payload.message;
     });
 
+    // Each book's result shows as soon as it is known, not when the last
+    // book is done.
     listen('finished', ({ payload }) => {
+        if (running) {
+            resultsItems.appendChild(resultCard(payload));
+            resultsSection.hidden = false;
+        }
         const item = progressItems.querySelector(`[data-path="${cssEscape(payload.path)}"]`);
         if (!item) return;
         const kind = outcomeKind(payload);
@@ -445,8 +470,10 @@ function wireEvents() {
     });
 
     stopBtn.addEventListener('click', async () => {
+        stopping = true;
         stopBtn.disabled = true;
         stopBtn.textContent = 'Stopping…';
+        setStatus('Stopping…');
         try {
             await invoke('stop_run');
         } catch (error) {
