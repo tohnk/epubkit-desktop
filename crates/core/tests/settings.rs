@@ -365,6 +365,50 @@ fn a_linked_settings_file_stays_linked() {
     assert_eq!(Settings::load(&real).unwrap().options.quality, 42);
 }
 
+/// A link to a settings file that is not there yet, made by a dotfiles
+/// manager say, is followed, and the file made where it points, as writing in
+/// place did. Moving a written file into place replaced the link itself.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_settings_file_not_there_yet_is_followed() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.path().join("dotfiles")).unwrap();
+    let link = dir.path().join("config").join("settings.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../dotfiles/epubkit.toml", &link).unwrap();
+
+    let mut settings = Settings::default();
+    settings.options.quality = 42;
+    settings.save(&link).unwrap();
+
+    let link_kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(link_kind.is_symlink(), "the link was replaced");
+    let real = dir.path().join("dotfiles").join("epubkit.toml");
+    assert_eq!(Settings::load(&real).unwrap().options.quality, 42);
+}
+
+/// A saved settings file is as readable as it was: a new one as any file its
+/// owner makes, and one already there as it was made. Written beside it and
+/// moved into place, a save made it readable by its owner alone.
+#[cfg(unix)]
+#[test]
+fn saving_keeps_a_settings_file_as_readable_as_it_was() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = tempdir();
+    let ordinary = dir.path().join("ordinary");
+    std::fs::write(&ordinary, "").unwrap();
+
+    let path = dir.path().join("settings.toml");
+    Settings::default().save(&path).unwrap();
+    assert_eq!(mode(&path), mode(&ordinary), "a new settings file");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    Settings::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o640, "a settings file already there");
+}
+
 #[test]
 fn labels_read_the_way_the_ui_shows_them() {
     let mut settings = Settings::default();
