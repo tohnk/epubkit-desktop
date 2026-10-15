@@ -4,14 +4,15 @@
 //! reference implementation without a GUI in the way.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
 use epubkit_core::metadata::{FilenameFormat, MetadataEdits};
-use epubkit_core::pipeline::{process_epub, ProcessingOptions};
+use epubkit_core::pipeline::{process_epub_stoppable, ProcessingOptions};
 use epubkit_core::settings::{Settings, QUALITY};
-use epubkit_core::{metadata, package, structure, xml};
+use epubkit_core::{metadata, package, structure, xml, Error};
 
 #[derive(Parser)]
 #[command(name = "epubkit", version, about = "EPUB optimizer for e-ink readers")]
@@ -473,14 +474,33 @@ fn optimize(input: &Path, output: Option<&Path>, options: ProcessingOptions) -> 
         .unwrap_or(Path::new("."));
     let staging = metadata::staging_file(directory).context("creating a staging file")?;
 
+    // Ctrl-C, or being told to end, stops the run at its next step, and the
+    // run takes what it was making with it; ended there and then, it left
+    // the staging file here and the book unpacked in the temporary directory.
+    // A second Ctrl-C ends it there and then.
+    static STOP: AtomicBool = AtomicBool::new(false);
+    let _ = ctrlc::set_handler(|| {
+        if STOP.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        eprintln!("Stopping…");
+    });
+
     let mut last_percent = u8::MAX;
-    let report = process_epub(input, staging.path(), &options, |percent, message| {
+    let progress = |percent, message: &str| {
         if percent != last_percent {
             eprintln!("[{percent:>3}%] {message}");
             last_percent = percent;
         }
-    })
-    .with_context(|| format!("optimizing {}", input.display()))?;
+    };
+    let report = match process_epub_stoppable(input, staging.path(), &options, progress, &STOP) {
+        Err(Error::Stopped) => {
+            drop(staging);
+            eprintln!("Stopped: nothing was written.");
+            std::process::exit(130);
+        }
+        run => run.with_context(|| format!("optimizing {}", input.display()))?,
+    };
 
     let destination = match output {
         // Asked for by name, so whatever is there is replaced.
