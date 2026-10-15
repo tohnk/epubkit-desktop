@@ -268,6 +268,26 @@ fn a_field_the_book_lacks_is_made_without_moving_its_neighbours() {
     }
 }
 
+/// What XML cannot hold is left out of an edit: a control character, pasted
+/// in with a title say, was written as it was, which libxml2 2.9 writes into
+/// a package document that then does not parse, and 2.15 as U+FFFD; and a
+/// NUL panicked.
+#[test]
+fn an_edit_leaves_out_what_xml_cannot_hold() {
+    let doc = opf(STANDARD);
+    let typed = "\u{1}Bad\u{0} \u{B}Title\u{FFFE}";
+    let edits = MetadataEdits {
+        title: Some(typed.into()),
+        author: Some(typed.into()),
+        ..MetadataEdits::default()
+    };
+    update_metadata(&doc, &edits).unwrap();
+
+    let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+    assert_eq!(metadata.title, "Bad Title");
+    assert_eq!(metadata.author, "Bad Title");
+}
+
 #[test]
 fn empty_edits_change_nothing() {
     let doc = opf(STANDARD);

@@ -214,9 +214,10 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         ("creator", edits.author.as_deref()),
         ("language", edits.language.as_deref()),
     ] {
-        let Some(value) = value.filter(|v| !v.is_empty()) else {
+        let Some(value) = value.map(xml_text).filter(|v| !v.is_empty()) else {
             continue;
         };
+        let value = value.as_str();
 
         if let Some(mut existing) = dc_element(doc, local_name)? {
             set_text(&mut existing, value);
@@ -229,6 +230,23 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `value` without what XML cannot hold: control characters other than tab,
+/// line feed and carriage return, NUL among them, and U+FFFE and U+FFFF.
+/// libxml2 2.9 writes a control character as it is, into a document that then
+/// does not parse, and a NUL cannot be handed to it at all.
+fn xml_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&c| {
+            matches!(c,
+                '\t' | '\n' | '\r'
+                | '\u{20}'..='\u{D7FF}'
+                | '\u{E000}'..='\u{FFFD}'
+                | '\u{10000}'..='\u{10FFFF}')
+        })
+        .collect()
 }
 
 /// Make `value`, as it reads, all the text of `element`. What libxml2's
