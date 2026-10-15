@@ -34,7 +34,9 @@ const filenameExample = document.getElementById('filename-example');
 /** Books currently listed, in the order they were added. */
 let books = [];
 /** Books being read, to be listed once they have been. */
-const reading = new Set();
+let reading = new Set();
+/** Which list a read is for: a list started again drops a read begun before. */
+let listing = 0;
 /** The core's settings. Never edited except through `applySettings`. */
 let settings = null;
 let devices = [];
@@ -281,6 +283,10 @@ async function reloadSettings() {
 // --------------------------------------------------------------------- books
 
 async function addBooks(paths) {
+    // Started again meanwhile, the list takes nothing this read finds.
+    const list = listing;
+    const pending = reading;
+
     // What was dropped can be folders of books as well as books.
     let found;
     try {
@@ -289,6 +295,7 @@ async function addBooks(paths) {
         setStatus(`Could not look through what was dropped: ${error}`, true);
         return;
     }
+    if (list !== listing) return;
     if (found.length === 0) {
         setStatus('Nothing to add: no EPUB files in what was dropped.');
         return;
@@ -296,15 +303,16 @@ async function addBooks(paths) {
 
     // A book dropped again while it is still being read is not listed twice.
     const fresh = [...new Set(found)].filter(
-        (path) => !reading.has(path) && !books.some((b) => b.path === path),
+        (path) => !pending.has(path) && !books.some((b) => b.path === path),
     );
     if (fresh.length === 0) return;
-    for (const path of fresh) reading.add(path);
+    for (const path of fresh) pending.add(path);
 
     setStatus(`Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`);
 
     try {
         const inspected = await invoke('inspect_books', { paths: fresh });
+        if (list !== listing) return;
         // The book's own title and author, which a field emptied leaves it.
         for (const book of inspected) {
             book.ownTitle = book.title;
@@ -316,8 +324,15 @@ async function addBooks(paths) {
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
     } finally {
-        for (const path of fresh) reading.delete(path);
+        for (const path of fresh) pending.delete(path);
     }
+}
+
+/// Drop every read under way: what they find is not listed, and a book they
+/// were reading is read again if it is dropped again.
+function forgetReads() {
+    listing += 1;
+    reading = new Set();
 }
 
 function renderBooks() {
@@ -630,6 +645,8 @@ function wireEvents() {
     });
 
     document.getElementById('clear-btn').addEventListener('click', () => {
+        // A read still under way would list its books again a moment later.
+        forgetReads();
         books = [];
         renderBooks();
         progressSection.hidden = true;
