@@ -391,8 +391,10 @@ function renderBooks(from = 0) {
         const card = document.createElement('div');
         card.className = `file-card ${book.error ? 'error' : ''}`;
 
+        // A dropped library lists thousands of covers; one is decoded only as
+        // it comes near the view.
         const cover = book.cover
-            ? `<img src="${escapeAttr(book.cover)}" alt="">`
+            ? `<img src="${escapeAttr(book.cover)}" alt="" loading="lazy" decoding="async">`
             : '<div class="no-cover">No cover</div>';
 
         // A field emptied leaves the book its own title or author, which then
