@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 use std::ops::Range;
 
@@ -241,16 +242,20 @@ pub struct ReachableStylesheets {
     pub too_large: bool,
 }
 
+/// The [`ReachableStylesheets`] of `documents`. Once `stop` is set, it stops
+/// before the next file it would read, with [`Error::Stopped`].
 pub fn reachable_stylesheets(
     root: &Path,
     opf_dir: &Path,
     documents: &[&Path],
+    stop: &AtomicBool,
 ) -> Result<ReachableStylesheets> {
     let mut result = ReachableStylesheets::default();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
 
     for &path in documents {
+        Error::if_stopped(stop)?;
         if !path.is_file() {
             continue;
         }
@@ -294,6 +299,7 @@ pub fn reachable_stylesheets(
     }
 
     while let Some(path) = queue.pop() {
+        Error::if_stopped(stop)?;
         if !seen.insert(path.clone()) || !path.is_file() {
             continue;
         }
@@ -553,13 +559,16 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 /// case is taken once, as a filesystem that ignores case holds it once.
 ///
 /// `chapters` are those the steps after the image step rewrite references
-/// in, and so are the SVG documents and stylesheets read here.
+/// in, and so are the SVG documents and stylesheets read here. Once `stop`
+/// is set, it stops before the next of them it would read, with
+/// [`Error::Stopped`].
 pub fn undeclared_images(
     root: &Path,
     opf_dir: &Path,
     opf: &Document,
     chapters: &[&Path],
     content: &ContentFiles,
+    stop: &AtomicBool,
 ) -> Result<Vec<PathBuf>> {
     let fold = |path: &Path| path.to_string_lossy().to_lowercase();
     let mut taken: HashSet<String> = manifest_items(opf)?
@@ -570,6 +579,7 @@ pub fn undeclared_images(
 
     let mut named = BTreeSet::new();
     for &path in chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         named_files(
@@ -581,11 +591,13 @@ pub fn undeclared_images(
     }
     // One that is not well-formed is left as it is, its references too.
     for path in content.svg.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         if let Ok(doc) = xml::parse_file(path) {
             named_files(&doc, root, path.parent().unwrap_or(opf_dir), &mut named)?;
         }
     }
     for path in content.css.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         let css = crate::css::read_stylesheet(path)?;
         let base = path.parent().unwrap_or(opf_dir);
         named.extend(
@@ -1031,13 +1043,16 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 /// fit, and one in a chapter styled by a stylesheet too large to read: see
 /// [`free_images`].
 ///
-/// `chapters` are read as the steps after the image step read them.
+/// `chapters` are read as the steps after the image step read them. Once
+/// `stop` is set, it stops before the next file it would read, with
+/// [`Error::Stopped`].
 pub fn fixed_shape_images(
     root: &Path,
     opf_dir: &Path,
     opf: &Document,
     chapters: &[&Path],
     content: &ContentFiles,
+    stop: &AtomicBool,
 ) -> Result<HashSet<PathBuf>> {
     let mut fixed = HashSet::new();
     let mut stylesheets = Stylesheets::new(root);
@@ -1045,10 +1060,12 @@ pub fn fixed_shape_images(
 
     // What a stylesheet shows, it shows in a box it sizes.
     for path in content.css.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         stylesheets.at(path)?;
     }
 
     for &path in chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         let base = path.parent().unwrap_or(opf_dir);

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -60,5 +61,15 @@ impl Error {
             path: path.as_ref().to_path_buf(),
             source,
         }
+    }
+
+    /// [`Error::Stopped`] once `stop` is set. A run checks it before each
+    /// step, and within one before each document, image or file it would
+    /// begin, so a stop waits on no more than one of them.
+    pub(crate) fn if_stopped(stop: &AtomicBool) -> Result<()> {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Stopped);
+        }
+        Ok(())
     }
 }

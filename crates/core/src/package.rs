@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use percent_encoding::percent_decode_str;
 use walkdir::WalkDir;
@@ -43,12 +43,24 @@ const OBFUSCATION_ALGORITHMS: &[&str] = &[
 /// Entry paths are validated before anything is written: an archive cannot
 /// escape `dest_dir` via absolute paths or `..` components (zip-slip).
 pub fn extract_epub(epub_path: &Path, dest_dir: &Path) -> Result<()> {
+    extract_epub_until(epub_path, dest_dir, &AtomicBool::new(false))
+}
+
+/// [`extract_epub`], which once `stop` is set stops before the next file it
+/// would unpack, with [`Error::Stopped`], leaving in `dest_dir` what it had
+/// unpacked, for the caller to take away.
+pub(crate) fn extract_epub_until(
+    epub_path: &Path,
+    dest_dir: &Path,
+    stop: &AtomicBool,
+) -> Result<()> {
     let file = File::open(epub_path).map_err(|e| Error::io(epub_path, e))?;
     let mut archive = ZipArchive::new(file)?;
 
     fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
     for i in 0..archive.len() {
+        Error::if_stopped(stop)?;
         let mut entry = archive.by_index(i)?;
         let raw_name = entry.name().to_string();
 
@@ -149,9 +161,7 @@ pub(crate) fn package_epub_until(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (name, path) in entries {
-        if stop.load(Ordering::Relaxed) {
-            return Err(Error::Stopped);
-        }
+        Error::if_stopped(stop)?;
         zip.start_file(name, deflated)?;
         copy_into(&mut zip, &path, output_path)?;
     }
@@ -488,4 +498,28 @@ fn encrypted_resources(encryption_xml: &[u8]) -> Result<Vec<(String, String)>> {
     }
 
     Ok(encrypted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Told to stop, unpacking stops before the next file it would unpack.
+    #[test]
+    fn unpacking_stops_once_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let epub = dir.path().join("book.epub");
+        let mut zip = ZipWriter::new(File::create(&epub).unwrap());
+        for name in [MIMETYPE_ENTRY, "OEBPS/one.xhtml", "OEBPS/two.xhtml"] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"text").unwrap();
+        }
+        zip.finish().unwrap();
+        let unpacked = dir.path().join("unpacked");
+
+        let result = extract_epub_until(&epub, &unpacked, &AtomicBool::new(true));
+
+        assert!(matches!(result, Err(Error::Stopped)), "{result:?}");
+        assert_eq!(fs::read_dir(&unpacked).unwrap().count(), 0);
+    }
 }

@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use epubkit_core::pipeline::{
@@ -146,6 +146,36 @@ fn a_run_told_to_stop_stops_at_its_next_step() {
         assert_eq!(reached.last(), Some(&stop_at), "{reached:?}");
         assert!(!output.exists(), "{stop_at}");
     }
+}
+
+/// What a run looks for in the book before its images stops once told, as
+/// its own steps do: the stylesheets the documents reach, the images the
+/// manifest leaves out, and those Light Novel mode must leave their shape.
+/// Each reads every chapter.
+#[test]
+fn looking_through_the_book_stops_once_told() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    write_demo_epub(&input);
+    package::extract_epub(&input, dir.path()).unwrap();
+    let opf_dir = dir.path().join("OEBPS");
+    let opf = xml::parse_file(&opf_dir.join("content.opf")).unwrap();
+    let content = structure::find_content_files(dir.path(), &opf_dir, &opf).unwrap();
+    let chapters: Vec<&Path> = content.xhtml.iter().map(PathBuf::as_path).collect();
+    let stop = AtomicBool::new(true);
+
+    assert!(matches!(
+        structure::reachable_stylesheets(dir.path(), &opf_dir, &chapters, &stop),
+        Err(Error::Stopped)
+    ));
+    assert!(matches!(
+        structure::undeclared_images(dir.path(), &opf_dir, &opf, &chapters, &content, &stop),
+        Err(Error::Stopped)
+    ));
+    assert!(matches!(
+        structure::fixed_shape_images(dir.path(), &opf_dir, &opf, &chapters, &content, &stop),
+        Err(Error::Stopped)
+    ));
 }
 
 #[test]

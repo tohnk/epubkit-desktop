@@ -288,10 +288,11 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     )
 }
 
-/// [`process_epub`], which once `stop` is set stops at its next step, before
-/// the next image it would begin or file it would pack, with
+/// [`process_epub`], which once `stop` is set stops at its next step, or
+/// within one before the next document, image or file it would begin, with
 /// [`Error::Stopped`]. It writes no book, even one packed by then, and what it
-/// made meanwhile goes with it.
+/// made meanwhile goes with it. A step over every chapter of a long book took
+/// seconds, and a quit from the Dock gives a run ten.
 pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     input_path: &Path,
     output_path: &Path,
@@ -301,9 +302,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
 ) -> Result<ProcessingReport> {
     // Each step the run reports is a point it can stop at.
     let mut step = |percent: u8, message: &str| {
-        if stop.load(Ordering::Relaxed) {
-            return Err(Error::Stopped);
-        }
+        Error::if_stopped(stop)?;
         progress(percent, message);
         Ok(())
     };
@@ -330,7 +329,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     let work_dir = work.path();
 
     step(5, "Extracting EPUB...")?;
-    package::extract_epub(input_path, work_dir)?;
+    package::extract_epub_until(input_path, work_dir, stop)?;
 
     step(8, "Parsing structure...")?;
     let opf_relative = package::find_opf_path(work_dir)?;
@@ -372,6 +371,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     let mut left_unread = !content.too_large.is_empty();
     report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
+        Error::if_stopped(stop)?;
         if !path.is_file() {
             continue;
         }
@@ -400,7 +400,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     let reachable = {
         let mut documents: Vec<&Path> = chapters.clone();
         documents.extend(svg_documents(&content));
-        structure::reachable_stylesheets(work_dir, &opf_dir, &documents)?
+        structure::reachable_stylesheets(work_dir, &opf_dir, &documents, stop)?
     };
     left_unread |= reachable.too_large;
 
@@ -408,7 +408,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     // Light Novel mode reshapes an image only where it is shown as a page of
     // its own, so first it looks at how each is shown.
     let keep_shape = if options.light_novel_mode {
-        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content)?
+        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content, stop)?
     } else {
         HashSet::new()
     };
@@ -416,7 +416,8 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     // Every image the manifest declares, whatever its name or media type, but
     // for SVG, which is drawn and stays as it is; then those the book shows
     // that the manifest leaves out.
-    let undeclared = structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content)?;
+    let undeclared =
+        structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content, stop)?;
     let mut rasters: Vec<PathBuf> = content
         .images
         .iter()
@@ -464,11 +465,13 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         let renames = structure::Renames::new(work_dir, &opf_dir, &rename_map);
         structure::update_opf(&opf, &renames)?;
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             structure::update_xhtml_references(path, &renames)?;
         }
         // An SVG document names images as a chapter does. One that is not
         // well-formed is left as it is.
         for path in svg_documents(&content) {
+            Error::if_stopped(stop)?;
             structure::update_svg_references(path, &renames).ok();
         }
         // Every stylesheet the manifest lists, and every one a document
@@ -482,6 +485,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
                 .map(PathBuf::as_path),
         );
         for path in stylesheets {
+            Error::if_stopped(stop)?;
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
             }
@@ -513,6 +517,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
         let reshaped = structure::ReshapedPages::new(work_dir, &opf_dir, &converted.reshaped);
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             structure::show_reshaped_pages(path, &reshaped)?;
         }
     }
@@ -523,11 +528,13 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         step(76, "Removing unused CSS...")?;
         let mut used = css::UsedSelectors::default();
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             used.merge(&css::collect_used_selectors(&bytes)?);
         }
         // An SVG document can use a stylesheet's rules as much as a chapter.
         for path in svg_documents(&content) {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             if let Ok(used_here) = css::collect_used_selectors(&bytes) {
                 used.merge(&used_here);
@@ -535,6 +542,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         }
 
         for path in &content.css {
+            Error::if_stopped(stop)?;
             if !path.is_file() {
                 continue;
             }
@@ -551,6 +559,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         step(80, "Removing embedded fonts...")?;
 
         for path in &content.css {
+            Error::if_stopped(stop)?;
             if !path.is_file() {
                 continue;
             }
@@ -563,6 +572,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
 
         // A chapter may declare a font in a <style> of its own.
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             let (cleaned, removed) = css::remove_embedded_fonts_from_styles(&bytes)?;
             if removed > 0 {
@@ -584,6 +594,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
 
     step(82, "Normalizing content...")?;
     for &path in &chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let (cleaned, removed) = html::normalize_whitespace(&bytes)?;
         report.blank_elements_removed += removed;
@@ -600,6 +611,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
         };
 
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             let (cleaned, file_report) = crate::text::clean_text_content(&bytes, &text_options)?;
             if file_report.total_fixes() > 0 {
@@ -753,9 +765,7 @@ fn convert_images<S: FnMut(u8, &str) -> Result<()>>(
     in_order_in_parallel(
         &jobs,
         |job| -> Result<Converted> {
-            if stop.load(Ordering::Relaxed) {
-                return Err(Error::Stopped);
-            }
+            Error::if_stopped(stop)?;
             // Set aside before the file is read, so a thread waiting its turn
             // holds nothing; and an image that would need more than all
             // there is to set aside is left as it is. Reading its header to
@@ -773,9 +783,7 @@ fn convert_images<S: FnMut(u8, &str) -> Result<()>>(
             }
             let _held = IMAGE_MEMORY.hold(needed);
             // Told to stop while it waited its turn.
-            if stop.load(Ordering::Relaxed) {
-                return Err(Error::Stopped);
-            }
+            Error::if_stopped(stop)?;
             // Decoded in a worker held to `needed` bytes, where workers are on,
             // so an image crafted to make a decoder allocate wildly cannot. The
             // worker reads the file itself, so the parent keeps no second copy.
