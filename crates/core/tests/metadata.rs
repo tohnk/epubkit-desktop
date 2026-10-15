@@ -586,6 +586,24 @@ fn the_year_comes_from_the_publication_date() {
     }
 }
 
+/// Calibre writes `0101-01-01` for a date it does not know, and a timezone can
+/// move that into the year before; .NET's least date, `0001-01-01`, stands for
+/// one in what is made with it. Neither is a year a book came out in, and
+/// `{year}` named five of 35 books from a Calibre library `(0101)`.
+#[test]
+fn a_date_put_where_none_is_known_gives_no_year() {
+    for date in [
+        "0101-01-01T00:00:00+00:00",
+        "0100-12-31T23:00:00+00:00",
+        "0001-01-01T00:00:00",
+    ] {
+        let doc = opf(&format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title><dc:date>{date}</dc:date></metadata></package>"#
+        ));
+        assert_eq!(extract_metadata(&doc).unwrap().year, "", "{date}");
+    }
+}
+
 /// A finished book never replaces a file — least of all the one it came from,
 /// which is exactly where `Original` points.
 #[test]

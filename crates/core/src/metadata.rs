@@ -63,6 +63,11 @@ const MAX_TEMPLATE_CHARS: usize = 200;
 /// The year in a `dc:date`, which may be a bare year, a date, or a timestamp.
 static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{4})\b").unwrap());
 
+/// The last year a `dc:date` gives where no date is known. Calibre writes
+/// `0101-01-01` for one, which a timezone can move into the year before, and
+/// takes any year before 101 for none; .NET's least date is `0001-01-01`.
+const LAST_UNKNOWN_YEAR: u16 = 101;
+
 /// Dashes with only spaces between them, as a template leaves either side of
 /// a field it fills with nothing.
 static EMPTY_BETWEEN_DASHES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-(?: *-)+").unwrap());
@@ -139,7 +144,8 @@ impl Default for FilenameOptions {
 pub struct Metadata {
     pub title: String,
     pub author: String,
-    /// From `dc:date`, the first four-digit year in it.
+    /// From `dc:date`, the first four-digit year in it, unless that stands
+    /// for no date at all.
     pub year: String,
     pub series: String,
     pub series_index: String,
@@ -171,6 +177,11 @@ pub fn extract_metadata(doc: &Document) -> Result<Metadata> {
         year: YEAR
             .captures(&dc_text(doc, "date")?)
             .map(|found| found[1].to_string())
+            .filter(|year| {
+                !year
+                    .parse()
+                    .is_ok_and(|year: u16| year <= LAST_UNKNOWN_YEAR)
+            })
             .unwrap_or_default(),
         language: dc_text(doc, "language")?,
         ..Metadata::default()
