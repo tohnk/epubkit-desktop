@@ -73,8 +73,11 @@ async function start() {
 }
 
 /// The footer carries the current device and preset, so what a run will do is
-/// visible without opening the options panel.
+/// visible without opening the options panel. During a run it says how the
+/// run goes instead: an option changed then put "Ready" back, and while the
+/// run stopped, nothing took it away.
 function showReady() {
+    if (running) return;
     const device = devices.find((d) => d.id === settings.device);
     const name = device ? `${device.label} · ${device.width}×${device.height}` : settings.device;
     setStatus(`Ready · ${name} · ${presetLabel()}`);
@@ -299,7 +302,7 @@ async function addBooks(paths) {
     }
     if (list !== listing) return;
     if (found.length === 0) {
-        setStatus('Nothing to add: no EPUB files in what was dropped.');
+        note('Nothing to add: no EPUB files in what was dropped.');
         return;
     }
 
@@ -318,7 +321,7 @@ async function addBooks(paths) {
     let read = 0;
     try {
         while (read < fresh.length) {
-            setStatus(
+            note(
                 many
                     ? `Reading ${fresh.length} books… ${read} read`
                     : `Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`,
@@ -642,7 +645,7 @@ function wireEvents() {
         if (!name) return;
         try {
             applySettings(await invoke('save_preset', { name, settings }));
-            setStatus(`Saved "${name}".`);
+            note(`Saved "${name}".`);
             closeNamer();
         } catch (error) {
             setStatus(`Could not save that preset: ${error}`, true);
@@ -665,7 +668,7 @@ function wireEvents() {
         try {
             await flushPersist();
             applySettings(await invoke('delete_preset', { id }));
-            setStatus('Preset deleted.');
+            note('Preset deleted.');
         } catch (error) {
             setStatus(`Could not delete that preset: ${error}`, true);
         }
@@ -683,7 +686,7 @@ function wireEvents() {
 
     stopReadingBtn.addEventListener('click', () => {
         forgetReads();
-        setStatus(`Stopped reading. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
+        note(`Stopped reading. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
     });
 
     clearBtn.addEventListener('click', () => {
@@ -714,6 +717,11 @@ function setStatus(message, isError = false) {
     statusLine.textContent = message;
     statusLine.classList.toggle('error-text', isError);
     readyShown = false;
+}
+
+/// Say something that is not an error, unless a run has the footer.
+function note(message) {
+    if (!running) setStatus(message);
 }
 
 function basename(path) {
