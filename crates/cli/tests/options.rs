@@ -158,6 +158,31 @@ fn every_option_can_be_turned_on_and_off() {
     }
 }
 
+/// `info` names the book as a run would, by the saved naming. It named every
+/// book as the default does, Author - Title, whatever was saved.
+#[test]
+fn info_names_the_book_as_a_run_would() {
+    let home = tempfile::tempdir().unwrap();
+    let saved = "[filename]\nformat = \"custom\"\ntemplate = \"{title} (as saved)\"\n";
+    for file in settings_files(home.path()) {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, saved).unwrap();
+    }
+    write_book(&home.path().join("in.epub"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_epubkit"))
+        .args(["info", "in.epub"])
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains("filename: A Book (as saved).epub"), "{said}");
+}
+
 /// JPEG quality is 20 to 95, as the CLI's help says and the app's slider
 /// allows. Any byte was taken, and remembered for every run after it:
 /// `--quality 9`, for 90, made each book from then on at the worst quality the

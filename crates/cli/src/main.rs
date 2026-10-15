@@ -336,10 +336,24 @@ fn info(path: &Path) -> Result<()> {
         println!("series:   {} #{}", meta.series, or_dash(&meta.series_index));
     }
     println!("cover:    {}", or_dash(&meta.cover_href));
-    println!(
-        "filename: {}",
-        metadata::format_filename(&meta.title, &meta.author)
-    );
+    // As a run would name it, by the saved naming.
+    let original = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let named = settings_path()
+        .and_then(|file| Settings::load(&file).context("loading settings"))
+        .and_then(|settings| {
+            Ok(metadata::output_filename(
+                &meta,
+                &settings.filename,
+                &original,
+            )?)
+        });
+    match named {
+        Ok(name) => println!("filename: {name}"),
+        Err(error) => println!("filename: — ({error:#})"),
+    }
 
     let files = structure::find_content_files(work.path(), &opf_dir, &doc)
         .context("reading the manifest")?;
