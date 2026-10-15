@@ -128,6 +128,53 @@ fn a_cover_comes_back_as_a_data_url_the_page_can_render() {
     assert!(cover.starts_with("data:image/jpeg;base64,"), "{cover}");
 }
 
+/// A folder dropped on the window gives the books in it, and in the folders
+/// in it, in the order a listing of each folder gives them; a book dropped
+/// on its own is itself. A dropped folder did nothing, and said nothing. What
+/// is hidden is left out: macOS writes a `._` file beside each book on a
+/// drive it does not format, an SD card say, and it too ends in `.epub`.
+#[test]
+fn a_dropped_folder_gives_the_books_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Books");
+    for file in [
+        "b.EPUB",
+        "a.epub",
+        "notes.txt",
+        "._a.epub",
+        ".hidden/d.epub",
+        "Series/c.epub",
+        "Series/Later/e.epub",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+    }
+    let alone = dir.path().join("alone.epub");
+    std::fs::write(&alone, b"").unwrap();
+    let text = |path: &Path| path.to_string_lossy().to_string();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![
+        text(&root),
+        text(&alone),
+        text(&dir.path().join("notes.txt")),
+        text(&dir.path().join("missing")),
+    ]))
+    .unwrap();
+
+    let expected: Vec<String> = [
+        root.join("a.epub"),
+        root.join("b.EPUB"),
+        root.join("Series/c.epub"),
+        root.join("Series/Later/e.epub"),
+        alone,
+    ]
+    .iter()
+    .map(|path| text(path))
+    .collect();
+    assert_eq!(found, expected);
+}
+
 /// A bad file must not sink the whole drop — it comes back as one failed entry
 /// alongside the books that were fine.
 #[test]

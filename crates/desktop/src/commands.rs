@@ -141,6 +141,52 @@ impl BookInfo {
     }
 }
 
+/// The books among what was dropped on the window: each EPUB itself, and
+/// those in each folder and the folders in it, folder by folder in the order
+/// a listing gives them. What is hidden is left out, a folder or a file: on a
+/// drive it does not format, an SD card say, macOS writes a `._` file beside
+/// each book, and it too ends in `.epub`.
+///
+/// Runs on a blocking worker: a library takes a while to walk.
+#[tauri::command]
+pub async fn find_books(paths: Vec<String>) -> Response<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let is_epub = |path: &Path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+        };
+        let hidden = |entry: &walkdir::DirEntry| {
+            entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+        };
+
+        let mut found = Vec::new();
+        for path in paths.iter().map(Path::new) {
+            if path.is_dir() {
+                let entries = walkdir::WalkDir::new(path)
+                    .sort_by(|a, b| {
+                        let name = |entry: &walkdir::DirEntry| {
+                            entry.file_name().to_string_lossy().to_lowercase()
+                        };
+                        name(a).cmp(&name(b))
+                    })
+                    .into_iter()
+                    .filter_entry(|entry| !hidden(entry))
+                    .flatten();
+                for entry in entries {
+                    if is_epub(entry.path()) && entry.path().is_file() {
+                        found.push(entry.path().to_string_lossy().to_string());
+                    }
+                }
+            } else if is_epub(path) && path.is_file() {
+                found.push(path.to_string_lossy().to_string());
+            }
+        }
+        found
+    })
+    .await
+    .map_err(to_message)
+}
+
 /// Read metadata and a cover thumbnail for each dropped book.
 ///
 /// Runs on a blocking worker: a command without `async` runs on the main

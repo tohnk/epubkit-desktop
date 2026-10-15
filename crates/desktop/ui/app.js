@@ -279,9 +279,20 @@ async function reloadSettings() {
 // --------------------------------------------------------------------- books
 
 async function addBooks(paths) {
-    const fresh = paths.filter(
-        (path) => path.toLowerCase().endsWith('.epub') && !books.some((b) => b.path === path),
-    );
+    // What was dropped can be folders of books as well as books.
+    let found;
+    try {
+        found = await invoke('find_books', { paths });
+    } catch (error) {
+        setStatus(`Could not look through what was dropped: ${error}`, true);
+        return;
+    }
+    if (found.length === 0) {
+        setStatus('Nothing to add: no EPUB files in what was dropped.');
+        return;
+    }
+
+    const fresh = [...new Set(found)].filter((path) => !books.some((b) => b.path === path));
     if (fresh.length === 0) return;
 
     setStatus(`Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`);
