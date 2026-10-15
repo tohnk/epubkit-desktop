@@ -112,8 +112,10 @@ pinned by tests:
 
 A run of books can be stopped. Stop, beside Processing, stops the book being
 made, which is not written, and begins no other, each then saying it was
-stopped; closed or quit during a run, the window stops it and goes once it
-has. Nothing stopped a run but ending the program, which left the run's
+stopped; closed during a run, the window stops it and goes once it has.
+Quit with Cmd+Q on macOS, it does not yet: tao handles only
+`applicationWillTerminate`, so the app ends with no exit request to put
+off. Nothing stopped a run but ending the program, which left the run's
 staging file in the folder the books were going to and the book unpacked in
 the temporary directory. The footer says how far a run has got, "Optimizing
 book 3 of 10…", and what it came to, "9 optimized, 1 failed", where it read
