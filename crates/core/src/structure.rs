@@ -512,7 +512,7 @@ pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result
     )?;
 
     let mut removed = 0;
-    for mut node in nodes {
+    for node in nodes {
         let href = decode(&node.get_attribute("href").unwrap_or_default());
         let name = Path::new(&href)
             .file_name()
@@ -520,7 +520,7 @@ pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result
             .unwrap_or_default();
 
         if !name.is_empty() && font_names.contains(&name) {
-            node.unlink();
+            xml::discard(doc, node);
             removed += 1;
         }
     }
@@ -917,7 +917,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
                     svg.add_prev_sibling(&mut img).ok();
                 }
             }
-            svg.unlink();
+            xml::discard(&content.doc, svg);
             changed += 1;
             continue;
         }
@@ -964,9 +964,9 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         image.remove_attribute("srcset").ok();
         image.remove_attribute("sizes").ok();
         if local_name(&parent) == "picture" && pictures.insert(parent.node_ptr()) {
-            for mut source in parent.get_child_elements() {
+            for source in parent.get_child_elements() {
                 if local_name(&source) == "source" {
-                    source.unlink();
+                    xml::discard(&content.doc, source);
                 }
             }
         }
@@ -1715,9 +1715,9 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         }
 
         let mut fixed_here = 0;
-        for (mut svg, img, unwrapped) in wrappers {
+        for (svg, img, unwrapped) in wrappers {
             if unwrapped {
-                svg.unlink();
+                xml::discard(&content.doc, svg);
                 fixed_here += 1;
             } else {
                 img.free_subtree();

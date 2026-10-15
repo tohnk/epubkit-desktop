@@ -420,7 +420,7 @@ pub fn forget_missing_encrypted_files(epub_dir: &Path) -> Result<()> {
     );
     let mut kept = 0;
     let mut forgotten = 0;
-    for mut data in xml::find_nodes(&doc, &format!("//{}", xml::local("EncryptedData")))? {
+    for data in xml::find_nodes(&doc, &format!("//{}", xml::local("EncryptedData")))? {
         let uri = xml::find_nodes_under(&doc, &data, &reference)?
             .first()
             .and_then(|node| node.get_attribute("URI"))
@@ -430,7 +430,7 @@ pub fn forget_missing_encrypted_files(epub_dir: &Path) -> Result<()> {
             && structure::resolve_href(epub_dir, epub_dir, &decoded)
                 .is_some_and(|file| !file.exists());
         if missing {
-            data.unlink();
+            xml::discard(&doc, data);
             forgotten += 1;
         } else {
             kept += 1;

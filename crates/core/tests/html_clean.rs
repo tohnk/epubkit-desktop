@@ -148,6 +148,31 @@ fn paragraphs_made_of_entities_are_not_empty() {
     assert_eq!(out.matches("&mdash;").count(), 2, "{out}");
 }
 
+/// Empty paragraphs whose space is an entity the chapter declares itself
+/// collapse, and the collapse finishes. Freeing a paragraph taken out
+/// followed its reference into the entity's declaration, and on through the
+/// declarations beside it; where one refers to another declared before it,
+/// it went round them for ever. Such a paragraph is only unlinked.
+#[test]
+fn empty_paragraphs_of_a_declared_entity_collapse() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY sp "&#160;"><!ENTITY nbsp "&sp;">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>&nbsp;</p><p>&nbsp;</p><p>&nbsp;</p><p>The next scene.</p>
+</body></html>
+"#;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(normalize_whitespace(input).unwrap()));
+    let (bytes, removed) = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the collapse never finished");
+    let out = String::from_utf8(bytes).unwrap();
+
+    assert_eq!(removed, 2, "{out}");
+    assert!(out.contains("The next scene."), "{out}");
+}
+
 /// An empty element with an id is a link target: a page marker the page list
 /// points at, or the anchor a table of contents entry names.
 #[test]

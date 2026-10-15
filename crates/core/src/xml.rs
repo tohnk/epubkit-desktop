@@ -137,6 +137,25 @@ pub fn attribute_values(
         .collect())
 }
 
+/// Take `node` out of its document for good, and free it.
+///
+/// libxml2 keeps a node that is only unlinked until the process ends: its
+/// document no longer reaches it, and nothing else frees it. The bindings'
+/// `free_subtree` frees it, and makes any handle still held into it inert;
+/// but it follows an entity reference into the entity's declaration, and on
+/// through the declarations beside it, and where one refers to another
+/// declared before it, it goes round them for ever. A node with a reference
+/// in it, or anything else written with `&`, is only unlinked, as every node
+/// was: few are.
+pub fn discard(doc: &Document, node: Node) {
+    if doc.node_to_string(&node).contains('&') {
+        let mut node = node;
+        node.unlink();
+    } else {
+        node.free_subtree();
+    }
+}
+
 /// An XPath step matching an element by local name, ignoring namespaces.
 pub fn local(name: &str) -> String {
     format!("*[local-name()='{name}']")
