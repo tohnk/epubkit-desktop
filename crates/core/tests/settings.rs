@@ -244,6 +244,22 @@ fn an_unknown_device_falls_back_rather_than_failing() {
     assert_eq!(settings.device_profile().id, "x4");
 }
 
+/// The device a settings file names reads as the device books are made for.
+/// One written otherwise than this build writes it, `X3`, or one it does not
+/// know, `x5`, was made for as the X4, the default, while the window's footer
+/// and `settings show` named it as written.
+#[test]
+fn a_stored_device_reads_as_the_device_books_are_made_for() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    for (stored, made_for) in [("X3", "x3"), ("x5", "x4"), ("", "x4")] {
+        std::fs::write(&path, format!("device = \"{stored}\"\n")).unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.device, made_for, "{stored:?}");
+        assert_eq!(settings.device_profile().id, made_for, "{stored:?}");
+    }
+}
+
 #[test]
 fn a_missing_file_gives_defaults() {
     let dir = tempdir();
@@ -290,6 +306,152 @@ fn saving_creates_the_directory() {
 
     Settings::default().save(&path).unwrap();
     assert!(path.exists());
+}
+
+/// A save replaces the settings file whole. Written in place, a save emptied
+/// the file before writing it: a reader then, the app or another run of the
+/// CLI, both of which save after every change, found no settings at all and
+/// took defaults in their place, which the app would save over every preset;
+/// or found half a file, which does not parse, and the app would not start.
+#[test]
+fn a_reader_never_sees_a_settings_file_half_saved() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    let mut many = Settings::default();
+    for n in 0..40 {
+        many.save_preset(&format!("Preset {n}")).unwrap();
+    }
+    let mut one = many.clone();
+    one.presets.truncate(1);
+    many.save(&path).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = [many, one]
+        .into_iter()
+        .map(|settings| {
+            let (path, stop) = (path.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    settings.save(&path).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    let started = Instant::now();
+    let mut broken = None;
+    while broken.is_none() && started.elapsed() < Duration::from_secs(1) {
+        match Settings::load(&path) {
+            Ok(settings) if settings.presets.is_empty() => {
+                broken = Some("every preset gone".to_string());
+            }
+            Ok(_) => {}
+            Err(error) => broken = Some(error.to_string()),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert_eq!(broken, None);
+}
+
+/// A settings file that is a link to one kept elsewhere, in a folder of
+/// dotfiles say, stays a link: the file it points at is what is saved.
+#[cfg(unix)]
+#[test]
+fn a_linked_settings_file_stays_linked() {
+    let dir = tempdir();
+    let real = dir.path().join("dotfiles").join("epubkit.toml");
+    Settings::default().save(&real).unwrap();
+    let link = dir.path().join("config").join("settings.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut settings = Settings::default();
+    settings.options.quality = 42;
+    settings.save(&link).unwrap();
+
+    let link_kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(link_kind.is_symlink(), "the link was replaced");
+    assert_eq!(Settings::load(&real).unwrap().options.quality, 42);
+}
+
+/// A link to a settings file that is not there yet, made by a dotfiles
+/// manager say, is followed, and the file made where it points, as writing in
+/// place did. Moving a written file into place replaced the link itself.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_settings_file_not_there_yet_is_followed() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.path().join("dotfiles")).unwrap();
+    let link = dir.path().join("config").join("settings.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../dotfiles/epubkit.toml", &link).unwrap();
+
+    let mut settings = Settings::default();
+    settings.options.quality = 42;
+    settings.save(&link).unwrap();
+
+    let link_kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(link_kind.is_symlink(), "the link was replaced");
+    let real = dir.path().join("dotfiles").join("epubkit.toml");
+    assert_eq!(Settings::load(&real).unwrap().options.quality, 42);
+}
+
+/// A saved settings file is as readable as it was: a new one as any file its
+/// owner makes, and one already there as it was made. Written beside it and
+/// moved into place, a save made it readable by its owner alone.
+#[cfg(unix)]
+#[test]
+fn saving_keeps_a_settings_file_as_readable_as_it_was() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = tempdir();
+    let ordinary = dir.path().join("ordinary");
+    std::fs::write(&ordinary, "").unwrap();
+
+    let path = dir.path().join("settings.toml");
+    Settings::default().save(&path).unwrap();
+    assert_eq!(mode(&path), mode(&ordinary), "a new settings file");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    Settings::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o640, "a settings file already there");
+}
+
+/// A quality outside 20 to 95, the range the window's slider and the command
+/// line allow, written into the file by hand or by an older version, is taken
+/// to the nearest end of it, a saved preset's too; and so is one handed to
+/// the pipeline. Kept, it was run with, while the window showed "9%" with its
+/// slider at 20.
+#[test]
+fn a_quality_outside_its_range_is_brought_into_it() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    std::fs::write(
+        &path,
+        "[options]\nquality = 9\n\n[[presets]]\nid = \"mine\"\nname = \"Mine\"\n\n\
+         [presets.options]\nquality = 200\n",
+    )
+    .unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.options.quality, 20);
+    assert_eq!(settings.preset("mine").unwrap().options.quality, 95);
+
+    let options = OptionSet {
+        quality: 5,
+        ..OptionSet::full()
+    };
+    let processing =
+        options.to_processing_options(settings.device_profile(), MetadataEdits::default());
+    assert_eq!(processing.quality, 20);
 }
 
 #[test]

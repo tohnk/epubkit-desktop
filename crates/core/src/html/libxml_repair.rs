@@ -263,14 +263,14 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
     doc.remove_internal_subset();
 
     let root = doc.as_node();
-    for mut child in root.get_child_nodes() {
+    for child in root.get_child_nodes() {
         let declaration = match child.get_type() {
             Some(NodeType::PiNode) => child.get_name().eq_ignore_ascii_case("xml"),
             Some(NodeType::CommentNode) => is_demoted_declaration(&child.get_content()),
             _ => false,
         };
         if declaration {
-            child.unlink();
+            xml::discard(child);
         }
     }
 }
@@ -345,7 +345,7 @@ fn make_legal_xml(doc: &Document) {
                 Some(NodeType::PiNode) => {
                     let name = node.get_name();
                     if name.eq_ignore_ascii_case("xml") || !is_xml_name(&name) {
-                        node.unlink();
+                        xml::discard(node);
                     }
                 }
                 Some(NodeType::ElementNode) => {

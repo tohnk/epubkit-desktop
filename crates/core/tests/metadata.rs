@@ -184,6 +184,128 @@ fn edits_create_missing_fields() {
     assert_eq!(extract_metadata(&doc).unwrap().author, "Added Author");
 }
 
+/// An edit is kept as it was typed, in a field the book has and in one it
+/// lacks. libxml2 parses what it is given for an element as markup, so an `&`
+/// in an edited title or author was taken for the start of a reference and
+/// dropped: "Tom & Jerry" became "Tom  Jerry", "AT&T" became "ATT", and one
+/// typed as "&amp;" read back as "&".
+#[test]
+fn edits_are_kept_as_typed() {
+    for typed in [
+        "Tom & Jerry",
+        "AT&T",
+        "Already &amp; escaped",
+        "&#38; and <tags>",
+    ] {
+        let doc = opf(r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Only A Title</dc:title>
+  </metadata>
+  <manifest/><spine/>
+</package>
+"#);
+        let edits = MetadataEdits {
+            title: Some(typed.into()),
+            author: Some(typed.into()),
+            ..MetadataEdits::default()
+        };
+        update_metadata(&doc, &edits).unwrap();
+
+        // As the book is written out, and read back.
+        let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+        assert_eq!(metadata.title, typed, "an edited title");
+        assert_eq!(metadata.author, typed, "an author the book lacked");
+    }
+}
+
+/// A field the book lacks is made with the `dc` prefix, wherever Dublin Core
+/// is declared. Declared without one, as the default namespace of
+/// `<metadata>`, it took `<metadata>` and its `<meta>`s out of the package's
+/// namespace as the book was written out, where nothing had declared it there
+/// already; and where `<metadata>` declares its own default, it could not be
+/// declared at all, and the book failed.
+#[test]
+fn a_field_the_book_lacks_is_made_without_moving_its_neighbours() {
+    let namespace = |doc: &libxml::tree::Document, name: &str| {
+        xml::find_first(doc, &format!("//*[local-name()='{name}']"))
+            .unwrap()
+            .and_then(|node| node.get_namespace())
+            .map(|ns| ns.get_href())
+            .unwrap_or_default()
+    };
+    for metadata_tag in [
+        "<metadata>",
+        r#"<metadata xmlns="http://www.idpf.org/2007/opf">"#,
+    ] {
+        let doc = opf(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  {metadata_tag}
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">A Title</dc:title>
+    <meta name="cover" content="cover-image"/>
+  </metadata>
+  <manifest/><spine/>
+</package>
+"#
+        ));
+        let edits = MetadataEdits {
+            author: Some("Added Author".into()),
+            ..MetadataEdits::default()
+        };
+        update_metadata(&doc, &edits).unwrap_or_else(|e| panic!("{metadata_tag}: {e}"));
+
+        let written = opf(&doc.to_string());
+        let opf_ns = "http://www.idpf.org/2007/opf";
+        assert_eq!(namespace(&written, "metadata"), opf_ns, "{metadata_tag}");
+        assert_eq!(namespace(&written, "meta"), opf_ns, "{metadata_tag}");
+        assert_eq!(
+            namespace(&written, "creator"),
+            "http://purl.org/dc/elements/1.1/",
+            "{metadata_tag}"
+        );
+        assert_eq!(extract_metadata(&written).unwrap().author, "Added Author");
+    }
+}
+
+/// What XML cannot hold is left out of an edit: a control character, pasted
+/// in with a title say, was written as it was, which libxml2 2.9 writes into
+/// a package document that then does not parse, and 2.15 as U+FFFD; and a
+/// NUL panicked.
+#[test]
+fn an_edit_leaves_out_what_xml_cannot_hold() {
+    let doc = opf(STANDARD);
+    let typed = "\u{1}Bad\u{0} \u{B}Title\u{FFFE}";
+    let edits = MetadataEdits {
+        title: Some(typed.into()),
+        author: Some(typed.into()),
+        ..MetadataEdits::default()
+    };
+    update_metadata(&doc, &edits).unwrap();
+
+    let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+    assert_eq!(metadata.title, "Bad Title");
+    assert_eq!(metadata.author, "Bad Title");
+}
+
+/// An edit of nothing but spaces is no edit, as an empty one is and as the
+/// window takes one: `--title "   "` wrote a title that read back as none.
+#[test]
+fn an_edit_of_only_spaces_changes_nothing() {
+    let doc = opf(STANDARD);
+    let edits = MetadataEdits {
+        title: Some("   ".into()),
+        author: Some("\t\n".into()),
+        language: Some(" ".into()),
+    };
+    update_metadata(&doc, &edits).unwrap();
+
+    let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+    assert_eq!(metadata.title, "The Book Title");
+    assert_eq!(metadata.author, "Jane Author");
+    assert_eq!(metadata.language, "en");
+}
+
 #[test]
 fn empty_edits_change_nothing() {
     let doc = opf(STANDARD);
@@ -201,6 +323,8 @@ fn store_metadata_is_stripped_but_real_metadata_survives() {
     <dc:creator>Keep Me Too</dc:creator>
     <meta name="calibre:timestamp" content="2020-01-01"/>
     <meta name="calibre:title_sort" content="Keep Me"/>
+    <meta name="calibre:series" content="Keepers"/>
+    <meta name="calibre:series_index" content="2"/>
     <meta name="ibooks:version" content="1.0"/>
     <meta name="amazon:asin" content="B00X"/>
     <meta name="cover" content="cov"/>
@@ -219,6 +343,10 @@ fn store_metadata_is_stripped_but_real_metadata_survives() {
     assert_eq!(metadata.author, "Keep Me Too");
     // The cover pointer is not store cruft and must be left alone.
     assert_eq!(metadata.cover_id, "cov");
+    // Nor is a series, which Calibre's tags give an EPUB 2 book, having no
+    // tag of its own for one: CrossInk sorts its library by them.
+    assert_eq!(metadata.series, "Keepers");
+    assert_eq!(metadata.series_index, "2");
 }
 
 #[test]
@@ -267,14 +395,158 @@ fn filenames_drop_control_characters() {
     assert_eq!(name, "Nullbyte - Tabhere.epub");
 }
 
-/// Truncation counts characters, not bytes — slicing a multi-byte codepoint
-/// would panic.
+/// A name's extension is taken off once the name is clean: "Book.epub?" came
+/// out `Book.epub.epub`, its extension hidden by the `?` until that was gone.
+///
+/// Nothing before it is nothing to name a book by: cleaning took the dot of
+/// an extension with nothing before it for a leading one, and the name came
+/// out `epub.epub`.
+#[test]
+fn an_extension_is_found_once_the_name_is_clean() {
+    assert_eq!(format_filename("Book.epub?", ""), "Book.epub");
+    assert_eq!(format_filename("Book.EPUB*", ""), "Book.epub");
+    assert_eq!(format_filename("Book - .epub", ""), "Book.epub");
+
+    assert_eq!(format_filename("?.epub", ""), "optimized.epub");
+    assert_eq!(format_filename("", ".epub"), "optimized.epub");
+    assert_eq!(
+        named(&book("", ""), FilenameFormat::Custom, "{title}.epub", ""),
+        "optimized.epub"
+    );
+    assert_eq!(
+        named(&book("???", ""), FilenameFormat::Custom, "{title}.epub", ""),
+        "optimized.epub"
+    );
+    // What a name starts with still goes, once the extension is off.
+    assert_eq!(format_filename(".hidden", ""), "hidden.epub");
+    assert_eq!(format_filename("- flag.epub", ""), "flag.epub");
+}
+
+/// A field a template leaves empty does not leave the dashes either side of
+/// it: `{author} - {series} - {title}` named a book in no series
+/// `Jane Author - - The Book Title.epub`.
+#[test]
+fn an_empty_field_does_not_leave_its_separators() {
+    let book = book("The Book Title", "Jane Author");
+    for (template, expected) in [
+        (
+            "{author} - {series} - {title}",
+            "Jane Author - The Book Title.epub",
+        ),
+        ("{series} - {series_index} - {title}", "The Book Title.epub"),
+        ("{title} - {series} -- {year}", "The Book Title.epub"),
+    ] {
+        let name = named(&book, FilenameFormat::Custom, template, "x.epub");
+        assert_eq!(name, expected, "{template}");
+    }
+}
+
+/// Nor the brackets round it: `{title} ({year})` named a book with no date
+/// `The Book Title ().epub`.
+#[test]
+fn an_empty_field_does_not_leave_its_brackets() {
+    let book = book("The Book Title", "Jane Author");
+    for (template, expected) in [
+        ("{title} ({year})", "The Book Title.epub"),
+        ("[{series_index}] {title}", "The Book Title.epub"),
+        (
+            "{author} ({year}) - {title}",
+            "Jane Author - The Book Title.epub",
+        ),
+        ("{title} [{series} - {series_index}]", "The Book Title.epub"),
+        ("{title} ({series} [{series_index}])", "The Book Title.epub"),
+        ("{title} {{{year}}}", "The Book Title.epub"),
+        // What is in them stays, with the brackets: an empty pair beside
+        // one took its other half, `[Jane Author The Book Title.epub`.
+        ("{title} (#{series_index})", "The Book Title (#).epub"),
+        (
+            "[{author} ({year})] {title}",
+            "[Jane Author] The Book Title.epub",
+        ),
+        (
+            "[({year}) {author}] {title}",
+            "[Jane Author] The Book Title.epub",
+        ),
+        ("({series} [{year}]) - {title}", "The Book Title.epub"),
+    ] {
+        let name = named(&book, FilenameFormat::Custom, template, "x.epub");
+        assert_eq!(name, expected, "{template}");
+    }
+
+    let dated = Metadata {
+        year: "1937".into(),
+        ..book.clone()
+    };
+    assert_eq!(
+        named(&dated, FilenameFormat::Custom, "{title} ({year})", ""),
+        "The Book Title (1937).epub"
+    );
+}
+
+/// Truncation cuts at the end of a character, wherever the byte limit falls —
+/// slicing a multi-byte codepoint would panic.
 #[test]
 fn long_multibyte_titles_do_not_panic() {
     let long_title = "é".repeat(500);
     let name = format_filename(&long_title, "");
     assert!(name.ends_with(".epub"));
     assert!(name.chars().count() <= 205);
+}
+
+/// A name is cut to what filesystems take, which Linux's count in bytes: ext4
+/// and btrfs take 255 to a name. Cut at 200 characters, a long Japanese title
+/// made a name of 374 bytes, which such a system, the Flatpak's say, refuses
+/// as the finished book is moved into place, failing the run at its end.
+#[test]
+fn a_long_title_is_cut_to_a_name_that_fits_in_bytes() {
+    for title in [
+        "異世界".repeat(40),
+        "é".repeat(300),
+        "😀".repeat(80),
+        "a".repeat(300),
+    ] {
+        let name = format_filename(&title, "作者");
+        assert!(name.ends_with(".epub"), "{name}");
+        assert!(name.len() <= 205, "{} bytes: {name}", name.len());
+        // With room beside it for the " (2)" another book of that name takes.
+        assert!(name.len() + " (999)".len() <= 255);
+    }
+    // ASCII is cut where it was, at 200 characters.
+    assert_eq!(format_filename(&"a".repeat(300), "").len(), 205);
+}
+
+/// Windows keeps the names of its devices, CON, NUL, COM1 and the rest, and
+/// takes a file named one, whatever follows its first dot, for the device: a
+/// book named `Con. Law.epub` could not be made there. A `_` after the
+/// device's name makes it a name like any other.
+#[test]
+fn a_name_windows_keeps_for_a_device_is_not_given_to_a_book() {
+    for (title, expected) in [
+        ("Con", "Con_.epub"),
+        ("AUX", "AUX_.epub"),
+        ("nul", "nul_.epub"),
+        ("Prn", "Prn_.epub"),
+        ("COM1", "COM1_.epub"),
+        ("lpt9", "lpt9_.epub"),
+        ("COM¹", "COM¹_.epub"),
+        ("CONOUT$", "CONOUT$_.epub"),
+        ("Con. Law", "Con_. Law.epub"),
+        ("Nul .Notes", "Nul_ .Notes.epub"),
+        // Not the name of a device.
+        ("Con Air", "Con Air.epub"),
+        ("COM10", "COM10.epub"),
+        ("Console", "Console.epub"),
+    ] {
+        assert_eq!(format_filename(title, ""), expected, "{title}");
+    }
+
+    // A long name still fits once the `_` is in it.
+    let name = format_filename(&format!("Con. {}", "x".repeat(300)), "");
+    assert!(name.starts_with("Con_. x"), "{name}");
+    assert_eq!(name.len(), 205);
+    // And a name cut down to a device's is not left one.
+    let name = format_filename(&format!("Con-{}x", ".".repeat(196)), "");
+    assert_eq!(name, "Con_.epub");
 }
 
 // ------------------------------------------------- filename formats (PR #5)
@@ -429,6 +701,24 @@ fn the_year_comes_from_the_publication_date() {
             r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title><dc:date>{date}</dc:date></metadata></package>"#
         ));
         assert_eq!(extract_metadata(&doc).unwrap().year, year, "{date}");
+    }
+}
+
+/// Calibre writes `0101-01-01` for a date it does not know, and a timezone can
+/// move that into the year before; .NET's least date, `0001-01-01`, stands for
+/// one in what is made with it. Neither is a year a book came out in, and
+/// `{year}` named five of 35 books from a Calibre library `(0101)`.
+#[test]
+fn a_date_put_where_none_is_known_gives_no_year() {
+    for date in [
+        "0101-01-01T00:00:00+00:00",
+        "0100-12-31T23:00:00+00:00",
+        "0001-01-01T00:00:00",
+    ] {
+        let doc = opf(&format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title><dc:date>{date}</dc:date></metadata></package>"#
+        ));
+        assert_eq!(extract_metadata(&doc).unwrap().year, "", "{date}");
     }
 }
 

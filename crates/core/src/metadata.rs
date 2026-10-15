@@ -25,8 +25,6 @@ const STORE_META_NAMES: &[&str] = &[
     "calibre:timestamp",
     "calibre:title_sort",
     "calibre:author_link_map",
-    "calibre:series",
-    "calibre:series_index",
     "calibre:rating",
     "calibre:user_categories",
     "calibre:user_metadata",
@@ -37,6 +35,11 @@ const STORE_META_NAMES: &[&str] = &[
 ];
 
 const STORE_META_PREFIXES: &[&str] = &["calibre:", "ibooks:", "amazon:", "kindle:"];
+
+/// Calibre's tags for a book's series, kept with the book's own metadata:
+/// EPUB 2 has none of its own for one, and readers take these, CrossInk to
+/// sort its library by.
+const SERIES_META_NAMES: &[&str] = &["calibre:series", "calibre:series_index"];
 
 /// Characters that cause trouble in filenames, and what to put in their place.
 const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
@@ -51,14 +54,42 @@ const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
     ('|', "-"),
 ];
 
-/// Leave room for the `.epub` extension within common filesystem limits.
-const MAX_FILENAME_CHARS: usize = 200;
+/// The names Windows keeps for its devices, as Microsoft's rules for naming a
+/// file list them, with the two consoles Python's `os.path.isreserved` adds.
+const WINDOWS_DEVICES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+];
+
+/// The most a name may take before its `.epub`, in bytes, as Linux's
+/// filesystems count a name: ext4 and btrfs take 255, which leaves room for
+/// the extension and a ` (2)` beside it. Filesystems that count UTF-16 units
+/// instead take 255 of those, never fewer than the bytes.
+const MAX_FILENAME_BYTES: usize = 200;
 
 /// A filename template longer than a filename is a mistake.
 const MAX_TEMPLATE_CHARS: usize = 200;
 
 /// The year in a `dc:date`, which may be a bare year, a date, or a timestamp.
 static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{4})\b").unwrap());
+
+/// The last year a `dc:date` gives where no date is known. Calibre writes
+/// `0101-01-01` for one, which a timezone can move into the year before, and
+/// takes any year before 101 for none; .NET's least date is `0001-01-01`.
+const LAST_UNKNOWN_YEAR: u16 = 101;
+
+/// Dashes with only spaces between them, as a template leaves either side of
+/// a field it fills with nothing.
+static EMPTY_BETWEEN_DASHES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-(?: *-)+").unwrap());
+
+/// A pair of brackets with nothing in them but spaces and dashes, as a
+/// template leaves round a field it fills with nothing, and the spaces before
+/// them, or with none there, after them.
+static EMPTY_BRACKETS: LazyLock<Regex> = LazyLock::new(|| {
+    let pair = r"(?:\([\s-]*\)|\[[\s-]*\]|\{[\s-]*\})";
+    Regex::new(&format!(r"\s+{pair}|{pair}\s*")).unwrap()
+});
 
 /// What a custom filename template can fill in.
 pub const TEMPLATE_FIELDS: &[&str] = &[
@@ -132,7 +163,8 @@ impl Default for FilenameOptions {
 pub struct Metadata {
     pub title: String,
     pub author: String,
-    /// From `dc:date`, the first four-digit year in it.
+    /// From `dc:date`, the first four-digit year in it, unless that stands
+    /// for no date at all.
     pub year: String,
     pub series: String,
     pub series_index: String,
@@ -164,6 +196,11 @@ pub fn extract_metadata(doc: &Document) -> Result<Metadata> {
         year: YEAR
             .captures(&dc_text(doc, "date")?)
             .map(|found| found[1].to_string())
+            .filter(|year| {
+                !year
+                    .parse()
+                    .is_ok_and(|year: u16| year <= LAST_UNKNOWN_YEAR)
+            })
             .unwrap_or_default(),
         language: dc_text(doc, "language")?,
         ..Metadata::default()
@@ -199,7 +236,8 @@ pub fn extract_metadata(doc: &Document) -> Result<Metadata> {
     Ok(metadata)
 }
 
-/// Apply user edits, creating Dublin Core elements that the book lacks.
+/// Apply user edits, creating Dublin Core elements that the book lacks. An
+/// edit of nothing, or of nothing but spaces, leaves its field alone.
 pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
     let Some(mut metadata_el) = xml::find_first(doc, &format!("//{}", xml::local("metadata")))?
     else {
@@ -211,16 +249,17 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         ("creator", edits.author.as_deref()),
         ("language", edits.language.as_deref()),
     ] {
-        let Some(value) = value.filter(|v| !v.is_empty()) else {
+        let Some(value) = value.map(xml_text).filter(|v| !v.trim().is_empty()) else {
             continue;
         };
+        let value = value.as_str();
 
         if let Some(mut existing) = dc_element(doc, local_name)? {
-            existing.set_content(value).ok();
+            set_text(&mut existing, value);
         } else {
-            let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC)?;
+            let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC, "dc")?;
             if let Ok(mut created) = metadata_el.new_child(namespace, local_name) {
-                created.set_content(value).ok();
+                set_text(&mut created, value);
             }
         }
     }
@@ -228,7 +267,35 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
     Ok(())
 }
 
-/// Remove store- and reader-specific `<meta>` entries. Returns how many went.
+/// `value` without what XML cannot hold: control characters other than tab,
+/// line feed and carriage return, NUL among them, and U+FFFE and U+FFFF.
+/// libxml2 2.9 writes a control character as it is, into a document that then
+/// does not parse, and a NUL cannot be handed to it at all.
+fn xml_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&c| {
+            matches!(c,
+                '\t' | '\n' | '\r'
+                | '\u{20}'..='\u{D7FF}'
+                | '\u{E000}'..='\u{FFFD}'
+                | '\u{10000}'..='\u{10FFFF}')
+        })
+        .collect()
+}
+
+/// Make `value`, as it reads, all the text of `element`. What libxml2's
+/// `set_content` is given for an element it parses as markup, so an `&` in an
+/// edited title was taken for the start of a reference and dropped.
+fn set_text(element: &mut Node, value: &str) {
+    for child in element.get_child_nodes() {
+        xml::discard(child);
+    }
+    element.append_text(value).ok();
+}
+
+/// Remove store- and reader-specific `<meta>` entries, all but a book's
+/// series. Returns how many went.
 pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
     let Some(metadata_el) = xml::find_first(doc, &format!("//{}", xml::local("metadata")))? else {
         return Ok(0);
@@ -238,17 +305,18 @@ pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
     let candidates =
         xml::find_nodes_under(doc, &metadata_el, &format!(".//{}", xml::local("meta")))?;
 
-    for mut meta in candidates {
+    for meta in candidates {
         let name = meta.get_attribute("name").unwrap_or_default();
         let property = meta.get_attribute("property").unwrap_or_default();
 
-        let is_store_tag = STORE_META_NAMES.contains(&name.as_str())
-            || STORE_META_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix) || property.starts_with(prefix));
+        let is_store_tag = !SERIES_META_NAMES.contains(&name.as_str())
+            && (STORE_META_NAMES.contains(&name.as_str())
+                || STORE_META_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix) || property.starts_with(prefix)));
 
         if is_store_tag {
-            meta.unlink();
+            xml::discard(meta);
             removed += 1;
         }
     }
@@ -514,13 +582,19 @@ fn strip_epub_extension(name: &str) -> &str {
 
 /// Make a name a safe filename with an `.epub` extension.
 fn finish_filename(name: &str) -> String {
-    let mut name = sanitize_filename(strip_epub_extension(name.trim()));
+    // The extension is looked for once the name is clean: in "Book.epub?" the
+    // `?` hid it, and the name came out `Book.epub.epub`. What the name starts
+    // with goes after it: a dot or a dash there hides the file or reads as a
+    // flag, but the dot of an extension with nothing before it, taken off
+    // first, named the book `epub.epub`.
+    let clean = sanitize_filename(name);
+    let mut name = fit(strip_epub_extension(&clean).trim_start_matches([' ', '.', '-']));
 
-    // Truncate by characters, not bytes — the latter would split a multi-byte
-    // codepoint and panic.
-    if name.chars().count() > MAX_FILENAME_CHARS {
-        name = name.chars().take(MAX_FILENAME_CHARS).collect();
-        name = name.trim_end_matches([' ', '.', '-']).to_string();
+    // Windows takes a name that is a device's up to its first dot for the
+    // device, `CON.epub` and `Con. Law.epub` alike, and makes no file of it.
+    if let Some(end) = windows_device_end(&name) {
+        name.insert(end, '_');
+        name = fit(&name);
     }
 
     // Nothing left, or nothing but dots, names no file.
@@ -529,6 +603,32 @@ fn finish_filename(name: &str) -> String {
     }
 
     format!("{name}.epub")
+}
+
+/// `name` cut to [`MAX_FILENAME_BYTES`], and without the spaces, dots and
+/// dashes it then ends with. It is cut in bytes, at the end of a character:
+/// cut at 200 characters, a long Japanese title made a name of 374 bytes,
+/// which Linux refuses.
+fn fit(name: &str) -> String {
+    let mut end = name.len().min(MAX_FILENAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].trim_end_matches([' ', '.', '-']).to_string()
+}
+
+/// Where the name of the Windows device `name` would be taken for ends, if
+/// any: Windows reads a name up to its first dot, less the spaces that part
+/// ends with, and in any case.
+fn windows_device_end(name: &str) -> Option<usize> {
+    let device = name
+        .split_once('.')
+        .map_or(name, |(before, _)| before)
+        .trim_end_matches(' ');
+    WINDOWS_DEVICES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(device))
+        .then_some(device.len())
 }
 
 /// Fill in a custom template. `{field}` is replaced by its value, and `{{` and
@@ -618,7 +718,14 @@ fn sanitize_filename(name: &str) -> String {
         }
     }
 
-    let out: String = out.nfc().collect();
+    let mut out: String = out.nfc().collect();
+
+    // A field a template fills with nothing leaves the brackets round it,
+    // `Title ()`, which then say nothing either; and with them gone, brackets
+    // round those may hold nothing in turn.
+    while EMPTY_BRACKETS.is_match(&out) {
+        out = EMPTY_BRACKETS.replace_all(&out, "").into_owned();
+    }
 
     // Collapse runs of whitespace, and of dashes.
     let mut collapsed = String::with_capacity(out.len());
@@ -634,6 +741,9 @@ fn sanitize_filename(name: &str) -> String {
     }
 
     // A name ending in a dot or a dash looks broken, and Windows drops a
-    // trailing dot altogether; leading ones hide the file or read as flags.
-    collapsed.trim_matches([' ', '.', '-']).to_string()
+    // trailing dot altogether. A field a template fills with nothing leaves
+    // the dashes either side of it, `Author - - Title`; one of them is enough.
+    let collapsed = EMPTY_BETWEEN_DASHES.replace_all(&collapsed, "-");
+
+    collapsed.trim_end_matches([' ', '.', '-']).to_string()
 }

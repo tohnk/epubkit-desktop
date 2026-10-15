@@ -244,15 +244,15 @@ fn local_name(node: &Node) -> String {
         .to_ascii_lowercase()
 }
 
-/// Keep the first element of a run and unlink the rest.
+/// Keep the first element of a run and remove the rest, freeing them.
 ///
 /// Unlike lxml, where text following an element is stored *on* that element as
 /// its tail and has to be reattached by hand before removal, libxml2 keeps it
-/// in a separate sibling text node — so unlinking cannot swallow prose.
+/// in a separate sibling text node — so removing one cannot swallow prose.
 fn collapse_run(run: &mut Vec<Node>, removed: &mut usize) {
     if run.len() > 1 {
-        for mut node in run.drain(1..) {
-            node.unlink();
+        for node in run.drain(1..) {
+            xml::discard(node);
             *removed += 1;
         }
     }

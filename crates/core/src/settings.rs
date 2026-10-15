@@ -27,6 +27,7 @@
 //!   desk, not a processing taste, so it is sticky on its own. So is how the
 //!   output is named, which is about the user's library, not the book.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,15 @@ pub const FULL: &str = "full";
 pub const CUSTOM: &str = "custom";
 
 const RESERVED_IDS: &[&str] = &[QUICK, FULL, CUSTOM];
+
+/// The JPEG qualities an option set may hold: what the window's slider
+/// allows and the command line takes.
+pub const QUALITY: std::ops::RangeInclusive<u8> = 20..=95;
+
+/// `quality`, or the nearer end of [`QUALITY`] where it is outside it.
+fn in_range(quality: u8) -> u8 {
+    quality.clamp(*QUALITY.start(), *QUALITY.end())
+}
 
 /// The processing choices a preset can hold.
 ///
@@ -105,7 +115,7 @@ impl OptionSet {
             grayscale: self.grayscale,
             eink_quantize: self.grayscale,
             contrast_boost: self.contrast_boost,
-            quality: self.quality,
+            quality: in_range(self.quality),
             remove_fonts: self.remove_fonts,
             remove_unused_css: self.remove_unused_css,
             light_novel_mode: self.light_novel_mode,
@@ -168,17 +178,58 @@ impl Settings {
         }
 
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        toml::from_str(&text).map_err(|e| Error::Settings(format!("{}: {e}", path.display())))
+        let mut settings: Self = toml::from_str(&text)
+            .map_err(|e| Error::Settings(format!("{}: {e}", path.display())))?;
+
+        // A file edited by hand, or by another version, can name a device
+        // this build does not know, or a quality the window cannot show and
+        // the command line would refuse. Each reads as what books are made
+        // with, so that is what the window and `settings show` name.
+        settings.device = settings.device_profile().id.to_string();
+        settings.options.quality = in_range(settings.options.quality);
+        for preset in &mut settings.presets {
+            preset.options.quality = in_range(preset.options.quality);
+        }
+        Ok(settings)
     }
 
+    /// Write settings to `path`, whole. They are written beside it and moved
+    /// into place, so whoever reads them meanwhile, the app or another run of
+    /// the CLI, finds the settings before or the settings after, never a file
+    /// half written; and a save that is stopped part way leaves the old ones.
+    /// A file that is a link to one elsewhere, there yet or not, is saved
+    /// where it points; and a file is as readable as before, a new one as
+    /// any its owner makes, one already there as it was.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
+        let path = through_links(path);
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(directory).map_err(|e| Error::io(directory, e))?;
 
         let text = toml::to_string_pretty(self)
             .map_err(|e| Error::Settings(format!("could not serialize settings: {e}")))?;
-        std::fs::write(path, text).map_err(|e| Error::io(path, e))
+        let mut builder = tempfile::Builder::new();
+        // A temporary file is private, which the settings file never was.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        let mut file = builder
+            .tempfile_in(directory)
+            .map_err(|e| Error::io(directory, e))?;
+        if let Ok(existing) = std::fs::metadata(&path) {
+            file.as_file()
+                .set_permissions(existing.permissions())
+                .map_err(|e| Error::io(file.path(), e))?;
+        }
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.as_file().sync_all())
+            .map_err(|e| Error::io(file.path(), e))?;
+        file.persist(&path).map_err(|e| Error::io(&path, e.error))?;
+        Ok(())
     }
 
     /// The device profile, falling back to the default if the stored id is not
@@ -315,6 +366,23 @@ impl Settings {
             .find(|candidate| !taken(candidate))
             .expect("an unused suffix always exists")
     }
+}
+
+/// `path`, or where it is a link, the file it leads to, through as many links
+/// as a system follows, whether or not that file is there yet.
+fn through_links(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        // A relative link leads from the folder it is in.
+        path = match path.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    path
 }
 
 /// Turn a display name into something safe to use as an id and a TOML key.

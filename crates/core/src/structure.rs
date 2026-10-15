@@ -512,7 +512,7 @@ pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result
     )?;
 
     let mut removed = 0;
-    for mut node in nodes {
+    for node in nodes {
         let href = decode(&node.get_attribute("href").unwrap_or_default());
         let name = Path::new(&href)
             .file_name()
@@ -520,7 +520,7 @@ pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result
             .unwrap_or_default();
 
         if !name.is_empty() && font_names.contains(&name) {
-            node.unlink();
+            xml::discard(node);
             removed += 1;
         }
     }
@@ -534,7 +534,7 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
         return Err(Error::InvalidEpub("OPF has no manifest".into()));
     };
 
-    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
+    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF, "")?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add manifest item: {e}")))?;
@@ -917,7 +917,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
                     svg.add_prev_sibling(&mut img).ok();
                 }
             }
-            svg.unlink();
+            xml::discard(svg);
             changed += 1;
             continue;
         }
@@ -964,9 +964,9 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         image.remove_attribute("srcset").ok();
         image.remove_attribute("sizes").ok();
         if local_name(&parent) == "picture" && pictures.insert(parent.node_ptr()) {
-            for mut source in parent.get_child_elements() {
+            for source in parent.get_child_elements() {
                 if local_name(&source) == "source" {
-                    source.unlink();
+                    xml::discard(source);
                 }
             }
         }
@@ -1715,9 +1715,9 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         }
 
         let mut fixed_here = 0;
-        for (mut svg, img, unwrapped) in wrappers {
+        for (svg, img, unwrapped) in wrappers {
             if unwrapped {
-                svg.unlink();
+                xml::discard(svg);
                 fixed_here += 1;
             } else {
                 img.free_subtree();
@@ -2518,7 +2518,7 @@ fn add_ncx_to_opf(doc: &Document, ncx_href: &str) -> Result<()> {
     // A book may already use "ncx" for something else.
     let id = unused_id(&ids_in(doc)?, "ncx");
 
-    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
+    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF, "")?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add NCX to manifest: {e}")))?;

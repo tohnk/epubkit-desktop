@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
 use epubkit_core::metadata::{FilenameFormat, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingOptions};
-use epubkit_core::settings::Settings;
+use epubkit_core::settings::{Settings, QUALITY};
 use epubkit_core::{metadata, package, structure, xml};
 
 #[derive(Parser)]
@@ -50,7 +50,12 @@ enum Command {
         #[arg(short, long)]
         device: Option<String>,
         /// JPEG quality, 20-95.
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            value_parser = clap::value_parser!(u8)
+                .range(i64::from(*QUALITY.start())..=i64::from(*QUALITY.end()))
+        )]
         quality: Option<u8>,
         /// Rotate and split landscape artwork for vertical reading.
         #[arg(long)]
@@ -170,10 +175,10 @@ fn main() -> Result<()> {
                 settings.select(preset)?;
             }
             if let Some(device) = &device {
-                if epubkit_core::image::device(device).is_none() {
+                let Some(profile) = epubkit_core::image::device(device) else {
                     anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
-                }
-                settings.device = device.clone();
+                };
+                settings.device = profile.id.to_string();
             }
 
             // Each flag can only turn something off, so saved settings stay the
@@ -219,12 +224,25 @@ fn main() -> Result<()> {
                 settings.filename.format = format;
             }
 
+            // A template that will name the book is checked before anything
+            // is saved, whoever saved it: the window saves the field as it is
+            // typed in. A book named by -o takes no name from it at all.
+            if output.is_none() && settings.filename.format == FilenameFormat::Custom {
+                metadata::check_template(&settings.filename.template).context(
+                    "the saved filename template cannot name the book; \
+                     set another with --filename-template or --filename",
+                )?;
+            }
+
             // Metadata edits are about one book, so they are never persisted.
-            let options = settings.processing_options(MetadataEdits {
+            let mut options = settings.processing_options(MetadataEdits {
                 title,
                 author,
                 language: None,
             });
+            if output.is_some() {
+                options.filename.format = FilenameFormat::Original;
+            }
 
             if !no_save {
                 settings.save(&path).context("saving settings")?;
@@ -480,10 +498,10 @@ fn settings_command(action: SettingsAction) -> Result<()> {
             println!("deleted '{id}'");
         }
         SettingsAction::Device { device } => {
-            if epubkit_core::image::device(&device).is_none() {
+            let Some(profile) = epubkit_core::image::device(&device) else {
                 anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
-            }
-            settings.device = device;
+            };
+            settings.device = profile.id.to_string();
             println!("device set to {}", settings.device);
         }
     }

@@ -142,7 +142,31 @@ On the CLI, saved settings are the base and the flags are overrides: each
 `--no-*` flag can only turn something off, so an option nobody mentioned keeps
 whatever it had. `--filename` and `--filename-template` are remembered too.
 Metadata edits (`--title`, `--author`) are about one book and are never
-persisted.
+persisted. `--quality` is refused outside 20 to 95, the range the window's
+slider allows; any byte was taken, and remembered, so `--quality 9` meant as
+90 made every book after it at the worst quality the encoder has. A quality
+outside that range in the settings file, written by hand or by an older
+version, is brought to the nearer end of it as the file is loaded, a saved
+preset's too; kept, it was run with while the window showed "9%" with its
+slider at 20. A device the file names reads as the device books are made
+for: `X3`, or an id this build does not know, was made for as the X4 while
+the window and `settings show` named it as written.
+
+A filename template is checked, before anything is saved, by a run it will
+name; one naming its book with `-o` takes no name from it. The window saves
+the template as it is typed in, and one saved half typed stopped every run,
+`-o` or not, after the run's flags had been saved.
+
+Settings are saved whole: written to a file beside the real one, flushed, and
+moved into place. The window saves after every change and the CLI after every
+run, and written in place, a save emptied the file before writing it, so the
+other could read no settings at all, take defaults in their place and save
+those over every preset, or read half a file, which does not parse, and refuse
+to start until it was deleted. With two writers and a reader, a third of the
+loads in three seconds found one or the other; now none do. A settings file
+that is a link to one elsewhere, there yet or not, is saved where it points,
+and a saved file is as readable as it was: a new one as any file its owner
+makes, one already there as it was made.
 
 ## Validating against the reference
 
@@ -849,6 +873,49 @@ now be named exactly as the file it came from, neither front end ever
 replaces a file that is already there; the output becomes `name (2).epub`.
 The CLI used to write over one without asking.
 
+Two of its rules differ from upstream's. A book is named from its metadata as
+it stands once the user's edits are in, before anything is stripped: upstream
+named it from what was left after cleaning the metadata, which strips
+Calibre's tags, where an EPUB 2 book keeps its series, so under the default
+preset `{series}` and `{series_index}` were always empty for such a book. And
+a name is cut at 200 bytes, at the end of a character, not at 200 characters:
+Linux's filesystems count a name in bytes and take 255, and a long Japanese
+title, cut at 200 characters, made a name of 374 bytes, which they refuse as
+the finished book is moved into place.
+
+An edited title or author goes into the package document as the text it is.
+The port set it with libxml2's `set_content`, which parses what it is given
+for an element as markup, so an `&` was taken for the start of a reference
+and dropped: "Tom & Jerry" came out "Tom  Jerry", in the book and its name.
+Upstream assigned the text, as lxml escapes it. What XML cannot hold is left
+out of an edit: a control character, which libxml2 2.9 writes into a document
+that then does not parse, and a NUL, which panicked. An edit of nothing but
+spaces is no edit, as an empty one is; upstream wrote it. A field the book lacks
+is made with the `dc` prefix: Dublin Core declared as the default namespace
+of `<metadata>` took `<metadata>` and its `<meta>`s with it, and where
+`<metadata>` declared a default of its own, the book failed.
+
+A name's `.epub` is looked for once the name is clean, so "Book.epub?" is no
+longer named `Book.epub.epub`, as upstream named it; and a field a template
+leaves empty leaves one dash rather than the two either side of it, and no
+brackets round it: `{title} ({year})` names a book with no date `Title.epub`,
+not `Title ().epub`. A date put where none is known gives no `{year}`, where
+upstream's gave `0101`: Calibre writes `0101-01-01` for one and takes any
+year before 101 for none, so no year up to 101 counts. And a name Windows
+keeps for a device, `CON`, `NUL`, `COM1` and the rest, which it reads up to
+the name's first dot, gets a `_` after it: `Con. Law` is named
+`Con_. Law.epub`, which Windows can make.
+
+### Cleaning metadata keeps a book's series
+
+Upstream's metadata cleaning strips every `calibre:` tag, `calibre:series`
+and `calibre:series_index` among them, and EPUB 2 has no tag of its own for a
+series, so an EPUB 2 book came out of a cleaning in none. The port keeps
+those two. CrossInk, a custom firmware for Xteink's readers, sorts its
+library by series and shows a book's under its title, and reads it from
+them, or failing them from an EPUB 3 book's `belongs-to-collection`, which
+cleaning always kept.
+
 ### Paths in a book stay inside it
 
 The reference joined manifest hrefs, and the package path in
@@ -974,6 +1041,27 @@ tree.
 The reference re-read and re-wrote the package document at nearly every step.
 The port parses it once, applies every edit to that one document, and writes it
 once before repackaging.
+
+### What is taken out of a document is freed
+
+lxml frees an element once nothing holds it. libxml2 frees only what its
+document still reaches, and the Rust bindings leave a node that is unlinked
+to that document, which never reaches it again: unlinked and not freed, it
+is kept until the process ends. The port unlinked empty paragraphs, unused
+manifest entries, store tags and the like, a dozen kinds, and freed none, so
+the window, which runs book after book in one process, grew with each: a
+book losing 60,000 empty paragraphs added 23 MB a run, 308 MB by the
+twelfth. Each is now freed as it is taken out, with `xml::discard`, which
+frees it with the bindings' `free_subtree`, which also makes any handle still
+held to it inert. A node that is gone for good is taken out that way, never
+with `unlink` alone. One exception: `free_subtree` follows an entity
+reference into the entity's declaration and on through the declarations
+beside it, and where one entity refers to another declared before it, it goes
+round them for ever. A node it would meet a reference in, under it or in an
+attribute's value, is only unlinked, as before. That was first judged by
+whether the node, written out, had an `&` in it, which as often stood for a
+quote in an attribute or an ampersand in text: Word's empty paragraph, its
+style naming a font in quotes, was never freed.
 
 ### Optimized books can be larger than the originals
 

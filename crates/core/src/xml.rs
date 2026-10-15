@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use libxml::parser::{Parser, ParserOptions};
-use libxml::tree::{Document, Namespace, Node, SaveOptions};
+use libxml::tree::{Document, Namespace, Node, NodeType, SaveOptions};
 use libxml::xpath::Context;
 
 use crate::{Error, Result};
@@ -137,6 +137,49 @@ pub fn attribute_values(
         .collect())
 }
 
+/// Take `node` out of its document for good, and free it.
+///
+/// libxml2 keeps a node that is only unlinked until the process ends: its
+/// document no longer reaches it, and nothing else frees it. The bindings'
+/// `free_subtree` frees it, and makes any handle still held into it inert;
+/// but it follows an entity reference into the entity's declaration, and on
+/// through the declarations beside it, and where one refers to another
+/// declared before it, it goes round them for ever. A node it would meet a
+/// reference in is only unlinked, as every node was: few are.
+pub fn discard(node: Node) {
+    if reaches_an_entity(&node) {
+        let mut node = node;
+        node.unlink();
+    } else {
+        node.free_subtree();
+    }
+}
+
+/// Whether `free_subtree` would meet an entity reference freeing `node`: in
+/// it or anything under it, or in the value of an attribute of an element
+/// there, which it goes through as well. Written out, a node told more than
+/// that: an `&` stood as much for a quote in an attribute, written `&quot;`,
+/// or for an ampersand in text, and a node holding one was never freed.
+fn reaches_an_entity(node: &Node) -> bool {
+    let mut stack = vec![node.clone()];
+    while let Some(node) = stack.pop() {
+        match node.get_type() {
+            Some(NodeType::EntityRefNode) => return true,
+            Some(NodeType::ElementNode) => {
+                for (name, namespace) in node.get_properties_ns().into_keys() {
+                    stack.extend(match namespace {
+                        Some(namespace) => node.get_property_node_ns(&name, &namespace.get_href()),
+                        None => node.get_property_node_no_ns(&name),
+                    });
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.get_child_nodes());
+    }
+    false
+}
+
 /// An XPath step matching an element by local name, ignoring namespaces.
 pub fn local(name: &str) -> String {
     format!("*[local-name()='{name}']")
@@ -146,7 +189,16 @@ pub fn local(name: &str) -> String {
 ///
 /// Reuses a declaration already in scope where possible, so appending an
 /// element does not litter the document with duplicate `xmlns:` attributes.
-pub fn namespace_for(doc: &Document, node: &mut Node, href: &str) -> Result<Option<Namespace>> {
+/// One declared here takes `prefix`, or where `node` binds that already, the
+/// first of `prefix1`, `prefix2` and on that it does not. Declared with no
+/// prefix, as the default namespace, it takes `node` and the children it
+/// does not prefix into it too.
+pub fn namespace_for(
+    doc: &Document,
+    node: &mut Node,
+    href: &str,
+    prefix: &str,
+) -> Result<Option<Namespace>> {
     if let Some(existing) = node
         .get_namespaces(doc)
         .into_iter()
@@ -154,7 +206,20 @@ pub fn namespace_for(doc: &Document, node: &mut Node, href: &str) -> Result<Opti
     {
         return Ok(Some(existing));
     }
-    Namespace::new("", href, node)
-        .map(Some)
-        .map_err(|e| Error::Xml(format!("could not declare namespace {href}: {e}")))
+    let mut failed = None;
+    for candidate in
+        std::iter::once(prefix.to_string()).chain((1..10).map(|n| format!("{prefix}{n}")))
+    {
+        match Namespace::new(&candidate, href, node) {
+            Ok(namespace) => return Ok(Some(namespace)),
+            Err(error) => failed = Some(error),
+        }
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    Err(Error::Xml(format!(
+        "could not declare namespace {href}: {}",
+        failed.map_or_else(String::new, |e| e.to_string())
+    )))
 }
