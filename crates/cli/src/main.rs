@@ -224,12 +224,25 @@ fn main() -> Result<()> {
                 settings.filename.format = format;
             }
 
+            // A template that will name the book is checked before anything
+            // is saved, whoever saved it: the window saves the field as it is
+            // typed in. A book named by -o takes no name from it at all.
+            if output.is_none() && settings.filename.format == FilenameFormat::Custom {
+                metadata::check_template(&settings.filename.template).context(
+                    "the saved filename template cannot name the book; \
+                     set another with --filename-template or --filename",
+                )?;
+            }
+
             // Metadata edits are about one book, so they are never persisted.
-            let options = settings.processing_options(MetadataEdits {
+            let mut options = settings.processing_options(MetadataEdits {
                 title,
                 author,
                 language: None,
             });
+            if output.is_some() {
+                options.filename.format = FilenameFormat::Original;
+            }
 
             if !no_save {
                 settings.save(&path).context("saving settings")?;
