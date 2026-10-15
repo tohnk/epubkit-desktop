@@ -217,6 +217,12 @@ fn a_folder_that_cannot_be_looked_in_is_named() {
     std::fs::write(shut.join("away.epub"), b"").unwrap();
     std::fs::write(root.join("open.epub"), b"").unwrap();
     std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads a folder whatever its mode, so there is none to name.
+    if std::fs::read_dir(&shut).is_ok() {
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: this user reads a folder whatever its mode");
+        return;
+    }
 
     let found = tauri::async_runtime::block_on(commands::find_books(vec![root
         .to_string_lossy()
