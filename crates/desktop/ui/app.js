@@ -561,6 +561,14 @@ function wireEvents() {
         if (chosen) await addBooks(Array.isArray(chosen) ? chosen : [chosen]);
     });
 
+    // A folder can be chosen as it can be dropped; the dialog chooses files
+    // or folders, not both, so it has a way of its own.
+    document.getElementById('choose-folder').addEventListener('click', async (event) => {
+        event.stopPropagation();
+        const chosen = await open({ directory: true, multiple: true });
+        if (chosen) await addBooks(Array.isArray(chosen) ? chosen : [chosen]);
+    });
+
     // Tauri delivers OS drag-and-drop as a window event, not a DOM one.
     listen('tauri://drag-drop', (event) => addBooks(event.payload.paths ?? []));
     listen('tauri://focus', reloadSettings);
