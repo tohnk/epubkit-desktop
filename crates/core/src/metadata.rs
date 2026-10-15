@@ -582,9 +582,12 @@ fn strip_epub_extension(name: &str) -> &str {
 /// Make a name a safe filename with an `.epub` extension.
 fn finish_filename(name: &str) -> String {
     // The extension is looked for once the name is clean: in "Book.epub?" the
-    // `?` hid it, and the name came out `Book.epub.epub`.
+    // `?` hid it, and the name came out `Book.epub.epub`. What the name starts
+    // with goes after it: a dot or a dash there hides the file or reads as a
+    // flag, but the dot of an extension with nothing before it, taken off
+    // first, named the book `epub.epub`.
     let clean = sanitize_filename(name);
-    let mut name = fit(strip_epub_extension(&clean));
+    let mut name = fit(strip_epub_extension(&clean).trim_start_matches([' ', '.', '-']));
 
     // Windows takes a name that is a device's up to its first dot for the
     // device, `CON.epub` and `Con. Law.epub` alike, and makes no file of it.
@@ -737,10 +740,9 @@ fn sanitize_filename(name: &str) -> String {
     }
 
     // A name ending in a dot or a dash looks broken, and Windows drops a
-    // trailing dot altogether; leading ones hide the file or read as flags.
-    // A field a template fills with nothing leaves the dashes either side of
-    // it, `Author - - Title`; one of them is enough.
+    // trailing dot altogether. A field a template fills with nothing leaves
+    // the dashes either side of it, `Author - - Title`; one of them is enough.
     let collapsed = EMPTY_BETWEEN_DASHES.replace_all(&collapsed, "-");
 
-    collapsed.trim_matches([' ', '.', '-']).to_string()
+    collapsed.trim_end_matches([' ', '.', '-']).to_string()
 }

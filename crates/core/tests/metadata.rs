@@ -379,11 +379,29 @@ fn filenames_drop_control_characters() {
 
 /// A name's extension is taken off once the name is clean: "Book.epub?" came
 /// out `Book.epub.epub`, its extension hidden by the `?` until that was gone.
+///
+/// Nothing before it is nothing to name a book by: cleaning took the dot of
+/// an extension with nothing before it for a leading one, and the name came
+/// out `epub.epub`.
 #[test]
 fn an_extension_is_found_once_the_name_is_clean() {
     assert_eq!(format_filename("Book.epub?", ""), "Book.epub");
     assert_eq!(format_filename("Book.EPUB*", ""), "Book.epub");
     assert_eq!(format_filename("Book - .epub", ""), "Book.epub");
+
+    assert_eq!(format_filename("?.epub", ""), "optimized.epub");
+    assert_eq!(format_filename("", ".epub"), "optimized.epub");
+    assert_eq!(
+        named(&book("", ""), FilenameFormat::Custom, "{title}.epub", ""),
+        "optimized.epub"
+    );
+    assert_eq!(
+        named(&book("???", ""), FilenameFormat::Custom, "{title}.epub", ""),
+        "optimized.epub"
+    );
+    // What a name starts with still goes, once the extension is off.
+    assert_eq!(format_filename(".hidden", ""), "hidden.epub");
+    assert_eq!(format_filename("- flag.epub", ""), "flag.epub");
 }
 
 /// A field a template leaves empty does not leave the dashes either side of
