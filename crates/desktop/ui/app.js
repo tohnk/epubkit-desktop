@@ -24,6 +24,7 @@ const resultsItems = document.getElementById('results-items');
 const optimizeBtn = document.getElementById('optimize-btn');
 const stopBtn = document.getElementById('stop-btn');
 const stopReadingBtn = document.getElementById('stop-reading-btn');
+const clearBtn = document.getElementById('clear-btn');
 const qualitySlider = document.getElementById('quality');
 const qualityValue = document.getElementById('quality-value');
 const statusLine = document.getElementById('status-line');
@@ -441,6 +442,9 @@ async function optimize() {
     stopBtn.hidden = false;
     stopBtn.disabled = false;
     stopBtn.textContent = 'Stop';
+    // The results show as each book finishes, Start again beneath them: used
+    // during the run, it emptied the list and hid the run, Stop with it.
+    clearBtn.hidden = true;
     resultsSection.hidden = true;
     resultsItems.innerHTML = '';
     progressSection.hidden = false;
@@ -471,6 +475,7 @@ async function optimize() {
         optimizeBtn.disabled = false;
         optimizeBtn.textContent = 'Optimize';
         stopBtn.hidden = true;
+        clearBtn.hidden = false;
     }
 }
 
@@ -681,7 +686,8 @@ function wireEvents() {
         setStatus(`Stopped reading. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
     });
 
-    document.getElementById('clear-btn').addEventListener('click', () => {
+    clearBtn.addEventListener('click', () => {
+        if (running) return;
         // A read still under way would list its books again a moment later.
         forgetReads();
         books = [];
