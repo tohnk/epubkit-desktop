@@ -1,9 +1,9 @@
 //! Stopping a run from the terminal.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Lines, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 
 /// A book of `chapters` short chapters, for a run to spend a while on.
 fn write_long_book(path: &Path, chapters: usize) {
@@ -56,6 +56,84 @@ fn write_long_book(path: &Path, chapters: usize) {
     zip.finish().unwrap();
 }
 
+/// The command line optimizing a long book in `dir`, into `out` there, with
+/// `tmp` there for its temporary directory.
+struct Run {
+    process: Child,
+    lines: Lines<BufReader<ChildStderr>>,
+    said: String,
+}
+
+impl Run {
+    fn start(dir: &Path) -> Self {
+        let book = dir.join("long.epub");
+        write_long_book(&book, 1500);
+        for folder in ["out", "tmp"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        let mut process = Command::new(env!("CARGO_BIN_EXE_epubkit"))
+            .arg("optimize")
+            .arg(&book)
+            .arg("-o")
+            .arg(dir.join("out/long.epub"))
+            .arg("--no-save")
+            .env("HOME", dir)
+            .env("XDG_CONFIG_HOME", dir.join(".config"))
+            .env("TMPDIR", dir.join("tmp"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(process.stderr.take().unwrap()).lines();
+        Self {
+            process,
+            lines,
+            said: String::new(),
+        }
+    }
+
+    /// Read what the run says until it says `text`.
+    fn wait_for(&mut self, text: &str) {
+        for line in self.lines.by_ref() {
+            let line = line.unwrap();
+            self.said.push_str(&line);
+            self.said.push('\n');
+            if line.contains(text) {
+                return;
+            }
+        }
+        panic!("the run never said {text:?}:\n{}", self.said);
+    }
+
+    /// Interrupt the run, as Ctrl-C does.
+    fn interrupt(&self) {
+        let sent = Command::new("kill")
+            .args(["-INT", &self.process.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+    }
+
+    /// How the run ended, and all it said.
+    fn end(self) -> (ExitStatus, String) {
+        let Run {
+            mut process,
+            lines,
+            mut said,
+        } = self;
+        for line in lines {
+            said.push_str(&line.unwrap());
+            said.push('\n');
+        }
+        (process.wait().unwrap(), said)
+    }
+}
+
+/// How many files are in `folder` of `dir`.
+fn left(dir: &Path, folder: &str) -> usize {
+    std::fs::read_dir(dir.join(folder)).unwrap().count()
+}
+
 /// Ctrl-C stops a run at its next step, and the run takes what it was making
 /// with it. It ended the program there and then, which left the run's staging
 /// file beside where the book was going, and the whole book unpacked in the
@@ -63,52 +141,42 @@ fn write_long_book(path: &Path, chapters: usize) {
 #[test]
 fn ctrl_c_stops_a_run_and_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
-    let book = dir.path().join("long.epub");
-    write_long_book(&book, 1500);
-    let out = dir.path().join("out");
-    let temporary = dir.path().join("tmp");
-    std::fs::create_dir_all(&out).unwrap();
-    std::fs::create_dir_all(&temporary).unwrap();
+    let mut run = Run::start(dir.path());
 
-    let mut run = Command::new(env!("CARGO_BIN_EXE_epubkit"))
-        .arg("optimize")
-        .arg(&book)
-        .arg("-o")
-        .arg(out.join("long.epub"))
-        .arg("--no-save")
-        .env("HOME", dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".config"))
-        .env("TMPDIR", &temporary)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    // Interrupted as Ctrl-C would, once the chapters are being repaired.
-    let mut said = String::new();
-    let mut lines = BufReader::new(run.stderr.take().unwrap()).lines();
-    for line in lines.by_ref() {
-        let line = line.unwrap();
-        said.push_str(&line);
-        said.push('\n');
-        if line.contains("Repairing HTML") {
-            break;
-        }
-    }
-    let interrupted = Command::new("kill")
-        .args(["-INT", &run.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(interrupted.success());
-    for line in lines {
-        said.push_str(&line.unwrap());
-        said.push('\n');
-    }
-    let ended = run.wait().unwrap();
+    // Interrupted once the chapters are being repaired.
+    run.wait_for("Repairing HTML");
+    run.interrupt();
+    let (ended, said) = run.end();
 
     assert_eq!(ended.code(), Some(130), "{ended:?}:\n{said}");
-    assert!(said.contains("Stopped"), "{said}");
-    let left = |dir: &Path| std::fs::read_dir(dir).unwrap().count();
-    assert_eq!(left(&out), 0, "left in the output folder");
-    assert_eq!(left(&temporary), 0, "left in the temporary directory");
+    assert!(said.contains("Stopped: nothing was written."), "{said}");
+    assert_eq!(left(dir.path(), "out"), 0, "left in the output folder");
+    assert_eq!(
+        left(dir.path(), "tmp"),
+        0,
+        "left in the temporary directory"
+    );
+}
+
+/// A second Ctrl-C, once the first is taken, ends the program there and then,
+/// for a run slow to reach its next step: it leaves the staging file and the
+/// unpacked book behind, as Ctrl-C did. Two sent together are taken as one.
+#[test]
+fn a_second_ctrl_c_ends_the_program_there_and_then() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::start(dir.path());
+
+    run.wait_for("Repairing HTML");
+    run.interrupt();
+    run.wait_for("Stopping");
+    run.interrupt();
+    let (ended, said) = run.end();
+
+    assert_eq!(ended.code(), Some(130), "{ended:?}:\n{said}");
+    assert!(
+        !said.contains("Stopped:"),
+        "it stopped at its next step:\n{said}"
+    );
+    assert_eq!(left(dir.path(), "out"), 1, "the staging file");
+    assert_eq!(left(dir.path(), "tmp"), 1, "the unpacked book");
 }
