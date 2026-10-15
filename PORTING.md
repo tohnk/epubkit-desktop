@@ -106,7 +106,9 @@ pinned by tests:
 - Every command the page's script invokes must be registered in `lib.rs`;
   one that is not is refused only when called, and its button does nothing.
   `the_page_invokes_only_commands_the_app_registers` checks the two files
-  against each other.
+  against each other, and `the_page_listens_for_the_events_the_app_emits`
+  holds the events the app emits to those the page listens for: renamed on
+  one side only, a run's progress would stand still and no result would show.
 
 A run of books can be stopped. Stop, beside Processing, stops the book being
 made, which is not written, and begins no other, each then saying it was
@@ -120,10 +122,17 @@ last is done. A book whose run panics fails on its own: the panic went up
 through the run of every book dropped with it.
 
 A folder dropped on the window gives the books in it and in the folders in
-it, leaving out what is hidden, as the `._` file macOS writes beside each book
-on an SD card is; it did nothing. A book dropped again while it is still
-being read is listed once, not twice. Emptying a book's title or author field
-leaves the book its own, which the field then shows, greyed.
+it, linked in or not, leaving out what is hidden, as the `._` file macOS
+writes beside each book on an SD card is; it did nothing. More than 16 books
+are read 16 at a time: each 16 show as they are read, the footer counts them,
+and a Stop beneath it ends the read, keeping what was read. A book dropped
+again while it is still being read is listed once, not twice, and Start again
+drops a read under way, which listed its books again a moment later.
+Emptying a book's title or author field leaves the book its own, which the
+field then shows, greyed.
+
+A stop is kept to while the book is packed, the last step, as at any other:
+the run went on to write the book there, having said it was stopping.
 
 ## Using the CLI
 
