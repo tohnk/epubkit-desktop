@@ -905,6 +905,16 @@ keeps for a device, `CON`, `NUL`, `COM1` and the rest, which it reads up to
 the name's first dot, gets a `_` after it: `Con. Law` is named
 `Con_. Law.epub`, which Windows can make.
 
+### Cleaning metadata keeps a book's series
+
+Upstream's metadata cleaning strips every `calibre:` tag, `calibre:series`
+and `calibre:series_index` among them, and EPUB 2 has no tag of its own for a
+series, so an EPUB 2 book came out of a cleaning in none. The port keeps
+those two. CrossInk, a custom firmware for Xteink's readers, sorts its
+library by series and shows a book's under its title, and reads it from
+them, or failing them from an EPUB 3 book's `belongs-to-collection`, which
+cleaning always kept.
+
 ### Paths in a book stay inside it
 
 The reference joined manifest hrefs, and the package path in
