@@ -889,7 +889,8 @@ for an element as markup, so an `&` was taken for the start of a reference
 and dropped: "Tom & Jerry" came out "Tom  Jerry", in the book and its name.
 Upstream assigned the text, as lxml escapes it. What XML cannot hold is left
 out of an edit: a control character, which libxml2 2.9 writes into a document
-that then does not parse, and a NUL, which panicked. A field the book lacks
+that then does not parse, and a NUL, which panicked. An edit of nothing but
+spaces is no edit, as an empty one is; upstream wrote it. A field the book lacks
 is made with the `dc` prefix: Dublin Core declared as the default namespace
 of `<metadata>` took `<metadata>` and its `<meta>`s with it, and where
 `<metadata>` declared a default of its own, the book failed.
@@ -1056,8 +1057,11 @@ held to it inert. A node that is gone for good is taken out that way, never
 with `unlink` alone. One exception: `free_subtree` follows an entity
 reference into the entity's declaration and on through the declarations
 beside it, and where one entity refers to another declared before it, it goes
-round them for ever. A node whose text has an `&` in it, a reference or an
-escaped character, is only unlinked, as before.
+round them for ever. A node it would meet a reference in, under it or in an
+attribute's value, is only unlinked, as before. That was first judged by
+whether the node, written out, had an `&` in it, which as often stood for a
+quote in an attribute or an ampersand in text: Word's empty paragraph, its
+style naming a font in quotes, was never freed.
 
 ### Optimized books can be larger than the originals
 
