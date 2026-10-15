@@ -72,6 +72,12 @@ const LAST_UNKNOWN_YEAR: u16 = 101;
 /// a field it fills with nothing.
 static EMPTY_BETWEEN_DASHES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-(?: *-)+").unwrap());
 
+/// Brackets with nothing in them but spaces, dashes and more such brackets,
+/// as a template leaves round a field it fills with nothing, and the spaces
+/// before them.
+static EMPTY_BRACKETS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*[(\[{][\s()\[\]{}-]*[)\]}]").unwrap());
+
 /// What a custom filename template can fill in.
 pub const TEMPLATE_FIELDS: &[&str] = &[
     "title",
@@ -674,6 +680,10 @@ fn sanitize_filename(name: &str) -> String {
     }
 
     let out: String = out.nfc().collect();
+
+    // A field a template fills with nothing leaves the brackets round it,
+    // `Title ()`, which then say nothing either.
+    let out = EMPTY_BRACKETS.replace_all(&out, "");
 
     // Collapse runs of whitespace, and of dashes.
     let mut collapsed = String::with_capacity(out.len());

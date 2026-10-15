@@ -399,6 +399,38 @@ fn an_empty_field_does_not_leave_its_separators() {
     }
 }
 
+/// Nor the brackets round it: `{title} ({year})` named a book with no date
+/// `The Book Title ().epub`.
+#[test]
+fn an_empty_field_does_not_leave_its_brackets() {
+    let book = book("The Book Title", "Jane Author");
+    for (template, expected) in [
+        ("{title} ({year})", "The Book Title.epub"),
+        ("[{series_index}] {title}", "The Book Title.epub"),
+        (
+            "{author} ({year}) - {title}",
+            "Jane Author - The Book Title.epub",
+        ),
+        ("{title} [{series} - {series_index}]", "The Book Title.epub"),
+        ("{title} ({series} [{series_index}])", "The Book Title.epub"),
+        ("{title} {{{year}}}", "The Book Title.epub"),
+        // What is in them stays, with the brackets.
+        ("{title} (#{series_index})", "The Book Title (#).epub"),
+    ] {
+        let name = named(&book, FilenameFormat::Custom, template, "x.epub");
+        assert_eq!(name, expected, "{template}");
+    }
+
+    let dated = Metadata {
+        year: "1937".into(),
+        ..book.clone()
+    };
+    assert_eq!(
+        named(&dated, FilenameFormat::Custom, "{title} ({year})", ""),
+        "The Book Title (1937).epub"
+    );
+}
+
 /// Truncation cuts at the end of a character, wherever the byte limit falls —
 /// slicing a multi-byte codepoint would panic.
 #[test]
