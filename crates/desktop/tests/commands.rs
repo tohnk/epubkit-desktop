@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use epubkit_core::metadata::{FilenameFormat, FilenameOptions, TEMPLATE_FIELDS};
@@ -277,6 +278,22 @@ fn naming(format: FilenameFormat) -> Settings {
     }
 }
 
+/// One book made as the window makes each, by a run nobody stops.
+fn optimize_one(
+    job: &commands::Job,
+    destination: &Path,
+    settings: &Settings,
+    progress: impl FnMut(u8, &str),
+) -> commands::Outcome {
+    commands::optimize_one(
+        job,
+        destination,
+        settings,
+        progress,
+        &AtomicBool::new(false),
+    )
+}
+
 /// The window names its books as chosen, not only the CLI.
 #[test]
 fn a_book_is_written_under_the_chosen_name() {
@@ -285,7 +302,7 @@ fn a_book_is_written_under_the_chosen_name() {
     demo_epub(&book);
     let out = tempfile::tempdir().unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         out.path(),
         &naming(FilenameFormat::TitleAuthor),
@@ -315,7 +332,7 @@ fn keeping_the_original_name_never_replaces_the_original() {
     demo_epub(&book);
     let before = std::fs::read(&book).unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         dir.path(),
         &naming(FilenameFormat::Original),
@@ -359,7 +376,7 @@ fn a_failed_run_removes_nothing_it_did_not_make() {
     let bystander = out.path().join(".epubkit-0.part");
     std::fs::write(&bystander, b"someone else's file").unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&out.path().join("missing.epub")),
         out.path(),
         &naming(FilenameFormat::AuthorTitle),
@@ -371,6 +388,60 @@ fn a_failed_run_removes_nothing_it_did_not_make() {
         std::fs::read(&bystander).ok().as_deref() == Some(b"someone else's file".as_slice()),
         "a file the run did not make was removed or changed"
     );
+}
+
+/// A run told to stop stops the book it is making, which is not written, and
+/// begins no other; each says it was stopped. Nothing could stop a run but
+/// closing the window, which left the book's staging file in the folder the
+/// books were going to.
+#[test]
+fn a_stopped_run_writes_nothing_more_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.epub");
+    let second = dir.path().join("second.epub");
+    titled_epub(&first, "First");
+    titled_epub(&second, "Second");
+    let jobs = [job(&first), job(&second)];
+    let out = tempfile::tempdir().unwrap();
+    let settings = naming(FilenameFormat::Title);
+
+    let stop = AtomicBool::new(false);
+    let mut finished = Vec::new();
+    let outcomes = commands::optimize_all(
+        &jobs,
+        out.path(),
+        &settings,
+        &stop,
+        |index, percent, _| {
+            if index == 0 && percent >= 15 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        },
+        |outcome| finished.push(outcome.path.clone()),
+    );
+
+    assert_eq!(finished, [jobs[0].path.clone(), jobs[1].path.clone()]);
+    for outcome in &outcomes {
+        assert!(outcome.stopped, "{outcome:?}");
+        assert!(outcome.output.is_none() && outcome.error.is_some());
+    }
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    // Not stopped, every book is made.
+    let outcomes = commands::optimize_all(
+        &jobs,
+        out.path(),
+        &settings,
+        &AtomicBool::new(false),
+        |_, _, _| {},
+        |_| {},
+    );
+    let made: Vec<_> = outcomes
+        .iter()
+        .map(|outcome| title_of(outcome.output.as_ref().unwrap()))
+        .collect();
+    assert_eq!(made, ["First", "Second"]);
+    assert!(outcomes.iter().all(|outcome| !outcome.stopped));
 }
 
 /// A book whose run panics fails on its own, as one whose run errs does. The
@@ -385,7 +456,7 @@ fn a_book_whose_run_panics_fails_on_its_own() {
     let out = tempfile::tempdir().unwrap();
     let settings = naming(FilenameFormat::AuthorTitle);
 
-    let outcome = commands::optimize_one(&job(&book), out.path(), &settings, |percent, _| {
+    let outcome = optimize_one(&job(&book), out.path(), &settings, |percent, _| {
         assert!(percent < 50, "a bug halfway through the book");
     });
 
@@ -396,7 +467,7 @@ fn a_book_whose_run_panics_fails_on_its_own() {
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
 
     // And the next book is made as ever.
-    let next = commands::optimize_one(&job(&book), out.path(), &settings, |_, _| {});
+    let next = optimize_one(&job(&book), out.path(), &settings, |_, _| {});
     assert!(next.error.is_none(), "{:?}", next.error);
 }
 
@@ -414,7 +485,7 @@ fn a_book_is_not_written_through_a_link() {
     let out = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(&precious, out.path().join(".epubkit-0.part")).unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         out.path(),
         &naming(FilenameFormat::AuthorTitle),
@@ -438,9 +509,9 @@ fn runs_side_by_side_keep_their_own_books() {
     let settings = naming(FilenameFormat::TitleAuthor);
 
     let mut inner = None;
-    let outer = commands::optimize_one(&job(&first), out.path(), &settings, |percent, _| {
+    let outer = optimize_one(&job(&first), out.path(), &settings, |percent, _| {
         if percent == 100 && inner.is_none() {
-            inner = Some(commands::optimize_one(
+            inner = Some(optimize_one(
                 &job(&second),
                 out.path(),
                 &settings,
@@ -487,6 +558,34 @@ fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
             &rest[..rest.find('"').expect("unterminated attribute")]
         })
         .collect()
+}
+
+/// Every command the page's script invokes is one the app registers. One it
+/// does not is refused only when the page calls it, and a button bound to it
+/// does nothing.
+#[test]
+fn the_page_invokes_only_commands_the_app_registers() {
+    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
+        .expect("the page's script should be readable");
+    let app = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("the app's source should be readable");
+
+    let invoked: std::collections::BTreeSet<&str> = script
+        .match_indices("invoke('")
+        .map(|(at, marker)| {
+            let rest = &script[at + marker.len()..];
+            &rest[..rest.find('\'').expect("unterminated command name")]
+        })
+        .collect();
+    for name in ["load_settings", "optimize_books", "stop_run"] {
+        assert!(invoked.contains(name), "{name} not found in {invoked:?}");
+    }
+    for name in invoked {
+        assert!(
+            app.contains(&format!("commands::{name},")),
+            "the page invokes '{name}', which the app does not register"
+        );
+    }
 }
 
 /// Every `data-option` the page binds to must exist in the serialized options.

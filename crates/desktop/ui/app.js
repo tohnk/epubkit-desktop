@@ -22,6 +22,7 @@ const progressItems = document.getElementById('progress-items');
 const resultsSection = document.getElementById('results-section');
 const resultsItems = document.getElementById('results-items');
 const optimizeBtn = document.getElementById('optimize-btn');
+const stopBtn = document.getElementById('stop-btn');
 const qualitySlider = document.getElementById('quality');
 const qualityValue = document.getElementById('quality-value');
 const statusLine = document.getElementById('status-line');
@@ -334,6 +335,9 @@ async function optimize() {
     running = true;
     optimizeBtn.disabled = true;
     optimizeBtn.textContent = 'Processing…';
+    stopBtn.hidden = false;
+    stopBtn.disabled = false;
+    stopBtn.textContent = 'Stop';
     resultsSection.hidden = true;
     resultsItems.innerHTML = '';
     progressSection.hidden = false;
@@ -359,6 +363,7 @@ async function optimize() {
         running = false;
         optimizeBtn.disabled = false;
         optimizeBtn.textContent = 'Optimize';
+        stopBtn.hidden = true;
     }
 }
 
@@ -368,7 +373,7 @@ function showResults(outcomes) {
 
     for (const outcome of outcomes) {
         const card = document.createElement('div');
-        card.className = `result-card ${outcome.error ? 'error' : 'success'}`;
+        card.className = `result-card ${outcomeKind(outcome)}`;
 
         if (outcome.error) {
             card.innerHTML = `
@@ -434,7 +439,19 @@ function wireEvents() {
     listen('finished', ({ payload }) => {
         const item = progressItems.querySelector(`[data-path="${cssEscape(payload.path)}"]`);
         if (!item) return;
-        item.querySelector('.progress-bar').classList.add(payload.error ? 'error' : 'complete');
+        const kind = outcomeKind(payload);
+        item.querySelector('.progress-bar').classList.add(kind === 'success' ? 'complete' : kind);
+        if (payload.error) item.querySelector('.progress-message').textContent = payload.error;
+    });
+
+    stopBtn.addEventListener('click', async () => {
+        stopBtn.disabled = true;
+        stopBtn.textContent = 'Stopping…';
+        try {
+            await invoke('stop_run');
+        } catch (error) {
+            setStatus(`Could not stop: ${error}`, true);
+        }
     });
 
     fileList.addEventListener('click', (event) => {
@@ -544,6 +561,12 @@ function wireEvents() {
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// How a book's run ended: made, failed, or stopped before it was made.
+function outcomeKind(outcome) {
+    if (outcome.stopped) return 'stopped';
+    return outcome.error ? 'error' : 'success';
+}
 
 function setStatus(message, isError = false) {
     statusLine.textContent = message;

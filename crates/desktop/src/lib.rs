@@ -32,7 +32,24 @@ pub fn run() {
             commands::check_filename_template,
             commands::inspect_books,
             commands::optimize_books,
+            commands::stop_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("epubkit failed to start");
+        // Closed or quit during a run, the window stops the run and goes once
+        // it has, so the run takes what it was making with it.
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if commands::stop_before_closing() {
+                    api.prevent_close();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("epubkit failed to start")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if commands::stop_before_closing() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

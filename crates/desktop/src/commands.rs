@@ -5,12 +5,12 @@
 //! `epubkit-core` so the CLI and the window cannot drift apart.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use base64::Engine;
 use epubkit_core::memory::MemoryBudget;
 use epubkit_core::metadata::{self, MetadataEdits};
-use epubkit_core::pipeline::{process_epub, ProcessingReport};
+use epubkit_core::pipeline::{process_epub_stoppable, ProcessingReport};
 use epubkit_core::settings::Settings;
 use epubkit_core::{image, package, preview, worker, Error};
 use serde::{Deserialize, Serialize};
@@ -152,10 +152,8 @@ pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
     tauri::async_runtime::spawn_blocking(move || {
         map_in_parallel(&paths, |path| {
             let path = Path::new(path);
-            unless_it_panics(
-                || inspect_one(path),
-                |message| BookInfo::failed(path, message),
-            )
+            unless_it_panics(|| inspect_one(path))
+                .unwrap_or_else(|message| BookInfo::failed(path, message))
         })
     })
     .await
@@ -258,7 +256,7 @@ struct Progress {
     message: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcome {
     pub path: String,
@@ -266,6 +264,55 @@ pub struct Outcome {
     pub summary: String,
     pub report: Option<ProcessingReport>,
     pub error: Option<String>,
+    /// Not made because the run was stopped, whether partway through the
+    /// book or before it was begun. `error` says which.
+    pub stopped: bool,
+}
+
+impl Outcome {
+    fn failed(job: &Job, error: impl std::fmt::Display) -> Self {
+        Self {
+            path: job.path.clone(),
+            output: None,
+            summary: String::new(),
+            report: None,
+            error: Some(error.to_string()),
+            stopped: false,
+        }
+    }
+
+    fn stopped(job: &Job, why: impl std::fmt::Display) -> Self {
+        Self {
+            stopped: true,
+            ..Self::failed(job, why)
+        }
+    }
+}
+
+/// Set to stop the run under way at its next step.
+static STOP: AtomicBool = AtomicBool::new(false);
+/// Set while books are being optimized.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Set when the window was closed during a run, to close once it has stopped.
+static CLOSE_WHEN_STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Stop the run under way: the book being made is not written, and no other
+/// is begun.
+#[tauri::command]
+pub fn stop_run() {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// Whether the window, asked to close, must wait. During a run it stops the
+/// run, and closes once that has stopped, so the run takes the files it was
+/// making with it, as it cannot if the program simply ends. Asked again
+/// meanwhile, it closes there and then.
+pub fn stop_before_closing() -> bool {
+    if RUNNING.load(Ordering::SeqCst) && !CLOSE_WHEN_STOPPED.swap(true, Ordering::SeqCst) {
+        STOP.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.
@@ -281,44 +328,77 @@ pub async fn optimize_books(
     settings: Settings,
 ) -> Response<Vec<Outcome>> {
     tauri::async_runtime::spawn_blocking(move || {
-        let destination = PathBuf::from(destination);
+        STOP.store(false, Ordering::SeqCst);
+        RUNNING.store(true, Ordering::SeqCst);
         let total = jobs.len();
-        let mut outcomes = Vec::with_capacity(total);
-
-        for (index, job) in jobs.iter().enumerate() {
-            let emit = |percent: u8, message: &str| {
+        let outcomes = optimize_all(
+            &jobs,
+            Path::new(&destination),
+            &settings,
+            &STOP,
+            |index, percent, message| {
                 let _ = app.emit(
                     "progress",
                     Progress {
-                        path: job.path.clone(),
+                        path: jobs[index].path.clone(),
                         index,
                         total,
                         percent,
                         message: message.to_string(),
                     },
                 );
-            };
-
-            let outcome = optimize_one(job, &destination, &settings, emit);
-
-            let _ = app.emit("finished", outcome.clone());
-            outcomes.push(outcome);
+            },
+            |outcome| {
+                let _ = app.emit("finished", outcome.clone());
+            },
+        );
+        RUNNING.store(false, Ordering::SeqCst);
+        if CLOSE_WHEN_STOPPED.swap(false, Ordering::SeqCst) {
+            app.exit(0);
         }
-
         Ok(outcomes)
     })
     .await
     .map_err(to_message)?
 }
 
-/// Optimize one book into `destination`, as [`optimize_books`] does for each.
+/// Optimize each of `jobs` into `destination`, as [`optimize_books`] does,
+/// telling `progress` how the book at each index goes and `finished` how
+/// each went. A book that fails does not stop the rest. Once `stop` is set,
+/// the book being made is not written and no other is begun, and each says
+/// it was stopped.
 ///
 /// Apart so it can be tested without a window.
+pub fn optimize_all(
+    jobs: &[Job],
+    destination: &Path,
+    settings: &Settings,
+    stop: &AtomicBool,
+    mut progress: impl FnMut(usize, u8, &str),
+    mut finished: impl FnMut(&Outcome),
+) -> Vec<Outcome> {
+    let mut outcomes = Vec::with_capacity(jobs.len());
+    for (index, job) in jobs.iter().enumerate() {
+        let outcome = if stop.load(Ordering::SeqCst) {
+            Outcome::stopped(job, "not begun: the run was stopped")
+        } else {
+            let progress = |percent: u8, message: &str| progress(index, percent, message);
+            optimize_one(job, destination, settings, progress, stop)
+        };
+        finished(&outcome);
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+/// Optimize one book into `destination`, as [`optimize_all`] does each,
+/// stopping once `stop` is set.
 pub fn optimize_one(
     job: &Job,
     destination: &Path,
     settings: &Settings,
     progress: impl FnMut(u8, &str),
+    stop: &AtomicBool,
 ) -> Outcome {
     let input = PathBuf::from(&job.path);
     let options = settings.processing_options(MetadataEdits {
@@ -327,35 +407,28 @@ pub fn optimize_one(
         language: None,
     });
 
-    let failed = |error: String| Outcome {
-        path: job.path.clone(),
-        output: None,
-        summary: String::new(),
-        report: None,
-        error: Some(error),
-    };
-
     // The output name comes from the book's metadata, which is not known until
     // the run finishes — so write beside the destination and move the book
     // into place once the report says what to call it. The staging file is
     // this run's own, and goes with it unless the book is published.
     let staging = match metadata::staging_file(destination) {
         Ok(staging) => staging,
-        Err(error) => return failed(error.to_string()),
+        Err(error) => return Outcome::failed(job, error),
     };
 
-    let run = unless_it_panics(
-        || process_epub(&input, staging.path(), &options, progress).map_err(to_message),
-        Err,
-    );
+    let run = unless_it_panics(|| {
+        process_epub_stoppable(&input, staging.path(), &options, progress, stop)
+    });
     let report = match run {
-        Ok(report) => report,
-        Err(error) => return failed(error),
+        Ok(Ok(report)) => report,
+        Ok(Err(Error::Stopped)) => return Outcome::stopped(job, Error::Stopped),
+        Ok(Err(error)) => return Outcome::failed(job, error),
+        Err(panic) => return Outcome::failed(job, panic),
     };
 
     let final_path = match metadata::publish(staging, &destination.join(&report.output_filename)) {
         Ok(path) => path,
-        Err(error) => return failed(error.to_string()),
+        Err(error) => return Outcome::failed(job, error),
     };
 
     Outcome {
@@ -364,22 +437,23 @@ pub fn optimize_one(
         summary: report.summary(),
         report: Some(report),
         error: None,
+        stopped: false,
     }
 }
 
 // ------------------------------------------------------------------ helpers
 
-/// What `work` gives, or if it panics, what `failed` makes of the panic. A
-/// panic is a bug, but one book's: it went up through every book read or run
-/// with it, and the window learned of none of them.
-fn unless_it_panics<R>(work: impl FnOnce() -> R, failed: impl FnOnce(String) -> R) -> R {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+/// What `work` gives, or if it panics, what went wrong. A panic is a bug, but
+/// one book's: it went up through every book read or run with it, and the
+/// window learned of none of them.
+fn unless_it_panics<R>(work: impl FnOnce() -> R) -> Result<R, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).map_err(|panic| {
         let message = panic
             .downcast_ref::<&str>()
             .map(|message| message.to_string())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_default();
-        failed(format!("internal error: {message}"))
+        format!("internal error: {message}")
     })
 }
 
