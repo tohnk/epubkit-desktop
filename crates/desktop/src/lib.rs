@@ -10,6 +10,8 @@
 
 pub mod commands;
 
+use tauri::Manager;
+
 pub fn run() {
     // A copy of this binary launched as a decode worker serves requests and
     // never returns here; it must not reach the window. The parent then runs
@@ -37,18 +39,18 @@ pub fn run() {
         ])
         // Closed or quit during a run, the window stops the run and goes once
         // it has, so the run takes what it was making with it.
-        .on_window_event(|_window, event| {
+        .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if commands::stop_before_closing() {
+                if commands::stop_before_closing(window.app_handle()) {
                     api.prevent_close();
                 }
             }
         })
         .build(tauri::generate_context!())
         .expect("epubkit failed to start")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if commands::stop_before_closing() {
+                if commands::stop_before_closing(app) {
                     api.prevent_exit();
                 }
             }

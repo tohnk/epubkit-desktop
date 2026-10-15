@@ -14,7 +14,7 @@ use epubkit_core::pipeline::{process_epub_stoppable, ProcessingReport};
 use epubkit_core::settings::Settings;
 use epubkit_core::{image, package, preview, worker, Error};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// Commands report failure as a string; the page has no use for a typed error.
 type Response<T> = Result<T, String>;
@@ -409,9 +409,15 @@ pub fn stop_run() {
 }
 
 /// Whether the window, asked to close, must wait for the run to stop: see
-/// [`RunState::stop_before_closing`].
-pub fn stop_before_closing() -> bool {
-    RUN.stop_before_closing()
+/// [`RunState::stop_before_closing`]. When it must, the page is told, so it
+/// says the window will go once the run has stopped; it said nothing, and a
+/// second close, taken for impatience, ended the program there and then.
+pub fn stop_before_closing<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if RUN.stop_before_closing() {
+        let _ = app.emit("closing", ());
+        return true;
+    }
+    false
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.

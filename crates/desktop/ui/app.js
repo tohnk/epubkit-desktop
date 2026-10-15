@@ -581,6 +581,14 @@ function wireEvents() {
         if (payload.error) item.querySelector('.progress-message').textContent = payload.error;
     });
 
+    // Closed during a run, the window stops the run, and goes once it has.
+    listen('closing', () => {
+        stopping = true;
+        stopBtn.disabled = true;
+        stopBtn.textContent = 'Stopping…';
+        setStatus('Stopping, then closing…');
+    });
+
     stopBtn.addEventListener('click', async () => {
         stopping = true;
         stopBtn.disabled = true;
