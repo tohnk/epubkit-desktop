@@ -112,8 +112,9 @@ pinned by tests:
   So, too, `the_page_invokes_each_command_with_the_arguments_it_takes` holds
   the arguments of each call to the command's parameters, camelCased as
   Tauri looks for them; `the_page_reads_only_what_the_app_sends` holds each
-  field the page reads off a result, a book, an event or the settings to the
-  ones the app serializes, a result's camelCased sizes among them; and
+  field the page reads or sets on a result, a book, an event or the settings
+  to the ones the app serializes, a result's camelCased sizes among them, but
+  for the two the page adds to a book itself; and
   `the_page_has_every_element_its_script_looks_up` holds the script's ids to
   the page's.
 
@@ -158,12 +159,16 @@ gives "choose a folder" the folder chosen.
 
 A stop is kept to while the book is packed, the last step, as at any other:
 the run went on to write the book there, having said it was stopping. Within
-a step, it is kept to before the next document, image or file the run would
-begin, not at the step's end: a step over every chapter of a long book took
-seconds, up to 1.7 on a Bible of 1196 documents, and a quit from the Dock
-gives a run ten. A run is over however it ends, a panic past every book's
-own catch too, which left it running, so that the window waited on it to
-close.
+a step, it is kept to before the next document the run would read, image it
+would convert, or file it would unpack or pack, not at the step's end: a
+step over every chapter of a long book took seconds, up to 1.7 on a Bible of
+1196 documents, and a quit from the Dock gives a run ten. Making a table of
+contents from the chapters' titles is such a step, for a book with no usable
+NCX. The one walk left unchecked, through the unpacked book for the files an
+operating system leaves, reads no document: 3 ms on that Bible, far less
+than the stop then spends deleting the same files. A run is over however it
+ends, a panic past every book's own catch too, which left it running, so
+that the window waited on it to close.
 
 ## Using the CLI
 
