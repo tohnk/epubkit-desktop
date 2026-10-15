@@ -33,6 +33,8 @@ const filenameExample = document.getElementById('filename-example');
 
 /** Books currently listed, in the order they were added. */
 let books = [];
+/** Books being read, to be listed once they have been. */
+const reading = new Set();
 /** The core's settings. Never edited except through `applySettings`. */
 let settings = null;
 let devices = [];
@@ -292,8 +294,12 @@ async function addBooks(paths) {
         return;
     }
 
-    const fresh = [...new Set(found)].filter((path) => !books.some((b) => b.path === path));
+    // A book dropped again while it is still being read is not listed twice.
+    const fresh = [...new Set(found)].filter(
+        (path) => !reading.has(path) && !books.some((b) => b.path === path),
+    );
     if (fresh.length === 0) return;
+    for (const path of fresh) reading.add(path);
 
     setStatus(`Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`);
 
@@ -309,6 +315,8 @@ async function addBooks(paths) {
         showReady();
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
+    } finally {
+        for (const path of fresh) reading.delete(path);
     }
 }
 
