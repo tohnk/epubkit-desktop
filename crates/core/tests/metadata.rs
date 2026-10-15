@@ -288,6 +288,24 @@ fn an_edit_leaves_out_what_xml_cannot_hold() {
     assert_eq!(metadata.author, "Bad Title");
 }
 
+/// An edit of nothing but spaces is no edit, as an empty one is and as the
+/// window takes one: `--title "   "` wrote a title that read back as none.
+#[test]
+fn an_edit_of_only_spaces_changes_nothing() {
+    let doc = opf(STANDARD);
+    let edits = MetadataEdits {
+        title: Some("   ".into()),
+        author: Some("\t\n".into()),
+        language: Some(" ".into()),
+    };
+    update_metadata(&doc, &edits).unwrap();
+
+    let metadata = extract_metadata(&opf(&doc.to_string())).unwrap();
+    assert_eq!(metadata.title, "The Book Title");
+    assert_eq!(metadata.author, "Jane Author");
+    assert_eq!(metadata.language, "en");
+}
+
 #[test]
 fn empty_edits_change_nothing() {
     let doc = opf(STANDARD);

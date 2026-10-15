@@ -236,7 +236,8 @@ pub fn extract_metadata(doc: &Document) -> Result<Metadata> {
     Ok(metadata)
 }
 
-/// Apply user edits, creating Dublin Core elements that the book lacks.
+/// Apply user edits, creating Dublin Core elements that the book lacks. An
+/// edit of nothing, or of nothing but spaces, leaves its field alone.
 pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
     let Some(mut metadata_el) = xml::find_first(doc, &format!("//{}", xml::local("metadata")))?
     else {
@@ -248,7 +249,7 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         ("creator", edits.author.as_deref()),
         ("language", edits.language.as_deref()),
     ] {
-        let Some(value) = value.map(xml_text).filter(|v| !v.is_empty()) else {
+        let Some(value) = value.map(xml_text).filter(|v| !v.trim().is_empty()) else {
             continue;
         };
         let value = value.as_str();
