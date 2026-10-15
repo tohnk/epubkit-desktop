@@ -345,14 +345,15 @@ pub struct Job {
     pub author: Option<String>,
 }
 
+/// How far a book's run has got, as the page is told it.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Progress {
-    path: String,
-    index: usize,
-    total: usize,
-    percent: u8,
-    message: String,
+pub struct Progress {
+    pub path: String,
+    pub index: usize,
+    pub total: usize,
+    pub percent: u8,
+    pub message: String,
 }
 
 #[derive(Serialize, Clone, Debug)]

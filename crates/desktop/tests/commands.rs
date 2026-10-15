@@ -783,6 +783,11 @@ fn page() -> String {
         .expect("the page should be readable")
 }
 
+fn script() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
+        .expect("the page's script should be readable")
+}
+
 /// The values of every `name="…"` attribute on the page, in order.
 fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
     let marker = format!("{name}=\"");
@@ -799,8 +804,7 @@ fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
 /// does nothing.
 #[test]
 fn the_page_invokes_only_commands_the_app_registers() {
-    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
-        .expect("the page's script should be readable");
+    let script = script();
     let app = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("the app's source should be readable");
 
@@ -827,8 +831,7 @@ fn the_page_invokes_only_commands_the_app_registers() {
 /// would stand still and no result would show, and nothing would say why.
 #[test]
 fn the_page_listens_for_the_events_the_app_emits() {
-    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
-        .expect("the page's script should be readable");
+    let script = script();
     let commands = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
         .expect("the app's commands should be readable");
 
@@ -850,6 +853,253 @@ fn the_page_listens_for_the_events_the_app_emits() {
 
     assert!(listened.contains("progress"), "{listened:?}");
     assert_eq!(listened, emitted);
+}
+
+/// `text` split at each comma outside brackets, a type's angle brackets
+/// among them.
+fn split_outside_brackets(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut from, mut before) = (0, 0, ' ');
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            // An arrow's is no bracket.
+            '>' if before != '=' && before != '-' => depth -= 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&text[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+        before = c;
+    }
+    parts.push(&text[from..]);
+    parts
+}
+
+/// Each command the page invokes is given the arguments it takes, by the
+/// names Tauri looks for them under: the parameters', camelCased. A parameter
+/// renamed on one side only made the command refuse each call for want of an
+/// argument, and nothing failed until the page made one.
+#[test]
+fn the_page_invokes_each_command_with_the_arguments_it_takes() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let script = script();
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+        .expect("the app's commands should be readable");
+    let camel_case = |name: &str| {
+        let mut words = name.split('_');
+        let first = words.next().unwrap_or_default().to_string();
+        words.fold(first, |name, word| {
+            let mut letters = word.chars();
+            let initial = letters.next().map(|c| c.to_uppercase().collect::<String>());
+            name + &initial.unwrap_or_default() + letters.as_str()
+        })
+    };
+
+    // What each command takes, but for what Tauri hands it itself.
+    let mut takes: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (at, marker) in source.match_indices("#[tauri::command]") {
+        let rest = &source[at + marker.len()..];
+        let rest = &rest[rest.find("fn ").expect("a command is a function") + 3..];
+        let open = rest.find('(').expect("a function has parameters");
+        let name = rest[..open].split('<').next().unwrap_or_default();
+        let parameters = &rest[open + 1..rest.find(')').expect("unterminated parameters")];
+        let arguments = split_outside_brackets(parameters)
+            .into_iter()
+            .filter_map(|parameter| parameter.split_once(':'))
+            .filter(|(_, kind)| !kind.trim().starts_with("AppHandle"))
+            .map(|(name, _)| camel_case(name.trim()))
+            .collect();
+        takes.insert(name, arguments);
+    }
+    assert!(takes.contains_key("optimize_books"), "{takes:?}");
+
+    let mut calls = 0;
+    for (at, marker) in script.match_indices("invoke('") {
+        let rest = &script[at + marker.len()..];
+        let name = &rest[..rest.find('\'').expect("unterminated command name")];
+        let rest = rest[name.len() + 1..].trim_start();
+        let given: BTreeSet<String> = match rest.strip_prefix(',') {
+            Some(rest) => {
+                let object = rest.trim_start().strip_prefix('{').unwrap_or_else(|| {
+                    panic!("invoke('{name}') is given arguments, not an object")
+                });
+                let mut depth = 1;
+                let end = object
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    })
+                    .map(|(end, _)| end)
+                    .expect("unterminated arguments");
+                split_outside_brackets(&object[..end])
+                    .into_iter()
+                    .map(|part| {
+                        part.split(':')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    })
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            }
+            None => BTreeSet::new(),
+        };
+        let wanted = takes
+            .get(name)
+            .unwrap_or_else(|| panic!("the page invokes '{name}', which is no command"));
+        assert_eq!(&given, wanted, "invoke('{name}') is given {given:?}");
+        calls += 1;
+    }
+    assert!(calls >= 10, "{calls} calls found");
+}
+
+/// What the page reads off each thing the app sends it is something the app
+/// sends, under the name it sends it by, but for what the page sets itself.
+/// A run's sizes and the name of the book it wrote are camelCased by the
+/// core: renamed there, each result would read "NaN" and "undefined", and
+/// nothing would fail.
+#[test]
+fn the_page_reads_only_what_the_app_sends() {
+    use epubkit_core::pipeline::ProcessingReport;
+    use std::collections::BTreeSet;
+
+    let script = script();
+    // The fields the page reads off `name`, but those it also sets.
+    let read = |name: &str| {
+        let marker = format!("{name}.");
+        let (mut read, mut set) = (BTreeSet::new(), BTreeSet::new());
+        for (at, _) in script.match_indices(&marker) {
+            let before = script[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                continue;
+            }
+            let rest = &script[at + marker.len()..];
+            let field: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let after = rest[field.len()..].trim_start();
+            if field.is_empty() {
+                continue;
+            } else if after.starts_with('=') && !after.starts_with("==") {
+                set.insert(field);
+            } else {
+                read.insert(field);
+            }
+        }
+        read.retain(|field| !set.contains(field));
+        read
+    };
+    let sends = |value: serde_json::Value| -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+
+    let report = ProcessingReport::default();
+    let outcome = commands::Outcome {
+        path: String::new(),
+        output: Some(String::new()),
+        summary: String::new(),
+        report: Some(report.clone()),
+        error: Some(String::new()),
+        stopped: false,
+    };
+    let progress = commands::Progress {
+        path: String::new(),
+        index: 0,
+        total: 1,
+        percent: 0,
+        message: String::new(),
+    };
+    let book = commands::BookInfo {
+        path: String::new(),
+        filename: String::new(),
+        size: 0,
+        title: String::new(),
+        author: String::new(),
+        series: String::new(),
+        cover: Some(String::new()),
+        error: Some(String::new()),
+    };
+    // The page's events carry a book's progress, or its outcome once it is
+    // done.
+    let mut payload = sends(serde_json::to_value(&progress).unwrap());
+    payload.extend(sends(serde_json::to_value(&outcome).unwrap()));
+
+    for (name, sent) in [
+        ("report", sends(serde_json::to_value(&report).unwrap())),
+        ("outcome", sends(serde_json::to_value(&outcome).unwrap())),
+        ("payload", payload),
+        ("book", sends(serde_json::to_value(&book).unwrap())),
+        (
+            "found",
+            sends(serde_json::to_value(commands::Found::default()).unwrap()),
+        ),
+        (
+            "device",
+            sends(serde_json::to_value(&commands::devices()[0]).unwrap()),
+        ),
+        (
+            "settings",
+            sends(serde_json::to_value(Settings::default()).unwrap()),
+        ),
+    ] {
+        let read = read(name);
+        assert!(!read.is_empty(), "the page reads nothing off {name}");
+        for field in &read {
+            assert!(
+                sent.contains(field),
+                "the page reads {name}.{field}, which the app does not send: it sends {sent:?}"
+            );
+        }
+    }
+}
+
+/// Every element the page's script looks up by its id is on the page. One
+/// that is not is null where the script reaches for it, and what it was doing
+/// there throws partway through: a large drop's read, say, with nothing said.
+#[test]
+fn the_page_has_every_element_its_script_looks_up() {
+    use std::collections::BTreeSet;
+
+    let script = script();
+    let html = page();
+    let ids: BTreeSet<&str> = html
+        .match_indices(" id=\"")
+        .map(|(at, marker)| {
+            let rest = &html[at + marker.len()..];
+            &rest[..rest.find('"').expect("unterminated id")]
+        })
+        .collect();
+    let looked_up: BTreeSet<&str> = script
+        .match_indices("getElementById('")
+        .map(|(at, marker)| {
+            let rest = &script[at + marker.len()..];
+            &rest[..rest.find('\'').expect("unterminated id")]
+        })
+        .collect();
+
+    assert!(looked_up.len() >= 20, "{looked_up:?}");
+    for id in &looked_up {
+        assert!(
+            ids.contains(id),
+            "the script looks up #{id}, which is not on the page"
+        );
+    }
 }
 
 /// Every `data-option` the page binds to must exist in the serialized options.
