@@ -173,6 +173,30 @@ fn empty_paragraphs_of_a_declared_entity_collapse() {
     assert!(out.contains("The next scene."), "{out}");
 }
 
+/// And so do empty paragraphs that name such an entity in an attribute: the
+/// walk that frees a node goes through its attributes' values as through its
+/// text.
+#[test]
+fn empty_paragraphs_naming_a_declared_entity_in_an_attribute_collapse() {
+    let input = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html [<!ENTITY base "gap"><!ENTITY spacer "&base;">]>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>A &spacer; start.</p><p class="&spacer;"></p><p class="&spacer;"></p><p class="&spacer;"></p>
+<p>The next scene.</p>
+</body></html>
+"#;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(normalize_whitespace(input).unwrap()));
+    let (bytes, removed) = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the collapse never finished");
+    let out = String::from_utf8(bytes).unwrap();
+
+    assert_eq!(removed, 2, "{out}");
+    assert!(out.contains("The next scene."), "{out}");
+}
+
 /// An empty element with an id is a link target: a page marker the page list
 /// points at, or the anchor a table of contents entry names.
 #[test]

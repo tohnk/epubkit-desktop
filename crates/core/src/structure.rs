@@ -520,7 +520,7 @@ pub fn update_opf_remove_fonts(doc: &Document, font_paths: &[PathBuf]) -> Result
             .unwrap_or_default();
 
         if !name.is_empty() && font_names.contains(&name) {
-            xml::discard(doc, node);
+            xml::discard(node);
             removed += 1;
         }
     }
@@ -917,7 +917,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
                     svg.add_prev_sibling(&mut img).ok();
                 }
             }
-            xml::discard(&content.doc, svg);
+            xml::discard(svg);
             changed += 1;
             continue;
         }
@@ -966,7 +966,7 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
         if local_name(&parent) == "picture" && pictures.insert(parent.node_ptr()) {
             for source in parent.get_child_elements() {
                 if local_name(&source) == "source" {
-                    xml::discard(&content.doc, source);
+                    xml::discard(source);
                 }
             }
         }
@@ -1717,7 +1717,7 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
         let mut fixed_here = 0;
         for (svg, img, unwrapped) in wrappers {
             if unwrapped {
-                xml::discard(&content.doc, svg);
+                xml::discard(svg);
                 fixed_here += 1;
             } else {
                 img.free_subtree();

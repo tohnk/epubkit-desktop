@@ -430,7 +430,7 @@ pub fn forget_missing_encrypted_files(epub_dir: &Path) -> Result<()> {
             && structure::resolve_href(epub_dir, epub_dir, &decoded)
                 .is_some_and(|file| !file.exists());
         if missing {
-            xml::discard(&doc, data);
+            xml::discard(data);
             forgotten += 1;
         } else {
             kept += 1;

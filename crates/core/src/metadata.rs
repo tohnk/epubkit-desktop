@@ -252,11 +252,11 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         let value = value.as_str();
 
         if let Some(mut existing) = dc_element(doc, local_name)? {
-            set_text(doc, &mut existing, value);
+            set_text(&mut existing, value);
         } else {
             let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC, "dc")?;
             if let Ok(mut created) = metadata_el.new_child(namespace, local_name) {
-                set_text(doc, &mut created, value);
+                set_text(&mut created, value);
             }
         }
     }
@@ -284,9 +284,9 @@ fn xml_text(value: &str) -> String {
 /// Make `value`, as it reads, all the text of `element`. What libxml2's
 /// `set_content` is given for an element it parses as markup, so an `&` in an
 /// edited title was taken for the start of a reference and dropped.
-fn set_text(doc: &Document, element: &mut Node, value: &str) {
+fn set_text(element: &mut Node, value: &str) {
     for child in element.get_child_nodes() {
-        xml::discard(doc, child);
+        xml::discard(child);
     }
     element.append_text(value).ok();
 }
@@ -313,7 +313,7 @@ pub fn strip_store_metadata(doc: &Document) -> Result<usize> {
                     .any(|prefix| name.starts_with(prefix) || property.starts_with(prefix)));
 
         if is_store_tag {
-            xml::discard(doc, meta);
+            xml::discard(meta);
             removed += 1;
         }
     }

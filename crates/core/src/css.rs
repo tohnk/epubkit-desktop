@@ -390,12 +390,12 @@ pub(crate) fn edit_style_element(
         if part.entity {
             // Written out into the text it went to.
             if slot.is_some() {
-                xml::discard(doc, node);
+                xml::discard(node);
             }
         } else if content != css[part.range.clone()] {
             // Text and CDATA take what they are given as it reads.
             if content.is_empty() {
-                xml::discard(doc, node);
+                xml::discard(node);
             } else {
                 node.set_content(&content).ok();
             }

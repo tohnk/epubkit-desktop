@@ -20,7 +20,10 @@ fn resident_kb() -> u64 {
 /// which runs book after book in one process, kept every empty paragraph,
 /// unused manifest entry and store tag of every book it had run: a book
 /// losing 60,000 empty paragraphs grew it by 23 MB each time, to 308 MB by
-/// the twelfth.
+/// the twelfth. Half of these are written as Word writes one, its style
+/// naming a font in quotes: a node written out with an `&` in it was taken
+/// for one holding an entity reference, which is never freed, and `"` in an
+/// attribute is written `&quot;`.
 #[test]
 fn what_a_run_takes_out_of_a_book_is_freed() {
     let dir = tempfile::tempdir().unwrap();
@@ -29,8 +32,9 @@ fn what_a_run_takes_out_of_a_book_is_freed() {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body><p>Start.</p>"#,
     );
-    for _ in 0..10_000 {
+    for _ in 0..5_000 {
         chapter.push_str("<p class=\"gap\"> </p>\n");
+        chapter.push_str("<p style='font-family:\"Times New Roman\"'>&#160;</p>\n");
     }
     chapter.push_str("<p>End.</p></body></html>\n");
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>

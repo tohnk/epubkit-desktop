@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use libxml::parser::{Parser, ParserOptions};
-use libxml::tree::{Document, Namespace, Node, SaveOptions};
+use libxml::tree::{Document, Namespace, Node, NodeType, SaveOptions};
 use libxml::xpath::Context;
 
 use crate::{Error, Result};
@@ -144,16 +144,40 @@ pub fn attribute_values(
 /// `free_subtree` frees it, and makes any handle still held into it inert;
 /// but it follows an entity reference into the entity's declaration, and on
 /// through the declarations beside it, and where one refers to another
-/// declared before it, it goes round them for ever. A node with a reference
-/// in it, or anything else written with `&`, is only unlinked, as every node
-/// was: few are.
-pub fn discard(doc: &Document, node: Node) {
-    if doc.node_to_string(&node).contains('&') {
+/// declared before it, it goes round them for ever. A node it would meet a
+/// reference in is only unlinked, as every node was: few are.
+pub fn discard(node: Node) {
+    if reaches_an_entity(&node) {
         let mut node = node;
         node.unlink();
     } else {
         node.free_subtree();
     }
+}
+
+/// Whether `free_subtree` would meet an entity reference freeing `node`: in
+/// it or anything under it, or in the value of an attribute of an element
+/// there, which it goes through as well. Written out, a node told more than
+/// that: an `&` stood as much for a quote in an attribute, written `&quot;`,
+/// or for an ampersand in text, and a node holding one was never freed.
+fn reaches_an_entity(node: &Node) -> bool {
+    let mut stack = vec![node.clone()];
+    while let Some(node) = stack.pop() {
+        match node.get_type() {
+            Some(NodeType::EntityRefNode) => return true,
+            Some(NodeType::ElementNode) => {
+                for (name, namespace) in node.get_properties_ns().into_keys() {
+                    stack.extend(match namespace {
+                        Some(namespace) => node.get_property_node_ns(&name, &namespace.get_href()),
+                        None => node.get_property_node_no_ns(&name),
+                    });
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.get_child_nodes());
+    }
+    false
 }
 
 /// An XPath step matching an element by local name, ignoring namespaces.

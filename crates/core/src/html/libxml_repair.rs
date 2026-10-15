@@ -270,7 +270,7 @@ fn strip_html_parser_artifacts(doc: &mut Document) {
             _ => false,
         };
         if declaration {
-            xml::discard(doc, child);
+            xml::discard(child);
         }
     }
 }
@@ -345,7 +345,7 @@ fn make_legal_xml(doc: &Document) {
                 Some(NodeType::PiNode) => {
                     let name = node.get_name();
                     if name.eq_ignore_ascii_case("xml") || !is_xml_name(&name) {
-                        xml::discard(doc, node);
+                        xml::discard(node);
                     }
                 }
                 Some(NodeType::ElementNode) => {

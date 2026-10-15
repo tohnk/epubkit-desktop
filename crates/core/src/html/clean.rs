@@ -2,7 +2,7 @@
 //! stripping, blank-element collapsing, and chapter page breaks. The remaining
 //! half of `html_cleaner.py` (the CSS passes live in [`crate::css`]).
 
-use libxml::tree::{Document, Node, NodeType};
+use libxml::tree::{Node, NodeType};
 
 use super::{parse_content, serialize_content};
 use crate::{xml, Result};
@@ -128,11 +128,11 @@ pub fn normalize_whitespace(xhtml_bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
                 // Layout whitespace between blocks does not break a run.
                 Some(NodeType::TextNode) if child.get_content().trim().is_empty() => continue,
                 Some(NodeType::ElementNode) if is_empty_block(&child) => run.push(child),
-                _ => collapse_run(&content.doc, &mut run, &mut removed),
+                _ => collapse_run(&mut run, &mut removed),
             }
         }
 
-        collapse_run(&content.doc, &mut run, &mut removed);
+        collapse_run(&mut run, &mut removed);
     }
 
     if removed == 0 {
@@ -249,10 +249,10 @@ fn local_name(node: &Node) -> String {
 /// Unlike lxml, where text following an element is stored *on* that element as
 /// its tail and has to be reattached by hand before removal, libxml2 keeps it
 /// in a separate sibling text node — so removing one cannot swallow prose.
-fn collapse_run(doc: &Document, run: &mut Vec<Node>, removed: &mut usize) {
+fn collapse_run(run: &mut Vec<Node>, removed: &mut usize) {
     if run.len() > 1 {
         for node in run.drain(1..) {
-            xml::discard(doc, node);
+            xml::discard(node);
             *removed += 1;
         }
     }
