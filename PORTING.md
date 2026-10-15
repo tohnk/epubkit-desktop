@@ -103,6 +103,27 @@ pinned by tests:
   an option added to one and not the other fails the build rather than quietly
   doing nothing. The filename buttons and the template fields the page lists
   are checked against the core the same way.
+- Every command the page's script invokes must be registered in `lib.rs`;
+  one that is not is refused only when called, and its button does nothing.
+  `the_page_invokes_only_commands_the_app_registers` checks the two files
+  against each other.
+
+A run of books can be stopped. Stop, beside Processing, stops the book being
+made, which is not written, and begins no other, each then saying it was
+stopped; closed or quit during a run, the window stops it and goes once it
+has. Nothing stopped a run but ending the program, which left the run's
+staging file in the folder the books were going to and the book unpacked in
+the temporary directory. The footer says how far a run has got, "Optimizing
+book 3 of 10…", and what it came to, "9 optimized, 1 failed", where it read
+"Ready" throughout; each book's result shows as it finishes, not once the
+last is done. A book whose run panics fails on its own: the panic went up
+through the run of every book dropped with it.
+
+A folder dropped on the window gives the books in it and in the folders in
+it, leaving out what is hidden, as the `._` file macOS writes beside each book
+on an SD card is; it did nothing. A book dropped again while it is still
+being read is listed once, not twice. Emptying a book's title or author field
+leaves the book its own, which the field then shows, greyed.
 
 ## Using the CLI
 
@@ -115,6 +136,12 @@ cargo run -p epubkit-cli -- optimize  book.epub
 cargo run -p epubkit-cli -- optimize  book.epub --filename-template '{series} {series_index} - {title}'
 cargo run -p epubkit-cli -- settings  show
 ```
+
+Ctrl-C, or being told to end, stops a run at its next step; the run takes
+what it was making with it, and the program exits with 130. A second Ctrl-C
+ends it there and then, as the first did, leaving the staging file and the
+unpacked book behind. `info` names a book as a run would, by the saved
+naming, where it named every book Author - Title.
 
 ## Settings
 
@@ -171,6 +198,11 @@ loads in three seconds found one or the other; now none do. A settings file
 that is a link to one elsewhere, there yet or not, is saved where it points,
 and a saved file is as readable as it was: a new one as any file its owner
 makes, one already there as it was made.
+
+Saved whole, a change the command line made while the window was open was
+undone at the window's next save. The window reads the settings again
+whenever it comes back to the front, once any change of its own still waiting
+is written.
 
 ## Validating against the reference
 
