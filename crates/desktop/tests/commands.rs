@@ -635,6 +635,36 @@ fn the_page_invokes_only_commands_the_app_registers() {
     }
 }
 
+/// The events the app emits are the events the page listens for, but for the
+/// window's own, `tauri://`. Renamed on one side only, a run's progress bars
+/// would stand still and no result would show, and nothing would say why.
+#[test]
+fn the_page_listens_for_the_events_the_app_emits() {
+    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
+        .expect("the page's script should be readable");
+    let commands = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+        .expect("the app's commands should be readable");
+
+    // The quoted name after each `call`, however the call is laid out.
+    let names = |text: &str, call: &str, quote: char| -> std::collections::BTreeSet<String> {
+        text.match_indices(call)
+            .filter_map(|(at, _)| {
+                let rest = text[at + call.len()..].trim_start();
+                let name = rest.strip_prefix(quote)?;
+                Some(name[..name.find(quote)?].to_string())
+            })
+            .collect()
+    };
+    let listened: std::collections::BTreeSet<String> = names(&script, "listen(", '\'')
+        .into_iter()
+        .filter(|name| !name.starts_with("tauri://"))
+        .collect();
+    let emitted = names(&commands, ".emit(", '"');
+
+    assert!(listened.contains("progress"), "{listened:?}");
+    assert_eq!(listened, emitted);
+}
+
 /// Every `data-option` the page binds to must exist in the serialized options.
 ///
 /// This is the test that was missing. `OptionSet` serializes snake_case (which
