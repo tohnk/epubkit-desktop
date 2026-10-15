@@ -144,7 +144,18 @@ whatever it had. `--filename` and `--filename-template` are remembered too.
 Metadata edits (`--title`, `--author`) are about one book and are never
 persisted. `--quality` is refused outside 20 to 95, the range the window's
 slider allows; any byte was taken, and remembered, so `--quality 9` meant as
-90 made every book after it at the worst quality the encoder has.
+90 made every book after it at the worst quality the encoder has. A quality
+outside that range in the settings file, written by hand or by an older
+version, is brought to the nearer end of it as the file is loaded, a saved
+preset's too; kept, it was run with while the window showed "9%" with its
+slider at 20. A device the file names reads as the device books are made
+for: `X3`, or an id this build does not know, was made for as the X4 while
+the window and `settings show` named it as written.
+
+A filename template is checked, before anything is saved, by a run it will
+name; one naming its book with `-o` takes no name from it. The window saves
+the template as it is typed in, and one saved half typed stopped every run,
+`-o` or not, after the run's flags had been saved.
 
 Settings are saved whole: written to a file beside the real one, flushed, and
 moved into place. The window saves after every change and the CLI after every
@@ -153,7 +164,9 @@ other could read no settings at all, take defaults in their place and save
 those over every preset, or read half a file, which does not parse, and refuse
 to start until it was deleted. With two writers and a reader, a third of the
 loads in three seconds found one or the other; now none do. A settings file
-that is a link to one elsewhere is saved where it points.
+that is a link to one elsewhere, there yet or not, is saved where it points,
+and a saved file is as readable as it was: a new one as any file its owner
+makes, one already there as it was made.
 
 ## Validating against the reference
 
@@ -874,7 +887,16 @@ An edited title or author goes into the package document as the text it is.
 The port set it with libxml2's `set_content`, which parses what it is given
 for an element as markup, so an `&` was taken for the start of a reference
 and dropped: "Tom & Jerry" came out "Tom  Jerry", in the book and its name.
-Upstream assigned the text, as lxml escapes it.
+Upstream assigned the text, as lxml escapes it. What XML cannot hold is left
+out of an edit: a control character, which libxml2 2.9 writes into a document
+that then does not parse, and a NUL, which panicked. A field the book lacks
+is made with the `dc` prefix: Dublin Core declared as the default namespace
+of `<metadata>` took `<metadata>` and its `<meta>`s with it, and where
+`<metadata>` declared a default of its own, the book failed.
+
+A name's `.epub` is looked for once the name is clean, so "Book.epub?" is no
+longer named `Book.epub.epub`, as upstream named it; and a field a template
+leaves empty leaves one dash rather than the two either side of it.
 
 ### Paths in a book stay inside it
 
@@ -1001,6 +1023,24 @@ tree.
 The reference re-read and re-wrote the package document at nearly every step.
 The port parses it once, applies every edit to that one document, and writes it
 once before repackaging.
+
+### What is taken out of a document is freed
+
+lxml frees an element once nothing holds it. libxml2 frees only what its
+document still reaches, and the Rust bindings leave a node that is unlinked
+to that document, which never reaches it again: unlinked and not freed, it
+is kept until the process ends. The port unlinked empty paragraphs, unused
+manifest entries, store tags and the like, a dozen kinds, and freed none, so
+the window, which runs book after book in one process, grew with each: a
+book losing 60,000 empty paragraphs added 23 MB a run, 308 MB by the
+twelfth. Each is now freed as it is taken out, with `xml::discard`, which
+frees it with the bindings' `free_subtree`, which also makes any handle still
+held to it inert. A node that is gone for good is taken out that way, never
+with `unlink` alone. One exception: `free_subtree` follows an entity
+reference into the entity's declaration and on through the declarations
+beside it, and where one entity refers to another declared before it, it goes
+round them for ever. A node whose text has an `&` in it, a reference or an
+escaped character, is only unlinked, as before.
 
 ### Optimized books can be larger than the originals
 
