@@ -98,7 +98,11 @@ pub const X3: DeviceProfile = DeviceProfile {
 pub const DEVICES: &[DeviceProfile] = &[X4, X3];
 
 pub fn device(id: &str) -> Option<DeviceProfile> {
-    DEVICES.iter().copied().find(|d| d.id == id)
+    // `X3` is the X3, however it is written.
+    DEVICES
+        .iter()
+        .copied()
+        .find(|d| d.id.eq_ignore_ascii_case(id))
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

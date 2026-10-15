@@ -175,10 +175,10 @@ fn main() -> Result<()> {
                 settings.select(preset)?;
             }
             if let Some(device) = &device {
-                if epubkit_core::image::device(device).is_none() {
+                let Some(profile) = epubkit_core::image::device(device) else {
                     anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
-                }
-                settings.device = device.clone();
+                };
+                settings.device = profile.id.to_string();
             }
 
             // Each flag can only turn something off, so saved settings stay the
@@ -485,10 +485,10 @@ fn settings_command(action: SettingsAction) -> Result<()> {
             println!("deleted '{id}'");
         }
         SettingsAction::Device { device } => {
-            if epubkit_core::image::device(&device).is_none() {
+            let Some(profile) = epubkit_core::image::device(&device) else {
                 anyhow::bail!("unknown device '{device}' (expected 'x4' or 'x3')");
-            }
-            settings.device = device;
+            };
+            settings.device = profile.id.to_string();
             println!("device set to {}", settings.device);
         }
     }

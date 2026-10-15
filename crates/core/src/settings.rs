@@ -181,8 +181,11 @@ impl Settings {
         let mut settings: Self = toml::from_str(&text)
             .map_err(|e| Error::Settings(format!("{}: {e}", path.display())))?;
 
-        // A file edited by hand, or by an older version, can hold a quality
-        // the window cannot show and the command line would refuse.
+        // A file edited by hand, or by another version, can name a device
+        // this build does not know, or a quality the window cannot show and
+        // the command line would refuse. Each reads as what books are made
+        // with, so that is what the window and `settings show` name.
+        settings.device = settings.device_profile().id.to_string();
         settings.options.quality = in_range(settings.options.quality);
         for preset in &mut settings.presets {
             preset.options.quality = in_range(preset.options.quality);

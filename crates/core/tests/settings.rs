@@ -244,6 +244,22 @@ fn an_unknown_device_falls_back_rather_than_failing() {
     assert_eq!(settings.device_profile().id, "x4");
 }
 
+/// The device a settings file names reads as the device books are made for.
+/// One written otherwise than this build writes it, `X3`, or one it does not
+/// know, `x5`, was made for as the X4, the default, while the window's footer
+/// and `settings show` named it as written.
+#[test]
+fn a_stored_device_reads_as_the_device_books_are_made_for() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    for (stored, made_for) in [("X3", "x3"), ("x5", "x4"), ("", "x4")] {
+        std::fs::write(&path, format!("device = \"{stored}\"\n")).unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.device, made_for, "{stored:?}");
+        assert_eq!(settings.device_profile().id, made_for, "{stored:?}");
+    }
+}
+
 #[test]
 fn a_missing_file_gives_defaults() {
     let dir = tempdir();
