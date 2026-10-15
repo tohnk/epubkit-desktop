@@ -175,6 +175,32 @@ fn a_dropped_folder_gives_the_books_in_it() {
     assert_eq!(found, expected);
 }
 
+/// A folder linked into a dropped one is looked through as any other: a
+/// library kept as links to folders gave none of the books in them. A link
+/// back up the tree is not followed round for ever.
+#[cfg(unix)]
+#[test]
+fn a_dropped_folder_gives_the_books_in_folders_linked_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("Elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("f.epub"), b"").unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("Linked")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("Up")).unwrap();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]))
+    .unwrap();
+
+    assert_eq!(
+        found,
+        [root.join("Linked/f.epub").to_string_lossy().to_string()]
+    );
+}
+
 /// A bad file must not sink the whole drop — it comes back as one failed entry
 /// alongside the books that were fine.
 #[test]

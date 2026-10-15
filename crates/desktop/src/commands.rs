@@ -142,10 +142,11 @@ impl BookInfo {
 }
 
 /// The books among what was dropped on the window: each EPUB itself, and
-/// those in each folder and the folders in it, folder by folder in the order
-/// a listing gives them. What is hidden is left out, a folder or a file: on a
-/// drive it does not format, an SD card say, macOS writes a `._` file beside
-/// each book, and it too ends in `.epub`.
+/// those in each folder and the folders in it, linked in or not, folder by
+/// folder in the order a listing gives them; a link back up the tree is not
+/// followed. What is hidden is left out, a folder or a file: on a drive it
+/// does not format, an SD card say, macOS writes a `._` file beside each
+/// book, and it too ends in `.epub`.
 ///
 /// Runs on a blocking worker: a library takes a while to walk.
 #[tauri::command]
@@ -163,6 +164,7 @@ pub async fn find_books(paths: Vec<String>) -> Response<Vec<String>> {
         for path in paths.iter().map(Path::new) {
             if path.is_dir() {
                 let entries = walkdir::WalkDir::new(path)
+                    .follow_links(true)
                     .sort_by(|a, b| {
                         let name = |entry: &walkdir::DirEntry| {
                             entry.file_name().to_string_lossy().to_lowercase()
