@@ -628,7 +628,7 @@ pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
     }
 
     step(90, "Checking TOC...")?;
-    let toc = structure::fix_toc(work_dir, &opf_dir, &opf)?;
+    let toc = structure::fix_toc_until(work_dir, &opf_dir, &opf, stop)?;
     report.toc_status = toc.describe();
 
     // Every OPF edit lands in one write, rather than the reference's dozen.

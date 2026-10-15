@@ -5,7 +5,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use epubkit_core::pipeline::{process_epub, process_epub_stoppable, ProcessingOptions};
 use epubkit_core::Error;
@@ -25,7 +25,7 @@ fn write_long_epub(path: &Path, chapters: usize) {
         "<p class=\"lead\" data-page=\"1\">It was a  long afternoon &amp; the light was  ",
         "failing, \"slowly\"..... and the water lay still.</p>\n<p></p>\n",
     )
-    .repeat(400);
+    .repeat(2000);
     let mut manifest = String::new();
     let mut spine = String::new();
     let mut texts = Vec::new();
@@ -99,7 +99,7 @@ fn a_run_told_to_stop_partway_through_a_step_stops_within_it() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.epub");
     let output = dir.path().join("out.epub");
-    write_long_epub(&input, 25);
+    write_long_epub(&input, 10);
     let options = ProcessingOptions::default();
 
     // How long each step takes left alone, once a first run has warmed up
@@ -112,15 +112,20 @@ fn a_run_told_to_stop_partway_through_a_step_stops_within_it() {
         })
         .unwrap();
     }
-    let takes = |step: u8| {
-        let at = began.iter().position(|&(percent, _)| percent == step);
-        let at = at.unwrap_or_else(|| panic!("no step {step}: {began:?}"));
-        began[at + 1].1 - began[at].1
-    };
 
-    // Those that take a while: repairing, finding the images, updating
-    // references, removing unused CSS, normalizing and cleaning text.
-    for step in [12, 15, 68, 76, 82, 85] {
+    // Every step that takes a while, a twenty-fifth of the run or more:
+    // those that go through the book chapter by chapter. Found, not listed,
+    // so that a step that comes to take a while is held to this as well:
+    // listed, the steps given a stop were the steps tested.
+    let run = began[began.len() - 1].1 - began[0].1;
+    let long: Vec<(u8, Duration)> = began
+        .windows(2)
+        .map(|pair| (pair[0].0, pair[1].1 - pair[0].1))
+        .filter(|&(_, takes)| takes * 25 >= run)
+        .collect();
+    assert!(long.len() >= 6, "{long:?} of {run:?}");
+
+    for (step, takes) in long {
         let stop = AtomicBool::new(false);
         let mut told = None;
         let result = process_epub_stoppable(
@@ -139,9 +144,8 @@ fn a_run_told_to_stop_partway_through_a_step_stops_within_it() {
 
         assert!(matches!(result, Err(Error::Stopped)), "{step}: {result:?}");
         assert!(
-            stopped_in * 2 < takes(step),
-            "{step}: stopped in {stopped_in:?}, where the step takes {:?}",
-            takes(step)
+            stopped_in * 2 < takes,
+            "{step}: stopped in {stopped_in:?}, where the step takes {takes:?}"
         );
     }
 }
