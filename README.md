@@ -24,7 +24,7 @@ epubkit runs this pipeline on every EPUB:
 | 12 | **Remove embedded fonts** — deletes @font-face rules from CSS, removes font files (.ttf, .otf, .woff, .woff2), and cleans them from the OPF manifest |
 | 13 | **Normalize whitespace** — strips excessive empty paragraphs/divs, adds CSS page-break-before to chapter headings (h1, h2) |
 | 14 | **Text cleanup** — scans all text nodes (skipping script, style, pre, code and other literal text) and fixes: double spaces, OCR ligature artifacts (fi/fl/ffi/ffl/ff), smart quotes → straight quotes, mojibake encoding errors, punctuation issues, Unicode NFC normalization |
-| 15 | **Clean metadata** — strips store-specific tags (Calibre, iBooks, Kindle, Amazon, Google Play, Kobo) |
+| 15 | **Clean metadata** — strips store and tool tags (Calibre, iBooks, Kindle, Amazon, Sigil), keeping a book's series |
 | 16 | **Fix TOC** — validates the Table of Contents, generates one from chapter headings if missing |
 | 17 | **Clean OS artifacts** — removes .DS_Store, Thumbs.db, __MACOSX, desktop.ini, etc. |
 | 18 | **Repackage** — rebuilds the EPUB ZIP with correct mimetype entry and deflate compression |
