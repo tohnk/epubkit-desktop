@@ -146,7 +146,16 @@ pub fn local(name: &str) -> String {
 ///
 /// Reuses a declaration already in scope where possible, so appending an
 /// element does not litter the document with duplicate `xmlns:` attributes.
-pub fn namespace_for(doc: &Document, node: &mut Node, href: &str) -> Result<Option<Namespace>> {
+/// One declared here takes `prefix`, or where `node` binds that already, the
+/// first of `prefix1`, `prefix2` and on that it does not. Declared with no
+/// prefix, as the default namespace, it takes `node` and the children it
+/// does not prefix into it too.
+pub fn namespace_for(
+    doc: &Document,
+    node: &mut Node,
+    href: &str,
+    prefix: &str,
+) -> Result<Option<Namespace>> {
     if let Some(existing) = node
         .get_namespaces(doc)
         .into_iter()
@@ -154,7 +163,20 @@ pub fn namespace_for(doc: &Document, node: &mut Node, href: &str) -> Result<Opti
     {
         return Ok(Some(existing));
     }
-    Namespace::new("", href, node)
-        .map(Some)
-        .map_err(|e| Error::Xml(format!("could not declare namespace {href}: {e}")))
+    let mut failed = None;
+    for candidate in
+        std::iter::once(prefix.to_string()).chain((1..10).map(|n| format!("{prefix}{n}")))
+    {
+        match Namespace::new(&candidate, href, node) {
+            Ok(namespace) => return Ok(Some(namespace)),
+            Err(error) => failed = Some(error),
+        }
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    Err(Error::Xml(format!(
+        "could not declare namespace {href}: {}",
+        failed.map_or_else(String::new, |e| e.to_string())
+    )))
 }

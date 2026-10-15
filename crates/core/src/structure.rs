@@ -534,7 +534,7 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
         return Err(Error::InvalidEpub("OPF has no manifest".into()));
     };
 
-    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
+    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF, "")?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add manifest item: {e}")))?;
@@ -2518,7 +2518,7 @@ fn add_ncx_to_opf(doc: &Document, ncx_href: &str) -> Result<()> {
     // A book may already use "ncx" for something else.
     let id = unused_id(&ids_in(doc)?, "ncx");
 
-    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF)?;
+    let namespace = xml::namespace_for(doc, &mut manifest, NS_OPF, "")?;
     let mut item = manifest
         .new_child(namespace, "item")
         .map_err(|e| Error::Xml(format!("could not add NCX to manifest: {e}")))?;

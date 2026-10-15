@@ -221,7 +221,7 @@ pub fn update_metadata(doc: &Document, edits: &MetadataEdits) -> Result<()> {
         if let Some(mut existing) = dc_element(doc, local_name)? {
             set_text(&mut existing, value);
         } else {
-            let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC)?;
+            let namespace = xml::namespace_for(doc, &mut metadata_el, NS_DC, "dc")?;
             if let Ok(mut created) = metadata_el.new_child(namespace, local_name) {
                 set_text(&mut created, value);
             }

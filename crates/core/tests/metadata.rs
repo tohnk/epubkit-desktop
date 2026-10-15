@@ -219,6 +219,55 @@ fn edits_are_kept_as_typed() {
     }
 }
 
+/// A field the book lacks is made with the `dc` prefix, wherever Dublin Core
+/// is declared. Declared without one, as the default namespace of
+/// `<metadata>`, it took `<metadata>` and its `<meta>`s out of the package's
+/// namespace as the book was written out, where nothing had declared it there
+/// already; and where `<metadata>` declares its own default, it could not be
+/// declared at all, and the book failed.
+#[test]
+fn a_field_the_book_lacks_is_made_without_moving_its_neighbours() {
+    let namespace = |doc: &libxml::tree::Document, name: &str| {
+        xml::find_first(doc, &format!("//*[local-name()='{name}']"))
+            .unwrap()
+            .and_then(|node| node.get_namespace())
+            .map(|ns| ns.get_href())
+            .unwrap_or_default()
+    };
+    for metadata_tag in [
+        "<metadata>",
+        r#"<metadata xmlns="http://www.idpf.org/2007/opf">"#,
+    ] {
+        let doc = opf(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  {metadata_tag}
+    <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">A Title</dc:title>
+    <meta name="cover" content="cover-image"/>
+  </metadata>
+  <manifest/><spine/>
+</package>
+"#
+        ));
+        let edits = MetadataEdits {
+            author: Some("Added Author".into()),
+            ..MetadataEdits::default()
+        };
+        update_metadata(&doc, &edits).unwrap_or_else(|e| panic!("{metadata_tag}: {e}"));
+
+        let written = opf(&doc.to_string());
+        let opf_ns = "http://www.idpf.org/2007/opf";
+        assert_eq!(namespace(&written, "metadata"), opf_ns, "{metadata_tag}");
+        assert_eq!(namespace(&written, "meta"), opf_ns, "{metadata_tag}");
+        assert_eq!(
+            namespace(&written, "creator"),
+            "http://purl.org/dc/elements/1.1/",
+            "{metadata_tag}"
+        );
+        assert_eq!(extract_metadata(&written).unwrap().author, "Added Author");
+    }
+}
+
 #[test]
 fn empty_edits_change_nothing() {
     let doc = opf(STANDARD);
