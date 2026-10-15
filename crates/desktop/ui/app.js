@@ -293,14 +293,23 @@ async function addBooks(paths) {
     const pending = reading;
 
     // What was dropped can be folders of books as well as books, which take a
-    // while to look through.
+    // while to look through: one that takes more than a moment can be
+    // stopped, a home folder say, or a link out of one to a whole disk.
     let found;
+    let slow = false;
+    const stoppable = setTimeout(() => {
+        slow = list === listing;
+        if (slow) countLongRead(1);
+    }, 500);
     try {
         note('Looking for books…');
         found = await invoke('find_books', { paths });
     } catch (error) {
         setStatus(`Could not look through what was dropped: ${error}`, true);
         return;
+    } finally {
+        clearTimeout(stoppable);
+        if (slow && list === listing) countLongRead(-1);
     }
     if (list !== listing) return;
     // A folder that could not be looked in is named, not passed over.
@@ -370,12 +379,14 @@ function countLongRead(change) {
 }
 
 /// Drop every read under way: what they find is not listed, and a book they
-/// were reading is read again if it is dropped again.
+/// were reading is read again if it is dropped again. A walk through what was
+/// dropped stops too.
 function forgetReads() {
     listing += 1;
     reading = new Set();
     longReads = 0;
     stopReadingBtn.hidden = true;
+    invoke('stop_finding').catch(() => {});
 }
 
 /// Draw the list, or with `from`, add to it the books from there on: a large

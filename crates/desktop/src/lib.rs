@@ -47,6 +47,7 @@ pub fn run() {
             commands::delete_preset,
             commands::check_filename_template,
             commands::find_books,
+            commands::stop_finding,
             commands::inspect_books,
             commands::optimize_books,
             commands::stop_run,

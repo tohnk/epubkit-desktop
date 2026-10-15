@@ -149,60 +149,84 @@ impl BookInfo {
 /// does not format, an SD card say, macOS writes a `._` file beside each
 /// book, and it too ends in `.epub`.
 ///
-/// Runs on a blocking worker: a library takes a while to walk.
+/// Runs on a blocking worker: a library takes a while to walk. Stops, with
+/// what it found so far, once [`stop_finding`] is called.
 #[tauri::command]
 pub async fn find_books(paths: Vec<String>) -> Response<Found> {
+    let walk = FINDING.load(Ordering::SeqCst);
     tauri::async_runtime::spawn_blocking(move || {
-        let is_epub = |path: &Path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
-        };
-        let hidden = |entry: &walkdir::DirEntry| {
-            entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
-        };
-
-        let mut found = Found::default();
-        for path in paths.iter().map(Path::new) {
-            if path.is_dir() {
-                let entries = walkdir::WalkDir::new(path)
-                    .follow_links(true)
-                    .sort_by(|a, b| {
-                        let name = |entry: &walkdir::DirEntry| {
-                            entry.file_name().to_string_lossy().to_lowercase()
-                        };
-                        name(a).cmp(&name(b))
-                    })
-                    .into_iter()
-                    .filter_entry(|entry| !hidden(entry));
-                for entry in entries {
-                    match entry {
-                        Ok(entry) => {
-                            if is_epub(entry.path()) && entry.path().is_file() {
-                                found.books.push(entry.path().to_string_lossy().to_string());
-                            }
-                        }
-                        // A folder shut to the app is named. A link back up
-                        // the tree, or to nothing, a book on a card no longer
-                        // in its reader say, is no folder to look in.
-                        Err(error)
-                            if error.io_error().map(std::io::Error::kind)
-                                == Some(std::io::ErrorKind::PermissionDenied) =>
-                        {
-                            found
-                                .unreadable
-                                .push(error.path().unwrap_or(path).to_string_lossy().to_string())
-                        }
-                        Err(_) => {}
-                    }
-                }
-            } else if is_epub(path) && path.is_file() {
-                found.books.push(path.to_string_lossy().to_string());
-            }
-        }
-        found
+        find_books_until(&paths, || FINDING.load(Ordering::SeqCst) != walk)
     })
     .await
     .map_err(to_message)
+}
+
+/// Moved on to stop each walk through a drop under way.
+static FINDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Stop looking through what was dropped: each walk under way stops at the
+/// next thing it would look at.
+#[tauri::command]
+pub fn stop_finding() {
+    FINDING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// [`find_books`], stopping, with what it found so far, at the first thing it
+/// would look at once `stopped` says so.
+pub fn find_books_until(paths: &[String], stopped: impl Fn() -> bool) -> Found {
+    let is_epub = |path: &Path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+    };
+    let hidden = |entry: &walkdir::DirEntry| {
+        entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+    };
+
+    let mut found = Found::default();
+    for path in paths.iter().map(Path::new) {
+        if stopped() {
+            break;
+        }
+        if path.is_dir() {
+            let entries = walkdir::WalkDir::new(path)
+                .follow_links(true)
+                .sort_by(|a, b| {
+                    let name = |entry: &walkdir::DirEntry| {
+                        entry.file_name().to_string_lossy().to_lowercase()
+                    };
+                    name(a).cmp(&name(b))
+                })
+                .into_iter()
+                .filter_entry(|entry| !hidden(entry));
+            for entry in entries {
+                if stopped() {
+                    return found;
+                }
+                match entry {
+                    Ok(entry) => {
+                        if is_epub(entry.path()) && entry.path().is_file() {
+                            found.books.push(entry.path().to_string_lossy().to_string());
+                        }
+                    }
+                    // A folder shut to the app is named. A link back up
+                    // the tree, or to nothing, a book on a card no longer
+                    // in its reader say, is no folder to look in.
+                    Err(error)
+                        if error.io_error().map(std::io::Error::kind)
+                            == Some(std::io::ErrorKind::PermissionDenied) =>
+                    {
+                        found
+                            .unreadable
+                            .push(error.path().unwrap_or(path).to_string_lossy().to_string())
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else if is_epub(path) && path.is_file() {
+            found.books.push(path.to_string_lossy().to_string());
+        }
+    }
+    found
 }
 
 /// What was dropped on the window holds.

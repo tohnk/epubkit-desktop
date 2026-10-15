@@ -237,6 +237,28 @@ fn a_folder_that_cannot_be_looked_in_is_named() {
     assert_eq!(found.unreadable, [shut.to_string_lossy().to_string()]);
 }
 
+/// A walk through a dropped folder stops when it is told, with what it found
+/// so far: a home folder, or one with a link out of it to a whole disk, took
+/// as long as it took, and nothing stopped it.
+#[test]
+fn a_walk_through_a_drop_stops_when_told() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..50 {
+        std::fs::write(dir.path().join(format!("{n:02}.epub")), b"").unwrap();
+    }
+    let paths = [dir.path().to_string_lossy().to_string()];
+
+    let asked = std::cell::Cell::new(0);
+    let found = commands::find_books_until(&paths, || {
+        asked.set(asked.get() + 1);
+        asked.get() > 10
+    });
+    assert!(found.books.len() <= 10, "{} found", found.books.len());
+
+    let found = commands::find_books_until(&paths, || false);
+    assert_eq!(found.books.len(), 50);
+}
+
 /// A link to nothing, to a book on a card no longer in its reader say, is
 /// passed over: followed, it was named as a folder that could not be looked
 /// in, though it was looked in well enough, and was a file at that.
