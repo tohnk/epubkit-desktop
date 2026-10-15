@@ -463,6 +463,40 @@ fn a_long_title_is_cut_to_a_name_that_fits_in_bytes() {
     assert_eq!(format_filename(&"a".repeat(300), "").len(), 205);
 }
 
+/// Windows keeps the names of its devices, CON, NUL, COM1 and the rest, and
+/// takes a file named one, whatever follows its first dot, for the device: a
+/// book named `Con. Law.epub` could not be made there. A `_` after the
+/// device's name makes it a name like any other.
+#[test]
+fn a_name_windows_keeps_for_a_device_is_not_given_to_a_book() {
+    for (title, expected) in [
+        ("Con", "Con_.epub"),
+        ("AUX", "AUX_.epub"),
+        ("nul", "nul_.epub"),
+        ("Prn", "Prn_.epub"),
+        ("COM1", "COM1_.epub"),
+        ("lpt9", "lpt9_.epub"),
+        ("COM¹", "COM¹_.epub"),
+        ("CONOUT$", "CONOUT$_.epub"),
+        ("Con. Law", "Con_. Law.epub"),
+        ("Nul .Notes", "Nul_ .Notes.epub"),
+        // Not the name of a device.
+        ("Con Air", "Con Air.epub"),
+        ("COM10", "COM10.epub"),
+        ("Console", "Console.epub"),
+    ] {
+        assert_eq!(format_filename(title, ""), expected, "{title}");
+    }
+
+    // A long name still fits once the `_` is in it.
+    let name = format_filename(&format!("Con. {}", "x".repeat(300)), "");
+    assert!(name.starts_with("Con_. x"), "{name}");
+    assert_eq!(name.len(), 205);
+    // And a name cut down to a device's is not left one.
+    let name = format_filename(&format!("Con-{}x", ".".repeat(196)), "");
+    assert_eq!(name, "Con_.epub");
+}
+
 // ------------------------------------------------- filename formats (PR #5)
 
 fn book(title: &str, author: &str) -> Metadata {

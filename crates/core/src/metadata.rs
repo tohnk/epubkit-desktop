@@ -51,6 +51,14 @@ const FILENAME_REPLACEMENTS: &[(char, &str)] = &[
     ('|', "-"),
 ];
 
+/// The names Windows keeps for its devices, as Microsoft's rules for naming a
+/// file list them, with the two consoles Python's `os.path.isreserved` adds.
+const WINDOWS_DEVICES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+];
+
 /// The most a name may take before its `.epub`, in bytes, as Linux's
 /// filesystems count a name: ext4 and btrfs take 255, which leaves room for
 /// the extension and a ` (2)` beside it. Filesystems that count UTF-16 units
@@ -569,19 +577,13 @@ fn finish_filename(name: &str) -> String {
     // The extension is looked for once the name is clean: in "Book.epub?" the
     // `?` hid it, and the name came out `Book.epub.epub`.
     let clean = sanitize_filename(name);
-    let mut name = strip_epub_extension(&clean)
-        .trim_end_matches([' ', '.', '-'])
-        .to_string();
+    let mut name = fit(strip_epub_extension(&clean));
 
-    // Cut in bytes, at the end of a character: cut at 200 characters, a long
-    // Japanese title made a name of 374 bytes, which Linux refuses.
-    if name.len() > MAX_FILENAME_BYTES {
-        let mut end = MAX_FILENAME_BYTES;
-        while !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        name.truncate(end);
-        name = name.trim_end_matches([' ', '.', '-']).to_string();
+    // Windows takes a name that is a device's up to its first dot for the
+    // device, `CON.epub` and `Con. Law.epub` alike, and makes no file of it.
+    if let Some(end) = windows_device_end(&name) {
+        name.insert(end, '_');
+        name = fit(&name);
     }
 
     // Nothing left, or nothing but dots, names no file.
@@ -590,6 +592,32 @@ fn finish_filename(name: &str) -> String {
     }
 
     format!("{name}.epub")
+}
+
+/// `name` cut to [`MAX_FILENAME_BYTES`], and without the spaces, dots and
+/// dashes it then ends with. It is cut in bytes, at the end of a character:
+/// cut at 200 characters, a long Japanese title made a name of 374 bytes,
+/// which Linux refuses.
+fn fit(name: &str) -> String {
+    let mut end = name.len().min(MAX_FILENAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].trim_end_matches([' ', '.', '-']).to_string()
+}
+
+/// Where the name of the Windows device `name` would be taken for ends, if
+/// any: Windows reads a name up to its first dot, less the spaces that part
+/// ends with, and in any case.
+fn windows_device_end(name: &str) -> Option<usize> {
+    let device = name
+        .split_once('.')
+        .map_or(name, |(before, _)| before)
+        .trim_end_matches(' ');
+    WINDOWS_DEVICES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(device))
+        .then_some(device.len())
 }
 
 /// Fill in a custom template. `{field}` is replaced by its value, and `{{` and
