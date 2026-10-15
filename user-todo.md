@@ -29,7 +29,8 @@ Finder.
   show "Reading N books… M read" with a Stop beneath it.
 - [ ] **A large folder.** Dropping a big tree, a whole library or the home
   folder, should show "Looking for books…" and, after a moment, a Stop that
-  ends the search.
+  ends the search. The footer should then say "Stopped looking for books.",
+  and nothing from that drop be listed.
 - [ ] **The SD card.** Dropping a folder from the Xteink's SD card should list
   no `._` files.
 

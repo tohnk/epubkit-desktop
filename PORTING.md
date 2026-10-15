@@ -135,7 +135,7 @@ did nothing. A folder that cannot be looked in is named, where it was passed
 over and a drop of only such a folder read "Nothing to add"; a link to
 nothing, a book on a card no longer in its reader say, is passed over. Looking
 through what was dropped can be stopped once it takes more than a moment, a
-home folder say. More than 16 books are read 16 at a time: each 16 show as
+home folder say, and then lists none of what it found. More than 16 books are read 16 at a time: each 16 show as
 they are read, the footer counts them, and a Stop beneath it ends the read,
 keeping what was read. Covers are decoded only as they come near the view,
 but each one's thumbnail, some 75 KB, is held from the start: a drop of
