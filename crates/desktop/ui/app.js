@@ -299,7 +299,7 @@ async function addBooks(paths) {
     let slow = false;
     const stoppable = setTimeout(() => {
         slow = list === listing;
-        if (slow) countLongRead(1);
+        if (slow) countLongRead('looking', 1);
     }, 500);
     try {
         note('Looking for books…');
@@ -309,7 +309,7 @@ async function addBooks(paths) {
         return;
     } finally {
         clearTimeout(stoppable);
-        if (slow && list === listing) countLongRead(-1);
+        if (slow && list === listing) countLongRead('looking', -1);
     }
     if (list !== listing) return;
     // A folder that could not be looked in is named, not passed over.
@@ -337,7 +337,7 @@ async function addBooks(paths) {
     // each few show as they are read, the footer counts them, and Stop ends
     // the read. Read whole, it showed nothing past "Reading 3000 books…".
     const many = fresh.length > READ_AT_ONCE;
-    if (many) countLongRead(1);
+    if (many) countLongRead('reading', 1);
     let read = 0;
     try {
         while (read < fresh.length) {
@@ -364,18 +364,21 @@ async function addBooks(paths) {
         setStatus(`Could not read those files: ${error}`, true);
     } finally {
         for (const path of fresh) pending.delete(path);
-        if (many && list === listing) countLongRead(-1);
+        if (many && list === listing) countLongRead('reading', -1);
     }
 }
 
 /** How many books a large drop reads at a time. */
 const READ_AT_ONCE = 16;
-/** Large drops of the list now being read, for which Stop shows. */
-let longReads = 0;
+/**
+ * Drops of the list now being read for which Stop shows: those still being
+ * looked through after a moment, and large ones being read.
+ */
+const longReads = { looking: 0, reading: 0 };
 
-function countLongRead(change) {
-    longReads += change;
-    stopReadingBtn.hidden = longReads === 0;
+function countLongRead(kind, change) {
+    longReads[kind] += change;
+    stopReadingBtn.hidden = longReads.looking + longReads.reading === 0;
 }
 
 /// Drop every read under way: what they find is not listed, and a book they
@@ -384,7 +387,8 @@ function countLongRead(change) {
 function forgetReads() {
     listing += 1;
     reading = new Set();
-    longReads = 0;
+    longReads.looking = 0;
+    longReads.reading = 0;
     stopReadingBtn.hidden = true;
     invoke('stop_finding').catch(() => {});
 }
@@ -726,9 +730,17 @@ function wireEvents() {
         }
     });
 
+    // Stop keeps the books listed and drops the rest, so a search stopped
+    // lists none of what it found. Listing that would mean reading it: the
+    // Stop would start a read, of whatever came first in a folder dropped by
+    // mistake, a home folder say.
     stopReadingBtn.addEventListener('click', () => {
+        const stopped = [
+            longReads.reading > 0 && 'reading',
+            longReads.looking > 0 && 'looking for books',
+        ].filter(Boolean).join(' and ');
         forgetReads();
-        note(`Stopped reading. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
+        note(`Stopped ${stopped}. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
     });
 
     clearBtn.addEventListener('click', () => {
