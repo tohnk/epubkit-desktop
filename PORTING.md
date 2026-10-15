@@ -896,7 +896,14 @@ of `<metadata>` took `<metadata>` and its `<meta>`s with it, and where
 
 A name's `.epub` is looked for once the name is clean, so "Book.epub?" is no
 longer named `Book.epub.epub`, as upstream named it; and a field a template
-leaves empty leaves one dash rather than the two either side of it.
+leaves empty leaves one dash rather than the two either side of it, and no
+brackets round it: `{title} ({year})` names a book with no date `Title.epub`,
+not `Title ().epub`. A date put where none is known gives no `{year}`, where
+upstream's gave `0101`: Calibre writes `0101-01-01` for one and takes any
+year before 101 for none, so no year up to 101 counts. And a name Windows
+keeps for a device, `CON`, `NUL`, `COM1` and the rest, which it reads up to
+the name's first dot, gets a `_` after it: `Con. Law` is named
+`Con_. Law.epub`, which Windows can make.
 
 ### Paths in a book stay inside it
 
