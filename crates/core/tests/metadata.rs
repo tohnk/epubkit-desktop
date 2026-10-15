@@ -399,8 +399,8 @@ fn an_empty_field_does_not_leave_its_separators() {
     }
 }
 
-/// Truncation counts characters, not bytes — slicing a multi-byte codepoint
-/// would panic.
+/// Truncation cuts at the end of a character, wherever the byte limit falls —
+/// slicing a multi-byte codepoint would panic.
 #[test]
 fn long_multibyte_titles_do_not_panic() {
     let long_title = "é".repeat(500);
