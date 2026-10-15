@@ -44,6 +44,15 @@ pub const CUSTOM: &str = "custom";
 
 const RESERVED_IDS: &[&str] = &[QUICK, FULL, CUSTOM];
 
+/// The JPEG qualities an option set may hold: what the window's slider
+/// allows and the command line takes.
+pub const QUALITY: std::ops::RangeInclusive<u8> = 20..=95;
+
+/// `quality`, or the nearer end of [`QUALITY`] where it is outside it.
+fn in_range(quality: u8) -> u8 {
+    quality.clamp(*QUALITY.start(), *QUALITY.end())
+}
+
 /// The processing choices a preset can hold.
 ///
 /// Deliberately *not* including the device: see the module documentation.
@@ -106,7 +115,7 @@ impl OptionSet {
             grayscale: self.grayscale,
             eink_quantize: self.grayscale,
             contrast_boost: self.contrast_boost,
-            quality: self.quality,
+            quality: in_range(self.quality),
             remove_fonts: self.remove_fonts,
             remove_unused_css: self.remove_unused_css,
             light_novel_mode: self.light_novel_mode,
@@ -169,7 +178,16 @@ impl Settings {
         }
 
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-        toml::from_str(&text).map_err(|e| Error::Settings(format!("{}: {e}", path.display())))
+        let mut settings: Self = toml::from_str(&text)
+            .map_err(|e| Error::Settings(format!("{}: {e}", path.display())))?;
+
+        // A file edited by hand, or by an older version, can hold a quality
+        // the window cannot show and the command line would refuse.
+        settings.options.quality = in_range(settings.options.quality);
+        for preset in &mut settings.presets {
+            preset.options.quality = in_range(preset.options.quality);
+        }
+        Ok(settings)
     }
 
     /// Write settings to `path`, whole. They are written beside it and moved

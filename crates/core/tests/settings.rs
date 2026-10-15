@@ -409,6 +409,35 @@ fn saving_keeps_a_settings_file_as_readable_as_it_was() {
     assert_eq!(mode(&path), 0o640, "a settings file already there");
 }
 
+/// A quality outside 20 to 95, the range the window's slider and the command
+/// line allow, written into the file by hand or by an older version, is taken
+/// to the nearest end of it, a saved preset's too; and so is one handed to
+/// the pipeline. Kept, it was run with, while the window showed "9%" with its
+/// slider at 20.
+#[test]
+fn a_quality_outside_its_range_is_brought_into_it() {
+    let dir = tempdir();
+    let path = dir.path().join("settings.toml");
+    std::fs::write(
+        &path,
+        "[options]\nquality = 9\n\n[[presets]]\nid = \"mine\"\nname = \"Mine\"\n\n\
+         [presets.options]\nquality = 200\n",
+    )
+    .unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.options.quality, 20);
+    assert_eq!(settings.preset("mine").unwrap().options.quality, 95);
+
+    let options = OptionSet {
+        quality: 5,
+        ..OptionSet::full()
+    };
+    let processing =
+        options.to_processing_options(settings.device_profile(), MetadataEdits::default());
+    assert_eq!(processing.quality, 20);
+}
+
 #[test]
 fn labels_read_the_way_the_ui_shows_them() {
     let mut settings = Settings::default();

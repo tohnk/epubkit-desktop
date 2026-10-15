@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use epubkit_core::html::{default_backend, HtmlRepair};
 use epubkit_core::metadata::{FilenameFormat, MetadataEdits};
 use epubkit_core::pipeline::{process_epub, ProcessingOptions};
-use epubkit_core::settings::Settings;
+use epubkit_core::settings::{Settings, QUALITY};
 use epubkit_core::{metadata, package, structure, xml};
 
 #[derive(Parser)]
@@ -50,7 +50,12 @@ enum Command {
         #[arg(short, long)]
         device: Option<String>,
         /// JPEG quality, 20-95.
-        #[arg(short, long, value_parser = clap::value_parser!(u8).range(20..=95))]
+        #[arg(
+            short,
+            long,
+            value_parser = clap::value_parser!(u8)
+                .range(i64::from(*QUALITY.start())..=i64::from(*QUALITY.end()))
+        )]
         quality: Option<u8>,
         /// Rotate and split landscape artwork for vertical reading.
         #[arg(long)]
