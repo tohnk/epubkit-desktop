@@ -990,42 +990,45 @@ fn the_page_invokes_each_command_with_the_arguments_it_takes() {
     assert!(calls >= 10, "{calls} calls found");
 }
 
-/// What the page reads off each thing the app sends it is something the app
-/// sends, under the name it sends it by, but for what the page sets itself.
-/// A run's sizes and the name of the book it wrote are camelCased by the
-/// core: renamed there, each result would read "NaN" and "undefined", and
-/// nothing would fail.
+/// What the page reads or sets on each thing the app sends it is something
+/// the app sends, under the name it sends it by, but for the fields the page
+/// adds itself, named here. A run's sizes and the name of the book it wrote
+/// are camelCased by the core: renamed there, each result would read "NaN"
+/// and "undefined", and nothing would fail. A field the page sets as well as
+/// reads, the settings' `active` say, is held to it too: told apart from
+/// the page's own by being set, it was passed over.
+///
+/// Only the first field of each path is checked here. The options' own are
+/// checked by `the_page_binds_to_option_keys_that_exist`, and the filename's
+/// by `the_settings_payload_is_shaped_the_way_the_page_expects`.
 #[test]
 fn the_page_reads_only_what_the_app_sends() {
     use epubkit_core::pipeline::ProcessingReport;
     use std::collections::BTreeSet;
 
+    // What the page adds to a book: the title and author the book itself
+    // has, which an emptied field leaves it.
+    let added = [("book", "ownTitle"), ("book", "ownAuthor")];
+
     let script = script();
-    // The fields the page reads off `name`, but those it also sets.
-    let read = |name: &str| {
+    // The fields the page uses on `name`, but those it adds itself.
+    let read = |name: &str| -> BTreeSet<String> {
         let marker = format!("{name}.");
-        let (mut read, mut set) = (BTreeSet::new(), BTreeSet::new());
-        for (at, _) in script.match_indices(&marker) {
-            let before = script[..at].chars().next_back();
-            if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
-                continue;
-            }
-            let rest = &script[at + marker.len()..];
-            let field: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            let after = rest[field.len()..].trim_start();
-            if field.is_empty() {
-                continue;
-            } else if after.starts_with('=') && !after.starts_with("==") {
-                set.insert(field);
-            } else {
-                read.insert(field);
-            }
-        }
-        read.retain(|field| !set.contains(field));
-        read
+        script
+            .match_indices(&marker)
+            .filter_map(|(at, _)| {
+                let before = script[..at].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                    return None;
+                }
+                let field: String = script[at + marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let own = added.contains(&(name, field.as_str()));
+                (!field.is_empty() && !own).then_some(field)
+            })
+            .collect()
     };
     let sends = |value: serde_json::Value| -> BTreeSet<String> {
         value
