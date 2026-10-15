@@ -371,6 +371,15 @@ fn filenames_drop_control_characters() {
     assert_eq!(name, "Nullbyte - Tabhere.epub");
 }
 
+/// A name's extension is taken off once the name is clean: "Book.epub?" came
+/// out `Book.epub.epub`, its extension hidden by the `?` until that was gone.
+#[test]
+fn an_extension_is_found_once_the_name_is_clean() {
+    assert_eq!(format_filename("Book.epub?", ""), "Book.epub");
+    assert_eq!(format_filename("Book.EPUB*", ""), "Book.epub");
+    assert_eq!(format_filename("Book - .epub", ""), "Book.epub");
+}
+
 /// Truncation counts characters, not bytes — slicing a multi-byte codepoint
 /// would panic.
 #[test]

@@ -545,7 +545,12 @@ fn strip_epub_extension(name: &str) -> &str {
 
 /// Make a name a safe filename with an `.epub` extension.
 fn finish_filename(name: &str) -> String {
-    let mut name = sanitize_filename(strip_epub_extension(name.trim()));
+    // The extension is looked for once the name is clean: in "Book.epub?" the
+    // `?` hid it, and the name came out `Book.epub.epub`.
+    let clean = sanitize_filename(name);
+    let mut name = strip_epub_extension(&clean)
+        .trim_end_matches([' ', '.', '-'])
+        .to_string();
 
     // Cut in bytes, at the end of a character: cut at 200 characters, a long
     // Japanese title made a name of 374 bytes, which Linux refuses.
