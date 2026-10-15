@@ -288,6 +288,11 @@ async function addBooks(paths) {
 
     try {
         const inspected = await invoke('inspect_books', { paths: fresh });
+        // The book's own title and author, which a field emptied leaves it.
+        for (const book of inspected) {
+            book.ownTitle = book.title;
+            book.ownAuthor = book.author;
+        }
         books.push(...inspected);
         renderBooks();
         showReady();
@@ -310,11 +315,13 @@ function renderBooks() {
             : '<div class="no-cover">No cover</div>';
 
         const meta = [book.author, book.series].filter(Boolean).join(' — ');
+        // A field emptied leaves the book its own title or author, which then
+        // shows in it, greyed, so the field says what will be used.
         const edit = book.error
             ? ''
             : `<div class="file-edit">
-                   <input type="text" placeholder="Title" value="${escapeAttr(book.title)}" data-edit="title" data-index="${index}">
-                   <input type="text" placeholder="Author" value="${escapeAttr(book.author)}" data-edit="author" data-index="${index}">
+                   <input type="text" aria-label="Title" placeholder="${escapeAttr(book.ownTitle || 'Title')}" value="${escapeAttr(book.title)}" data-edit="title" data-index="${index}">
+                   <input type="text" aria-label="Author" placeholder="${escapeAttr(book.ownAuthor || 'Author')}" value="${escapeAttr(book.author)}" data-edit="author" data-index="${index}">
                </div>`;
 
         card.innerHTML = `
