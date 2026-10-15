@@ -384,9 +384,11 @@ function renderBooks(from = 0) {
             ? `<img src="${escapeAttr(book.cover)}" alt="">`
             : '<div class="no-cover">No cover</div>';
 
-        const meta = [book.author, book.series].filter(Boolean).join(' — ');
         // A field emptied leaves the book its own title or author, which then
-        // shows in it, greyed, so the field says what will be used.
+        // shows in it, greyed, so the field says what will be used; the card
+        // says it too, where it showed the file's name, or no author.
+        const title = book.title || book.ownTitle;
+        const meta = [book.author || book.ownAuthor, book.series].filter(Boolean).join(' — ');
         const edit = book.error
             ? ''
             : `<div class="file-edit">
@@ -397,7 +399,7 @@ function renderBooks(from = 0) {
         card.innerHTML = `
             <div class="file-cover">${cover}</div>
             <div class="file-info">
-                <div class="file-name">${escapeHtml(book.title || book.filename)}</div>
+                <div class="file-name">${escapeHtml(title || book.filename)}</div>
                 <div class="file-meta">${escapeHtml(meta)}${meta ? ' · ' : ''}${formatBytes(book.size)}</div>
                 ${book.error ? `<div class="file-error">${escapeHtml(book.error)}</div>` : ''}
                 ${edit}
