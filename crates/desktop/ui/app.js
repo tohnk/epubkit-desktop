@@ -23,6 +23,7 @@ const resultsSection = document.getElementById('results-section');
 const resultsItems = document.getElementById('results-items');
 const optimizeBtn = document.getElementById('optimize-btn');
 const stopBtn = document.getElementById('stop-btn');
+const stopReadingBtn = document.getElementById('stop-reading-btn');
 const qualitySlider = document.getElementById('quality');
 const qualityValue = document.getElementById('quality-value');
 const statusLine = document.getElementById('status-line');
@@ -308,24 +309,49 @@ async function addBooks(paths) {
     if (fresh.length === 0) return;
     for (const path of fresh) pending.add(path);
 
-    setStatus(`Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`);
-
+    // A large drop, a folder of books say, is read a few books at a time:
+    // each few show as they are read, the footer counts them, and Stop ends
+    // the read. Read whole, it showed nothing past "Reading 3000 books…".
+    const many = fresh.length > READ_AT_ONCE;
+    if (many) countLongRead(1);
+    let read = 0;
     try {
-        const inspected = await invoke('inspect_books', { paths: fresh });
-        if (list !== listing) return;
-        // The book's own title and author, which a field emptied leaves it.
-        for (const book of inspected) {
-            book.ownTitle = book.title;
-            book.ownAuthor = book.author;
+        while (read < fresh.length) {
+            setStatus(
+                many
+                    ? `Reading ${fresh.length} books… ${read} read`
+                    : `Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`,
+            );
+            const batch = fresh.slice(read, read + READ_AT_ONCE);
+            const inspected = await invoke('inspect_books', { paths: batch });
+            if (list !== listing) return;
+            // The book's own title and author, which a field emptied leaves it.
+            for (const book of inspected) {
+                book.ownTitle = book.title;
+                book.ownAuthor = book.author;
+            }
+            const from = books.length;
+            books.push(...inspected);
+            renderBooks(from);
+            read += batch.length;
         }
-        books.push(...inspected);
-        renderBooks();
         showReady();
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
     } finally {
         for (const path of fresh) pending.delete(path);
+        if (many && list === listing) countLongRead(-1);
     }
+}
+
+/** How many books a large drop reads at a time. */
+const READ_AT_ONCE = 16;
+/** Large drops of the list now being read, for which Stop shows. */
+let longReads = 0;
+
+function countLongRead(change) {
+    longReads += change;
+    stopReadingBtn.hidden = longReads === 0;
 }
 
 /// Drop every read under way: what they find is not listed, and a book they
@@ -333,14 +359,20 @@ async function addBooks(paths) {
 function forgetReads() {
     listing += 1;
     reading = new Set();
+    longReads = 0;
+    stopReadingBtn.hidden = true;
 }
 
-function renderBooks() {
+/// Draw the list, or with `from`, add to it the books from there on: a large
+/// drop, read a few books at a time, adds each few rather than drawing every
+/// book again.
+function renderBooks(from = 0) {
     fileList.hidden = books.length === 0;
     optionsPanel.hidden = books.length === 0;
-    fileList.innerHTML = '';
+    if (from === 0) fileList.innerHTML = '';
 
-    books.forEach((book, index) => {
+    books.slice(from).forEach((book, offset) => {
+        const index = from + offset;
         const card = document.createElement('div');
         card.className = `file-card ${book.error ? 'error' : ''}`;
 
@@ -642,6 +674,11 @@ function wireEvents() {
         } catch (error) {
             setStatus(`Could not open that folder: ${error}`, true);
         }
+    });
+
+    stopReadingBtn.addEventListener('click', () => {
+        forgetReads();
+        setStatus(`Stopped reading. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
     });
 
     document.getElementById('clear-btn').addEventListener('click', () => {

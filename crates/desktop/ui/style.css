@@ -695,6 +695,10 @@ h2 {
     padding: 5px 14px;
 }
 
+.ghost-btn.footer-btn {
+    margin-top: 10px;
+}
+
 .progress-message {
     font-size: 13px;
     color: var(--text-secondary);
