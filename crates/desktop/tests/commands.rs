@@ -545,6 +545,38 @@ fn closing_during_a_run_stops_it_and_closes_once_it_has() {
     assert!(!run.end());
 }
 
+/// Quit with no say in it, from the Dock say, the app tells a run under way
+/// to stop and waits, a while, for it to have stopped and taken its files.
+#[test]
+fn quitting_waits_a_while_for_a_run_to_stop() {
+    use std::time::{Duration, Instant};
+
+    let run = commands::RunState::new();
+    assert!(
+        run.stop_and_wait(Duration::ZERO),
+        "with no run, nothing to wait for"
+    );
+
+    // A run that stops a moment after it is told.
+    let stop = run.begin();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            run.end();
+        });
+        let began = Instant::now();
+        assert!(run.stop_and_wait(Duration::from_secs(10)));
+        assert!(began.elapsed() >= Duration::from_millis(50));
+    });
+
+    // One that does not stop is given up on.
+    run.begin();
+    assert!(!run.stop_and_wait(Duration::from_millis(50)));
+}
+
 /// A book whose run panics fails on its own, as one whose run errs does. The
 /// panic went up through the window's run of every book dropped with it:
 /// those after it were never made, and the page was told only that the run

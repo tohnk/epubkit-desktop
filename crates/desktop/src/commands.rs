@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use epubkit_core::memory::MemoryBudget;
@@ -383,6 +384,24 @@ impl RunState {
         false
     }
 
+    /// Stop the run under way, if there is one, and wait up to `patience` for
+    /// it to have stopped, and taken the files it was making with it. Gives
+    /// whether it has.
+    pub fn stop_and_wait(&self, patience: Duration) -> bool {
+        if !self.running.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.stop();
+        let given_up = Instant::now() + patience;
+        while self.running.load(Ordering::SeqCst) {
+            if Instant::now() >= given_up {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     /// The run is over: whether the window is to close now, as it was asked
     /// to during the run. The run is marked over first, so that the close
     /// this asks for is not taken for one during a run, and put off again.
@@ -418,6 +437,12 @@ pub fn stop_before_closing<R: Runtime>(app: &AppHandle<R>) -> bool {
         return true;
     }
     false
+}
+
+/// For an app ending with no say in it, quit from the Dock say: stop the run
+/// under way, and wait for it, a while, to take its files with it.
+pub fn stop_before_exiting() {
+    RUN.stop_and_wait(Duration::from_secs(10));
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.
