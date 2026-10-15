@@ -459,6 +459,22 @@ impl RunState {
         self.running.store(false, Ordering::SeqCst);
         self.close_when_stopped.swap(false, Ordering::SeqCst)
     }
+
+    /// Do `work`, given the flag that stops it, on a blocking worker as the
+    /// run. Gives what it came to, and whether the window is to close now.
+    ///
+    /// The run begins before the work is handed to a worker, not once one
+    /// takes it up, and is over once the work is done however it ends: a
+    /// panic past every book's own catch left it running, so that the window
+    /// waited on it to close.
+    pub async fn run<T: Send + 'static>(
+        &'static self,
+        work: impl FnOnce(&'static AtomicBool) -> T + Send + 'static,
+    ) -> (Result<T, String>, bool) {
+        let stop = self.begin();
+        let done = tauri::async_runtime::spawn_blocking(move || work(stop)).await;
+        (done.map_err(to_message), self.end())
+    }
 }
 
 impl Default for RunState {
@@ -515,37 +531,37 @@ pub async fn optimize_books(
     destination: String,
     settings: Settings,
 ) -> Response<Vec<Outcome>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let stop = RUN.begin();
-        let total = jobs.len();
-        let outcomes = optimize_all(
-            &jobs,
-            Path::new(&destination),
-            &settings,
-            stop,
-            |index, percent, message| {
-                let _ = app.emit(
-                    "progress",
-                    Progress {
-                        path: jobs[index].path.clone(),
-                        index,
-                        total,
-                        percent,
-                        message: message.to_string(),
-                    },
-                );
-            },
-            |outcome| {
-                let _ = app.emit("finished", outcome.clone());
-            },
-        );
-        if RUN.end() {
-            app.exit(0);
-        }
-        Ok(outcomes)
-    })
-    .await
-    .map_err(to_message)?
+    let page = app.clone();
+    let (outcomes, close) = RUN
+        .run(move |stop| {
+            let total = jobs.len();
+            optimize_all(
+                &jobs,
+                Path::new(&destination),
+                &settings,
+                stop,
+                |index, percent, message| {
+                    let _ = page.emit(
+                        "progress",
+                        Progress {
+                            path: jobs[index].path.clone(),
+                            index,
+                            total,
+                            percent,
+                            message: message.to_string(),
+                        },
+                    );
+                },
+                |outcome| {
+                    let _ = page.emit("finished", outcome.clone());
+                },
+            )
+        })
+        .await;
+    if close {
+        app.exit(0);
+    }
+    outcomes
 }
 
 /// Optimize each of `jobs` into `destination`, as [`optimize_books`] does,

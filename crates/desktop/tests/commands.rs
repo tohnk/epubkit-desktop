@@ -629,6 +629,23 @@ fn closing_during_a_run_stops_it_and_closes_once_it_has() {
     assert!(!run.end());
 }
 
+/// A run is over however its worker ends, one that panics past every book's
+/// own catch too. Left running, it had the window wait on it to close,
+/// "Stopping, then closing…" for a run that was gone, and a quit from the
+/// Dock wait out its patience.
+#[test]
+fn a_run_is_over_however_its_worker_ends() {
+    static RUN: commands::RunState = commands::RunState::new();
+
+    let (done, close) = tauri::async_runtime::block_on(RUN.run(|_| -> () {
+        panic!("past every book's own catch");
+    }));
+
+    assert!(done.is_err());
+    assert!(!close);
+    assert!(!RUN.stop_before_closing(), "no run left to wait on");
+}
+
 /// Quit with no say in it, from the Dock say, the app tells a run under way
 /// to stop and waits, a while, for it to have stopped and taken its files.
 #[test]
