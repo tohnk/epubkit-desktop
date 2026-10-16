@@ -24,8 +24,8 @@
                     <polyline points="17 8 12 3 7 8"/>
                     <line x1="12" y1="3" x2="12" y2="15"/>
                 </svg>
-                <p class="upload-label">Drop EPUB files here</p>
-                <p class="upload-hint">or click to browse</p>
+                <p class="upload-label">Drop EPUB files or folders here</p>
+                <p class="upload-hint">or click to choose books, or <button id="choose-folder" class="link-btn">choose a folder</button></p>
             </div>
         </div>
 
@@ -61,7 +61,7 @@
                 </label>
                 <label class="option">
                     <input type="checkbox" data-option="clean_metadata">
-                    <div class="option-text"><span>Clean Metadata</span><small>Strip store/calibre tags</small></div>
+                    <div class="option-text"><span>Clean Metadata</span><small>Strip store tags, keep series</small></div>
                 </label>
                 <label class="option">
                     <input type="checkbox" data-option="text_cleanup">
@@ -125,7 +125,10 @@
         </div>
 
         <div id="progress-section" class="progress-section" hidden>
-            <div class="section-header"><h2>Processing</h2></div>
+            <div class="section-header section-header-row">
+                <h2>Processing</h2>
+                <button id="stop-btn" class="ghost-btn danger stop-btn" hidden>Stop</button>
+            </div>
             <div id="progress-items"></div>
         </div>
 
@@ -137,6 +140,7 @@
 
         <footer>
             <p id="status-line"></p>
+            <button id="stop-reading-btn" class="ghost-btn stop-btn footer-btn" hidden>Stop</button>
         </footer>
     </div>
 

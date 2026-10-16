@@ -22,6 +22,9 @@ const progressItems = document.getElementById('progress-items');
 const resultsSection = document.getElementById('results-section');
 const resultsItems = document.getElementById('results-items');
 const optimizeBtn = document.getElementById('optimize-btn');
+const stopBtn = document.getElementById('stop-btn');
+const stopReadingBtn = document.getElementById('stop-reading-btn');
+const clearBtn = document.getElementById('clear-btn');
 const qualitySlider = document.getElementById('quality');
 const qualityValue = document.getElementById('quality-value');
 const statusLine = document.getElementById('status-line');
@@ -32,10 +35,18 @@ const filenameExample = document.getElementById('filename-example');
 
 /** Books currently listed, in the order they were added. */
 let books = [];
+/** Books being read, to be listed once they have been. */
+let reading = new Set();
+/** Which list a read is for: a list started again drops a read begun before. */
+let listing = 0;
 /** The core's settings. Never edited except through `applySettings`. */
 let settings = null;
 let devices = [];
 let running = false;
+/** Set once Stop is pressed, until the run has stopped. */
+let stopping = false;
+/** Whether the footer shows the ready line, not a message to be read. */
+let readyShown = false;
 
 // ------------------------------------------------------------------- startup
 
@@ -62,11 +73,15 @@ async function start() {
 }
 
 /// The footer carries the current device and preset, so what a run will do is
-/// visible without opening the options panel.
+/// visible without opening the options panel. During a run it says how the
+/// run goes instead: an option changed then put "Ready" back, and while the
+/// run stopped, nothing took it away.
 function showReady() {
+    if (running) return;
     const device = devices.find((d) => d.id === settings.device);
     const name = device ? `${device.label} · ${device.width}×${device.height}` : settings.device;
     setStatus(`Ready · ${name} · ${presetLabel()}`);
+    readyShown = true;
 }
 
 function presetLabel() {
@@ -229,67 +244,190 @@ function persist() {
     }, 250);
 }
 
-/// Write a change that is still waiting, for a command that reads the file.
+/// Write a change that is still waiting, and wait for any save under way, for
+/// a command that reads the file.
 async function flushPersist() {
-    if (persistTimer === null) return;
-    clearTimeout(persistTimer);
-    persistTimer = null;
-    await save();
+    if (persistTimer !== null) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+        save();
+    }
+    await saving;
 }
 
-async function save() {
-    try {
-        await invoke('save_settings', { settings });
-    } catch (error) {
+/** The save last begun, for a read of the file to wait for. */
+let saving = Promise.resolve();
+
+function save() {
+    saving = invoke('save_settings', { settings }).catch((error) => {
         setStatus(`Could not save settings: ${error}`, true);
+    });
+    return saving;
+}
+
+/// Read the settings again as the window comes back to the front: the
+/// command line may have changed them meanwhile, and the page's copy, saved
+/// whole at its next change, would undo what it did.
+async function reloadSettings() {
+    try {
+        await flushPersist();
+        const next = await invoke('load_settings');
+        const wasReady = readyShown;
+        settings = next;
+        renderDevices();
+        renderPresets();
+        renderOptions();
+        renderFilename();
+        // A run's outcome, or an error, stays in the footer until it is read.
+        if (wasReady) showReady();
+    } catch (error) {
+        setStatus(`Could not load settings: ${error}`, true);
     }
 }
 
 // --------------------------------------------------------------------- books
 
 async function addBooks(paths) {
-    const fresh = paths.filter(
-        (path) => path.toLowerCase().endsWith('.epub') && !books.some((b) => b.path === path),
-    );
-    if (fresh.length === 0) return;
+    // Started again meanwhile, the list takes nothing this read finds.
+    const list = listing;
+    const pending = reading;
 
-    setStatus(`Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`);
-
+    // What was dropped can be folders of books as well as books, which take a
+    // while to look through: one that takes more than a moment can be
+    // stopped, a home folder say, or a link out of one to a whole disk.
+    let found;
+    let slow = false;
+    const stoppable = setTimeout(() => {
+        slow = list === listing;
+        if (slow) countLongRead('looking', 1);
+    }, 500);
     try {
-        const inspected = await invoke('inspect_books', { paths: fresh });
-        books.push(...inspected);
-        renderBooks();
-        showReady();
+        note('Looking for books…');
+        found = await invoke('find_books', { paths });
+    } catch (error) {
+        setStatus(`Could not look through what was dropped: ${error}`, true);
+        return;
+    } finally {
+        clearTimeout(stoppable);
+        if (slow && list === listing) countLongRead('looking', -1);
+    }
+    if (list !== listing) return;
+    // A folder that could not be looked in is named, not passed over.
+    const shut = found.unreadable;
+    const unlooked = shut.length === 1
+        ? `could not look in ${basename(shut[0])}.`
+        : `could not look in ${shut.length} folders.`;
+    if (found.books.length === 0) {
+        note(`Nothing to add: ${shut.length > 0 ? unlooked : 'no EPUB files in what was dropped.'}`);
+        return;
+    }
+    const done = () => (shut.length > 0 ? note(`Books listed, but ${unlooked}`) : showReady());
+
+    // A book dropped again while it is still being read is not listed twice.
+    const fresh = [...new Set(found.books)].filter(
+        (path) => !pending.has(path) && !books.some((b) => b.path === path),
+    );
+    if (fresh.length === 0) {
+        done();
+        return;
+    }
+    for (const path of fresh) pending.add(path);
+
+    // A large drop, a folder of books say, is read a few books at a time:
+    // each few show as they are read, the footer counts them, and Stop ends
+    // the read. Read whole, it showed nothing past "Reading 3000 books…".
+    const many = fresh.length > READ_AT_ONCE;
+    if (many) countLongRead('reading', 1);
+    let read = 0;
+    try {
+        while (read < fresh.length) {
+            note(
+                many
+                    ? `Reading ${fresh.length} books… ${read} read`
+                    : `Reading ${fresh.length} book${fresh.length === 1 ? '' : 's'}…`,
+            );
+            const batch = fresh.slice(read, read + READ_AT_ONCE);
+            const inspected = await invoke('inspect_books', { paths: batch });
+            if (list !== listing) return;
+            // The book's own title and author, which a field emptied leaves it.
+            for (const book of inspected) {
+                book.ownTitle = book.title;
+                book.ownAuthor = book.author;
+            }
+            const from = books.length;
+            books.push(...inspected);
+            renderBooks(from);
+            read += batch.length;
+        }
+        done();
     } catch (error) {
         setStatus(`Could not read those files: ${error}`, true);
+    } finally {
+        for (const path of fresh) pending.delete(path);
+        if (many && list === listing) countLongRead('reading', -1);
     }
 }
 
-function renderBooks() {
+/** How many books a large drop reads at a time. */
+const READ_AT_ONCE = 16;
+/**
+ * Drops of the list now being read for which Stop shows: those still being
+ * looked through after a moment, and large ones being read.
+ */
+const longReads = { looking: 0, reading: 0 };
+
+function countLongRead(kind, change) {
+    longReads[kind] += change;
+    stopReadingBtn.hidden = longReads.looking + longReads.reading === 0;
+}
+
+/// Drop every read under way: what they find is not listed, and a book they
+/// were reading is read again if it is dropped again. A walk through what was
+/// dropped stops too.
+function forgetReads() {
+    listing += 1;
+    reading = new Set();
+    longReads.looking = 0;
+    longReads.reading = 0;
+    stopReadingBtn.hidden = true;
+    invoke('stop_finding').catch(() => {});
+}
+
+/// Draw the list, or with `from`, add to it the books from there on: a large
+/// drop, read a few books at a time, adds each few rather than drawing every
+/// book again.
+function renderBooks(from = 0) {
     fileList.hidden = books.length === 0;
     optionsPanel.hidden = books.length === 0;
-    fileList.innerHTML = '';
+    if (from === 0) fileList.innerHTML = '';
 
-    books.forEach((book, index) => {
+    books.slice(from).forEach((book, offset) => {
+        const index = from + offset;
         const card = document.createElement('div');
         card.className = `file-card ${book.error ? 'error' : ''}`;
 
+        // A dropped library lists thousands of covers; one is decoded only as
+        // it comes near the view.
         const cover = book.cover
-            ? `<img src="${escapeAttr(book.cover)}" alt="">`
+            ? `<img src="${escapeAttr(book.cover)}" alt="" loading="lazy" decoding="async">`
             : '<div class="no-cover">No cover</div>';
 
-        const meta = [book.author, book.series].filter(Boolean).join(' — ');
+        // A field emptied leaves the book its own title or author, which then
+        // shows in it, greyed, so the field says what will be used; the card
+        // says it too, where it showed the file's name, or no author.
+        const title = book.title || book.ownTitle;
+        const meta = [book.author || book.ownAuthor, book.series].filter(Boolean).join(' — ');
         const edit = book.error
             ? ''
             : `<div class="file-edit">
-                   <input type="text" placeholder="Title" value="${escapeAttr(book.title)}" data-edit="title" data-index="${index}">
-                   <input type="text" placeholder="Author" value="${escapeAttr(book.author)}" data-edit="author" data-index="${index}">
+                   <input type="text" aria-label="Title" placeholder="${escapeAttr(book.ownTitle || 'Title')}" value="${escapeAttr(book.title)}" data-edit="title" data-index="${index}">
+                   <input type="text" aria-label="Author" placeholder="${escapeAttr(book.ownAuthor || 'Author')}" value="${escapeAttr(book.author)}" data-edit="author" data-index="${index}">
                </div>`;
 
         card.innerHTML = `
             <div class="file-cover">${cover}</div>
             <div class="file-info">
-                <div class="file-name">${escapeHtml(book.title || book.filename)}</div>
+                <div class="file-name">${escapeHtml(title || book.filename)}</div>
                 <div class="file-meta">${escapeHtml(meta)}${meta ? ' · ' : ''}${formatBytes(book.size)}</div>
                 ${book.error ? `<div class="file-error">${escapeHtml(book.error)}</div>` : ''}
                 ${edit}
@@ -334,6 +472,12 @@ async function optimize() {
     running = true;
     optimizeBtn.disabled = true;
     optimizeBtn.textContent = 'Processing…';
+    stopBtn.hidden = false;
+    stopBtn.disabled = false;
+    stopBtn.textContent = 'Stop';
+    // The results show as each book finishes, Start again beneath them: used
+    // during the run, it emptied the list and hid the run, Stop with it.
+    clearBtn.hidden = true;
     resultsSection.hidden = true;
     resultsItems.innerHTML = '';
     progressSection.hidden = false;
@@ -350,61 +494,77 @@ async function optimize() {
         progressItems.appendChild(item);
     }
 
+    stopping = false;
+    setStatus(`Optimizing book 1 of ${jobs.length}…`);
+
     try {
         const outcomes = await invoke('optimize_books', { jobs, destination, settings });
         showResults(outcomes);
+        setStatus(tally(outcomes));
     } catch (error) {
         setStatus(`Processing failed: ${error}`, true);
     } finally {
         running = false;
         optimizeBtn.disabled = false;
         optimizeBtn.textContent = 'Optimize';
+        stopBtn.hidden = true;
+        clearBtn.hidden = false;
     }
 }
 
+/// Every book's result, in the order the books were run, as the run ends;
+/// each was shown as its book finished.
 function showResults(outcomes) {
+    resultsItems.replaceChildren(...outcomes.map(resultCard));
     resultsSection.hidden = false;
-    resultsItems.innerHTML = '';
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
 
-    for (const outcome of outcomes) {
-        const card = document.createElement('div');
-        card.className = `result-card ${outcome.error ? 'error' : 'success'}`;
+/// What a run came to, for the footer: "9 optimized, 1 failed".
+function tally(outcomes) {
+    const count = (kind) => outcomes.filter((outcome) => outcomeKind(outcome) === kind).length;
+    const parts = [`${count('success')} optimized`];
+    if (count('error') > 0) parts.push(`${count('error')} failed`);
+    if (count('stopped') > 0) parts.push(`${count('stopped')} stopped`);
+    return parts.join(', ');
+}
 
-        if (outcome.error) {
-            card.innerHTML = `
-                <div class="result-header"><span class="filename">${escapeHtml(basename(outcome.path))}</span></div>
-                <div class="file-error">${escapeHtml(outcome.error)}</div>`;
-        } else {
-            const report = outcome.report;
-            const change = report.originalSize > 0
-                ? (1 - report.optimizedSize / report.originalSize) * 100
-                : 0;
-            // Dithering to four levels is noise to a DCT codec, so a book of
-            // smooth artwork can legitimately come out bigger.
-            const label = change < 0 ? 'larger' : 'smaller';
+function resultCard(outcome) {
+    const card = document.createElement('div');
+    card.className = `result-card ${outcomeKind(outcome)}`;
 
-            // The name written, which is the report's unless that was taken.
-            const written = outcome.output ? basename(outcome.output) : report.outputFilename;
-
-            card.innerHTML = `
-                <div class="result-header"><span class="filename">${escapeHtml(written)}</span></div>
-                <div class="result-size">
-                    <span class="size-original">${formatBytes(report.originalSize)}</span>
-                    <span class="size-arrow">&rarr;</span>
-                    <span class="size-new">${formatBytes(report.optimizedSize)}</span>
-                    <span class="size-reduction">${Math.abs(change).toFixed(1)}% ${label}</span>
-                </div>
-                <div class="result-summary">${escapeHtml(outcome.summary)}</div>
-                <div class="result-output">
-                    <span class="path" title="${escapeAttr(outcome.output ?? '')}">${escapeHtml(outcome.output ?? '')}</span>
-                    <button class="reveal-btn" data-reveal="${escapeAttr(outcome.output ?? '')}">Show</button>
-                </div>`;
-        }
-
-        resultsItems.appendChild(card);
+    if (outcome.error) {
+        card.innerHTML = `
+            <div class="result-header"><span class="filename">${escapeHtml(basename(outcome.path))}</span></div>
+            <div class="file-error">${escapeHtml(outcome.error)}</div>`;
+        return card;
     }
 
-    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const report = outcome.report;
+    const change = report.originalSize > 0
+        ? (1 - report.optimizedSize / report.originalSize) * 100
+        : 0;
+    // Dithering to four levels is noise to a DCT codec, so a book of
+    // smooth artwork can legitimately come out bigger.
+    const label = change < 0 ? 'larger' : 'smaller';
+
+    // The name written, which is the report's unless that was taken.
+    const written = outcome.output ? basename(outcome.output) : report.outputFilename;
+
+    card.innerHTML = `
+        <div class="result-header"><span class="filename">${escapeHtml(written)}</span></div>
+        <div class="result-size">
+            <span class="size-original">${formatBytes(report.originalSize)}</span>
+            <span class="size-arrow">&rarr;</span>
+            <span class="size-new">${formatBytes(report.optimizedSize)}</span>
+            <span class="size-reduction">${Math.abs(change).toFixed(1)}% ${label}</span>
+        </div>
+        <div class="result-summary">${escapeHtml(outcome.summary)}</div>
+        <div class="result-output">
+            <span class="path" title="${escapeAttr(outcome.output ?? '')}">${escapeHtml(outcome.output ?? '')}</span>
+            <button class="reveal-btn" data-reveal="${escapeAttr(outcome.output ?? '')}">Show</button>
+        </div>`;
+    return card;
 }
 
 // -------------------------------------------------------------------- wiring
@@ -418,23 +578,63 @@ function wireEvents() {
         if (chosen) await addBooks(Array.isArray(chosen) ? chosen : [chosen]);
     });
 
+    // A folder can be chosen as it can be dropped; the dialog chooses files
+    // or folders, not both, so it has a way of its own.
+    document.getElementById('choose-folder').addEventListener('click', async (event) => {
+        event.stopPropagation();
+        const chosen = await open({ directory: true, multiple: true });
+        if (chosen) await addBooks(Array.isArray(chosen) ? chosen : [chosen]);
+    });
+
     // Tauri delivers OS drag-and-drop as a window event, not a DOM one.
     listen('tauri://drag-drop', (event) => addBooks(event.payload.paths ?? []));
+    listen('tauri://focus', reloadSettings);
     listen('tauri://drag-enter', () => dropZone.classList.add('dragover'));
     listen('tauri://drag-leave', () => dropZone.classList.remove('dragover'));
     listen('tauri://drag-drop', () => dropZone.classList.remove('dragover'));
 
     listen('progress', ({ payload }) => {
+        if (running && !stopping) {
+            setStatus(`Optimizing book ${payload.index + 1} of ${payload.total}…`);
+        }
         const item = progressItems.querySelector(`[data-path="${cssEscape(payload.path)}"]`);
         if (!item) return;
         item.querySelector('.progress-bar').style.width = `${payload.percent}%`;
         item.querySelector('.progress-message').textContent = payload.message;
     });
 
+    // Each book's result shows as soon as it is known, not when the last
+    // book is done.
     listen('finished', ({ payload }) => {
+        if (running) {
+            resultsItems.appendChild(resultCard(payload));
+            resultsSection.hidden = false;
+        }
         const item = progressItems.querySelector(`[data-path="${cssEscape(payload.path)}"]`);
         if (!item) return;
-        item.querySelector('.progress-bar').classList.add(payload.error ? 'error' : 'complete');
+        const kind = outcomeKind(payload);
+        item.querySelector('.progress-bar').classList.add(kind === 'success' ? 'complete' : kind);
+        if (payload.error) item.querySelector('.progress-message').textContent = payload.error;
+    });
+
+    // Closed during a run, the window stops the run, and goes once it has.
+    listen('closing', () => {
+        stopping = true;
+        stopBtn.disabled = true;
+        stopBtn.textContent = 'Stopping…';
+        setStatus('Stopping, then closing…');
+    });
+
+    stopBtn.addEventListener('click', async () => {
+        stopping = true;
+        stopBtn.disabled = true;
+        stopBtn.textContent = 'Stopping…';
+        setStatus('Stopping…');
+        try {
+            await invoke('stop_run');
+        } catch (error) {
+            setStatus(`Could not stop: ${error}`, true);
+        }
     });
 
     fileList.addEventListener('click', (event) => {
@@ -491,7 +691,7 @@ function wireEvents() {
         if (!name) return;
         try {
             applySettings(await invoke('save_preset', { name, settings }));
-            setStatus(`Saved "${name}".`);
+            note(`Saved "${name}".`);
             closeNamer();
         } catch (error) {
             setStatus(`Could not save that preset: ${error}`, true);
@@ -514,7 +714,7 @@ function wireEvents() {
         try {
             await flushPersist();
             applySettings(await invoke('delete_preset', { id }));
-            setStatus('Preset deleted.');
+            note('Preset deleted.');
         } catch (error) {
             setStatus(`Could not delete that preset: ${error}`, true);
         }
@@ -530,7 +730,23 @@ function wireEvents() {
         }
     });
 
-    document.getElementById('clear-btn').addEventListener('click', () => {
+    // Stop keeps the books listed and drops the rest, so a search stopped
+    // lists none of what it found. Listing that would mean reading it: the
+    // Stop would start a read, of whatever came first in a folder dropped by
+    // mistake, a home folder say.
+    stopReadingBtn.addEventListener('click', () => {
+        const stopped = [
+            longReads.reading > 0 && 'reading',
+            longReads.looking > 0 && 'looking for books',
+        ].filter(Boolean).join(' and ');
+        forgetReads();
+        note(`Stopped ${stopped}. ${books.length} book${books.length === 1 ? '' : 's'} listed.`);
+    });
+
+    clearBtn.addEventListener('click', () => {
+        if (running) return;
+        // A read still under way would list its books again a moment later.
+        forgetReads();
         books = [];
         renderBooks();
         progressSection.hidden = true;
@@ -545,9 +761,21 @@ function wireEvents() {
 
 // ------------------------------------------------------------------ helpers
 
+/// How a book's run ended: made, failed, or stopped before it was made.
+function outcomeKind(outcome) {
+    if (outcome.stopped) return 'stopped';
+    return outcome.error ? 'error' : 'success';
+}
+
 function setStatus(message, isError = false) {
     statusLine.textContent = message;
     statusLine.classList.toggle('error-text', isError);
+    readyShown = false;
+}
+
+/// Say something that is not an error, unless a run has the footer.
+function note(message) {
+    if (!running) setStatus(message);
 }
 
 function basename(path) {

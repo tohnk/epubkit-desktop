@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use epubkit_core::metadata::{FilenameFormat, FilenameOptions, TEMPLATE_FIELDS};
@@ -125,6 +126,190 @@ fn a_cover_comes_back_as_a_data_url_the_page_can_render() {
 
     // A thumbnail, whatever the cover was.
     assert!(cover.starts_with("data:image/jpeg;base64,"), "{cover}");
+}
+
+/// A folder dropped on the window gives the books in it, and in the folders
+/// in it, in the order a listing of each folder gives them; a book dropped
+/// on its own is itself. A dropped folder did nothing, and said nothing. What
+/// is hidden is left out: macOS writes a `._` file beside each book on a
+/// drive it does not format, an SD card say, and it too ends in `.epub`.
+#[test]
+fn a_dropped_folder_gives_the_books_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Books");
+    for file in [
+        "b.EPUB",
+        "a.epub",
+        "notes.txt",
+        "._a.epub",
+        ".hidden/d.epub",
+        "Series/c.epub",
+        "Series/Later/e.epub",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+    }
+    let alone = dir.path().join("alone.epub");
+    std::fs::write(&alone, b"").unwrap();
+    let text = |path: &Path| path.to_string_lossy().to_string();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![
+        text(&root),
+        text(&alone),
+        text(&dir.path().join("notes.txt")),
+        text(&dir.path().join("missing")),
+    ]))
+    .unwrap();
+
+    let expected: Vec<String> = [
+        root.join("a.epub"),
+        root.join("b.EPUB"),
+        root.join("Series/c.epub"),
+        root.join("Series/Later/e.epub"),
+        alone,
+    ]
+    .iter()
+    .map(|path| text(path))
+    .collect();
+    assert_eq!(found.books, expected);
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
+}
+
+/// A folder linked into a dropped one is looked through as any other: a
+/// library kept as links to folders gave none of the books in them. A link
+/// back up the tree is not followed round for ever.
+#[cfg(unix)]
+#[test]
+fn a_dropped_folder_gives_the_books_in_folders_linked_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("Elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("f.epub"), b"").unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("Linked")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("Up")).unwrap();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]))
+    .unwrap();
+
+    assert_eq!(
+        found.books,
+        [root.join("Linked/f.epub").to_string_lossy().to_string()]
+    );
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
+}
+
+/// A folder that cannot be looked in is named: its books were left out with
+/// nothing said, and a drop of only such a folder read "Nothing to add".
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cannot_be_looked_in_is_named() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    let shut = root.join("Shut");
+    std::fs::create_dir_all(&shut).unwrap();
+    std::fs::write(shut.join("away.epub"), b"").unwrap();
+    std::fs::write(root.join("open.epub"), b"").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads a folder whatever its mode, so there is none to name.
+    if std::fs::read_dir(&shut).is_ok() {
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: this user reads a folder whatever its mode");
+        return;
+    }
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]));
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let found = found.unwrap();
+
+    assert_eq!(
+        found.books,
+        [root.join("open.epub").to_string_lossy().to_string()]
+    );
+    assert_eq!(found.unreadable, [shut.to_string_lossy().to_string()]);
+}
+
+/// A walk through a dropped folder stops when it is told, with what it found
+/// so far: a home folder, or one with a link out of it to a whole disk, took
+/// as long as it took, and nothing stopped it.
+#[test]
+fn a_walk_through_a_drop_stops_when_told() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..50 {
+        std::fs::write(dir.path().join(format!("{n:02}.epub")), b"").unwrap();
+    }
+    let paths = [dir.path().to_string_lossy().to_string()];
+
+    let asked = std::cell::Cell::new(0);
+    let found = commands::find_books_until(&paths, || {
+        asked.set(asked.get() + 1);
+        asked.get() > 10
+    });
+    assert!(found.books.len() <= 10, "{} found", found.books.len());
+
+    let found = commands::find_books_until(&paths, || false);
+    assert_eq!(found.books.len(), 50);
+}
+
+/// A book reached twice in what was dropped, as itself and through a link to
+/// it or to its folder, is listed once, as it was first reached. Listed
+/// twice, it was made twice, the second as "… (2).epub".
+#[cfg(unix)]
+#[test]
+fn a_book_reached_twice_in_a_drop_is_listed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(root.join("Shelf")).unwrap();
+    let book = root.join("Shelf").join("book.epub");
+    std::fs::write(&book, b"").unwrap();
+    std::os::unix::fs::symlink(root.join("Shelf"), root.join("Again")).unwrap();
+    std::os::unix::fs::symlink(&book, root.join("Linked.epub")).unwrap();
+
+    let dropped = [&root, &book].map(|path| path.to_string_lossy().to_string());
+    let found = commands::find_books_until(&dropped, || false);
+
+    assert_eq!(
+        found.books,
+        [root
+            .join("Again")
+            .join("book.epub")
+            .to_string_lossy()
+            .to_string()]
+    );
+}
+
+/// A link to nothing, to a book on a card no longer in its reader say, is
+/// passed over: followed, it was named as a folder that could not be looked
+/// in, though it was looked in well enough, and was a file at that.
+#[cfg(unix)]
+#[test]
+fn a_link_to_nothing_is_passed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("here.epub"), b"").unwrap();
+    let gone = dir.path().join("Gone");
+    std::os::unix::fs::symlink(gone.join("away.epub"), root.join("away.epub")).unwrap();
+    std::os::unix::fs::symlink(&gone, root.join("Gone")).unwrap();
+
+    let found = tauri::async_runtime::block_on(commands::find_books(vec![root
+        .to_string_lossy()
+        .to_string()]))
+    .unwrap();
+
+    assert_eq!(
+        found.books,
+        [root.join("here.epub").to_string_lossy().to_string()]
+    );
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
 }
 
 /// A bad file must not sink the whole drop — it comes back as one failed entry
@@ -277,6 +462,22 @@ fn naming(format: FilenameFormat) -> Settings {
     }
 }
 
+/// One book made as the window makes each, by a run nobody stops.
+fn optimize_one(
+    job: &commands::Job,
+    destination: &Path,
+    settings: &Settings,
+    progress: impl FnMut(u8, &str),
+) -> commands::Outcome {
+    commands::optimize_one(
+        job,
+        destination,
+        settings,
+        progress,
+        &AtomicBool::new(false),
+    )
+}
+
 /// The window names its books as chosen, not only the CLI.
 #[test]
 fn a_book_is_written_under_the_chosen_name() {
@@ -285,7 +486,7 @@ fn a_book_is_written_under_the_chosen_name() {
     demo_epub(&book);
     let out = tempfile::tempdir().unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         out.path(),
         &naming(FilenameFormat::TitleAuthor),
@@ -315,7 +516,7 @@ fn keeping_the_original_name_never_replaces_the_original() {
     demo_epub(&book);
     let before = std::fs::read(&book).unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         dir.path(),
         &naming(FilenameFormat::Original),
@@ -359,7 +560,7 @@ fn a_failed_run_removes_nothing_it_did_not_make() {
     let bystander = out.path().join(".epubkit-0.part");
     std::fs::write(&bystander, b"someone else's file").unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&out.path().join("missing.epub")),
         out.path(),
         &naming(FilenameFormat::AuthorTitle),
@@ -371,6 +572,164 @@ fn a_failed_run_removes_nothing_it_did_not_make() {
         std::fs::read(&bystander).ok().as_deref() == Some(b"someone else's file".as_slice()),
         "a file the run did not make was removed or changed"
     );
+}
+
+/// A run told to stop stops the book it is making, which is not written, and
+/// begins no other; each says it was stopped. Nothing could stop a run but
+/// closing the window, which left the book's staging file in the folder the
+/// books were going to.
+#[test]
+fn a_stopped_run_writes_nothing_more_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.epub");
+    let second = dir.path().join("second.epub");
+    titled_epub(&first, "First");
+    titled_epub(&second, "Second");
+    let jobs = [job(&first), job(&second)];
+    let out = tempfile::tempdir().unwrap();
+    let settings = naming(FilenameFormat::Title);
+
+    let stop = AtomicBool::new(false);
+    let mut finished = Vec::new();
+    let outcomes = commands::optimize_all(
+        &jobs,
+        out.path(),
+        &settings,
+        &stop,
+        |index, percent, _| {
+            if index == 0 && percent >= 15 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        },
+        |outcome| finished.push(outcome.path.clone()),
+    );
+
+    assert_eq!(finished, [jobs[0].path.clone(), jobs[1].path.clone()]);
+    for outcome in &outcomes {
+        assert!(outcome.stopped, "{outcome:?}");
+        assert!(outcome.output.is_none() && outcome.error.is_some());
+    }
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    // Not stopped, every book is made.
+    let outcomes = commands::optimize_all(
+        &jobs,
+        out.path(),
+        &settings,
+        &AtomicBool::new(false),
+        |_, _, _| {},
+        |_| {},
+    );
+    let made: Vec<_> = outcomes
+        .iter()
+        .map(|outcome| title_of(outcome.output.as_ref().unwrap()))
+        .collect();
+    assert_eq!(made, ["First", "Second"]);
+    assert!(outcomes.iter().all(|outcome| !outcome.stopped));
+}
+
+/// Closed during a run, the window waits for the run to stop and then closes;
+/// closed again meanwhile, it closes at once. The close the run's end asks
+/// for is not put off in its turn as one asked during a run, which it was
+/// not only because the run was marked over before that close was asked.
+#[test]
+fn closing_during_a_run_stops_it_and_closes_once_it_has() {
+    let run = commands::RunState::new();
+    assert!(!run.stop_before_closing(), "with no run, the window closes");
+
+    let stop = run.begin();
+    assert!(run.stop_before_closing(), "during a run, it waits");
+    assert!(stop.load(Ordering::SeqCst), "and the run is told to stop");
+    assert!(
+        !run.stop_before_closing(),
+        "closed again, it closes at once"
+    );
+
+    assert!(run.end(), "the run over, the window closes");
+    assert!(!run.stop_before_closing(), "and that close is not put off");
+
+    // A run the window was not closed during leaves it open, and the next
+    // run forgets the stop told to the last.
+    run.stop();
+    let stop = run.begin();
+    assert!(!stop.load(Ordering::SeqCst));
+    assert!(!run.end());
+}
+
+/// A run is over however its worker ends, one that panics past every book's
+/// own catch too. Left running, it had the window wait on it to close,
+/// "Stopping, then closing…" for a run that was gone, and a quit from the
+/// Dock wait out its patience.
+#[test]
+fn a_run_is_over_however_its_worker_ends() {
+    static RUN: commands::RunState = commands::RunState::new();
+
+    let (done, close) = tauri::async_runtime::block_on(RUN.run(|_| -> () {
+        panic!("past every book's own catch");
+    }));
+
+    assert!(done.is_err());
+    assert!(!close);
+    assert!(!RUN.stop_before_closing(), "no run left to wait on");
+}
+
+/// Quit with no say in it, from the Dock say, the app tells a run under way
+/// to stop and waits, a while, for it to have stopped and taken its files.
+#[test]
+fn quitting_waits_a_while_for_a_run_to_stop() {
+    use std::time::{Duration, Instant};
+
+    let run = commands::RunState::new();
+    assert!(
+        run.stop_and_wait(Duration::ZERO),
+        "with no run, nothing to wait for"
+    );
+
+    // A run that stops a moment after it is told.
+    let stop = run.begin();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            run.end();
+        });
+        let began = Instant::now();
+        assert!(run.stop_and_wait(Duration::from_secs(10)));
+        assert!(began.elapsed() >= Duration::from_millis(50));
+    });
+
+    // One that does not stop is given up on.
+    run.begin();
+    assert!(!run.stop_and_wait(Duration::from_millis(50)));
+}
+
+/// A book whose run panics fails on its own, as one whose run errs does. The
+/// panic went up through the window's run of every book dropped with it:
+/// those after it were never made, and the page was told only that the run
+/// had failed, not which of the books before it had been written.
+#[test]
+fn a_book_whose_run_panics_fails_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = dir.path().join("book.epub");
+    demo_epub(&book);
+    let out = tempfile::tempdir().unwrap();
+    let settings = naming(FilenameFormat::AuthorTitle);
+
+    let outcome = optimize_one(&job(&book), out.path(), &settings, |percent, _| {
+        assert!(percent < 50, "a bug halfway through the book");
+    });
+
+    assert!(outcome.output.is_none());
+    let error = outcome.error.expect("the panic is the book's error");
+    assert!(error.contains("a bug halfway through the book"), "{error}");
+    // Its staging file went with it.
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    // And the next book is made as ever.
+    let next = optimize_one(&job(&book), out.path(), &settings, |_, _| {});
+    assert!(next.error.is_none(), "{:?}", next.error);
 }
 
 /// A book is written to a file of its own making, not through a link that
@@ -387,7 +746,7 @@ fn a_book_is_not_written_through_a_link() {
     let out = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(&precious, out.path().join(".epubkit-0.part")).unwrap();
 
-    let outcome = commands::optimize_one(
+    let outcome = optimize_one(
         &job(&book),
         out.path(),
         &naming(FilenameFormat::AuthorTitle),
@@ -411,9 +770,9 @@ fn runs_side_by_side_keep_their_own_books() {
     let settings = naming(FilenameFormat::TitleAuthor);
 
     let mut inner = None;
-    let outer = commands::optimize_one(&job(&first), out.path(), &settings, |percent, _| {
+    let outer = optimize_one(&job(&first), out.path(), &settings, |percent, _| {
         if percent == 100 && inner.is_none() {
-            inner = Some(commands::optimize_one(
+            inner = Some(optimize_one(
                 &job(&second),
                 out.path(),
                 &settings,
@@ -451,6 +810,11 @@ fn page() -> String {
         .expect("the page should be readable")
 }
 
+fn script() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
+        .expect("the page's script should be readable")
+}
+
 /// The values of every `name="…"` attribute on the page, in order.
 fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
     let marker = format!("{name}=\"");
@@ -460,6 +824,312 @@ fn attribute_values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
             &rest[..rest.find('"').expect("unterminated attribute")]
         })
         .collect()
+}
+
+/// Every command the page's script invokes is one the app registers. One it
+/// does not is refused only when the page calls it, and a button bound to it
+/// does nothing.
+#[test]
+fn the_page_invokes_only_commands_the_app_registers() {
+    let script = script();
+    let app = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("the app's source should be readable");
+
+    let invoked: std::collections::BTreeSet<&str> = script
+        .match_indices("invoke('")
+        .map(|(at, marker)| {
+            let rest = &script[at + marker.len()..];
+            &rest[..rest.find('\'').expect("unterminated command name")]
+        })
+        .collect();
+    for name in ["load_settings", "optimize_books", "stop_run"] {
+        assert!(invoked.contains(name), "{name} not found in {invoked:?}");
+    }
+    for name in invoked {
+        assert!(
+            app.contains(&format!("commands::{name},")),
+            "the page invokes '{name}', which the app does not register"
+        );
+    }
+}
+
+/// The events the app emits are the events the page listens for, but for the
+/// window's own, `tauri://`. Renamed on one side only, a run's progress bars
+/// would stand still and no result would show, and nothing would say why.
+#[test]
+fn the_page_listens_for_the_events_the_app_emits() {
+    let script = script();
+    let commands = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+        .expect("the app's commands should be readable");
+
+    // The quoted name after each `call`, however the call is laid out.
+    let names = |text: &str, call: &str, quote: char| -> std::collections::BTreeSet<String> {
+        text.match_indices(call)
+            .filter_map(|(at, _)| {
+                let rest = text[at + call.len()..].trim_start();
+                let name = rest.strip_prefix(quote)?;
+                Some(name[..name.find(quote)?].to_string())
+            })
+            .collect()
+    };
+    let listened: std::collections::BTreeSet<String> = names(&script, "listen(", '\'')
+        .into_iter()
+        .filter(|name| !name.starts_with("tauri://"))
+        .collect();
+    let emitted = names(&commands, ".emit(", '"');
+
+    assert!(listened.contains("progress"), "{listened:?}");
+    assert_eq!(listened, emitted);
+}
+
+/// `text` split at each comma outside brackets, a type's angle brackets
+/// among them.
+fn split_outside_brackets(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut from, mut before) = (0, 0, ' ');
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            // An arrow's is no bracket.
+            '>' if before != '=' && before != '-' => depth -= 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&text[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+        before = c;
+    }
+    parts.push(&text[from..]);
+    parts
+}
+
+/// Each command the page invokes is given the arguments it takes, by the
+/// names Tauri looks for them under: the parameters', camelCased. A parameter
+/// renamed on one side only made the command refuse each call for want of an
+/// argument, and nothing failed until the page made one.
+#[test]
+fn the_page_invokes_each_command_with_the_arguments_it_takes() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let script = script();
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+        .expect("the app's commands should be readable");
+    let camel_case = |name: &str| {
+        let mut words = name.split('_');
+        let first = words.next().unwrap_or_default().to_string();
+        words.fold(first, |name, word| {
+            let mut letters = word.chars();
+            let initial = letters.next().map(|c| c.to_uppercase().collect::<String>());
+            name + &initial.unwrap_or_default() + letters.as_str()
+        })
+    };
+
+    // What each command takes, but for what Tauri hands it itself.
+    let mut takes: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (at, marker) in source.match_indices("#[tauri::command]") {
+        let rest = &source[at + marker.len()..];
+        let rest = &rest[rest.find("fn ").expect("a command is a function") + 3..];
+        let open = rest.find('(').expect("a function has parameters");
+        let name = rest[..open].split('<').next().unwrap_or_default();
+        let parameters = &rest[open + 1..rest.find(')').expect("unterminated parameters")];
+        let arguments = split_outside_brackets(parameters)
+            .into_iter()
+            .filter_map(|parameter| parameter.split_once(':'))
+            .filter(|(_, kind)| !kind.trim().starts_with("AppHandle"))
+            .map(|(name, _)| camel_case(name.trim()))
+            .collect();
+        takes.insert(name, arguments);
+    }
+    assert!(takes.contains_key("optimize_books"), "{takes:?}");
+
+    let mut calls = 0;
+    for (at, marker) in script.match_indices("invoke('") {
+        let rest = &script[at + marker.len()..];
+        let name = &rest[..rest.find('\'').expect("unterminated command name")];
+        let rest = rest[name.len() + 1..].trim_start();
+        let given: BTreeSet<String> = match rest.strip_prefix(',') {
+            Some(rest) => {
+                let object = rest.trim_start().strip_prefix('{').unwrap_or_else(|| {
+                    panic!("invoke('{name}') is given arguments, not an object")
+                });
+                let mut depth = 1;
+                let end = object
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    })
+                    .map(|(end, _)| end)
+                    .expect("unterminated arguments");
+                split_outside_brackets(&object[..end])
+                    .into_iter()
+                    .map(|part| {
+                        part.split(':')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    })
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            }
+            None => BTreeSet::new(),
+        };
+        let wanted = takes
+            .get(name)
+            .unwrap_or_else(|| panic!("the page invokes '{name}', which is no command"));
+        assert_eq!(&given, wanted, "invoke('{name}') is given {given:?}");
+        calls += 1;
+    }
+    assert!(calls >= 10, "{calls} calls found");
+}
+
+/// What the page reads or sets on each thing the app sends it is something
+/// the app sends, under the name it sends it by, but for the fields the page
+/// adds itself, named here. A run's sizes and the name of the book it wrote
+/// are camelCased by the core: renamed there, each result would read "NaN"
+/// and "undefined", and nothing would fail. A field the page sets as well as
+/// reads, the settings' `active` say, is held to it too: told apart from
+/// the page's own by being set, it was passed over.
+///
+/// Only the first field of each path is checked here. The options' own are
+/// checked by `the_page_binds_to_option_keys_that_exist`, and the filename's
+/// by `the_settings_payload_is_shaped_the_way_the_page_expects`.
+#[test]
+fn the_page_reads_only_what_the_app_sends() {
+    use epubkit_core::pipeline::ProcessingReport;
+    use std::collections::BTreeSet;
+
+    // What the page adds to a book: the title and author the book itself
+    // has, which an emptied field leaves it.
+    let added = [("book", "ownTitle"), ("book", "ownAuthor")];
+
+    let script = script();
+    // The fields the page uses on `name`, but those it adds itself.
+    let read = |name: &str| -> BTreeSet<String> {
+        let marker = format!("{name}.");
+        script
+            .match_indices(&marker)
+            .filter_map(|(at, _)| {
+                let before = script[..at].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                    return None;
+                }
+                let field: String = script[at + marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let own = added.contains(&(name, field.as_str()));
+                (!field.is_empty() && !own).then_some(field)
+            })
+            .collect()
+    };
+    let sends = |value: serde_json::Value| -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+
+    let report = ProcessingReport::default();
+    let outcome = commands::Outcome {
+        path: String::new(),
+        output: Some(String::new()),
+        summary: String::new(),
+        report: Some(report.clone()),
+        error: Some(String::new()),
+        stopped: false,
+    };
+    let progress = commands::Progress {
+        path: String::new(),
+        index: 0,
+        total: 1,
+        percent: 0,
+        message: String::new(),
+    };
+    let book = commands::BookInfo {
+        path: String::new(),
+        filename: String::new(),
+        size: 0,
+        title: String::new(),
+        author: String::new(),
+        series: String::new(),
+        cover: Some(String::new()),
+        error: Some(String::new()),
+    };
+    // The page's events carry a book's progress, or its outcome once it is
+    // done.
+    let mut payload = sends(serde_json::to_value(&progress).unwrap());
+    payload.extend(sends(serde_json::to_value(&outcome).unwrap()));
+
+    for (name, sent) in [
+        ("report", sends(serde_json::to_value(&report).unwrap())),
+        ("outcome", sends(serde_json::to_value(&outcome).unwrap())),
+        ("payload", payload),
+        ("book", sends(serde_json::to_value(&book).unwrap())),
+        (
+            "found",
+            sends(serde_json::to_value(commands::Found::default()).unwrap()),
+        ),
+        (
+            "device",
+            sends(serde_json::to_value(&commands::devices()[0]).unwrap()),
+        ),
+        (
+            "settings",
+            sends(serde_json::to_value(Settings::default()).unwrap()),
+        ),
+    ] {
+        let read = read(name);
+        assert!(!read.is_empty(), "the page reads nothing off {name}");
+        for field in &read {
+            assert!(
+                sent.contains(field),
+                "the page reads {name}.{field}, which the app does not send: it sends {sent:?}"
+            );
+        }
+    }
+}
+
+/// Every element the page's script looks up by its id is on the page. One
+/// that is not is null where the script reaches for it, and what it was doing
+/// there throws partway through: a large drop's read, say, with nothing said.
+#[test]
+fn the_page_has_every_element_its_script_looks_up() {
+    use std::collections::BTreeSet;
+
+    let script = script();
+    let html = page();
+    let ids: BTreeSet<&str> = html
+        .match_indices(" id=\"")
+        .map(|(at, marker)| {
+            let rest = &html[at + marker.len()..];
+            &rest[..rest.find('"').expect("unterminated id")]
+        })
+        .collect();
+    let looked_up: BTreeSet<&str> = script
+        .match_indices("getElementById('")
+        .map(|(at, marker)| {
+            let rest = &script[at + marker.len()..];
+            &rest[..rest.find('\'').expect("unterminated id")]
+        })
+        .collect();
+
+    assert!(looked_up.len() >= 20, "{looked_up:?}");
+    for id in &looked_up {
+        assert!(
+            ids.contains(id),
+            "the script looks up #{id}, which is not on the page"
+        );
+    }
 }
 
 /// Every `data-option` the page binds to must exist in the serialized options.

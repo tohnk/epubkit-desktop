@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 use std::ops::Range;
 
@@ -241,16 +242,20 @@ pub struct ReachableStylesheets {
     pub too_large: bool,
 }
 
+/// The [`ReachableStylesheets`] of `documents`. Once `stop` is set, it stops
+/// before the next file it would read, with [`Error::Stopped`].
 pub fn reachable_stylesheets(
     root: &Path,
     opf_dir: &Path,
     documents: &[&Path],
+    stop: &AtomicBool,
 ) -> Result<ReachableStylesheets> {
     let mut result = ReachableStylesheets::default();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
 
     for &path in documents {
+        Error::if_stopped(stop)?;
         if !path.is_file() {
             continue;
         }
@@ -294,6 +299,7 @@ pub fn reachable_stylesheets(
     }
 
     while let Some(path) = queue.pop() {
+        Error::if_stopped(stop)?;
         if !seen.insert(path.clone()) || !path.is_file() {
             continue;
         }
@@ -553,13 +559,16 @@ pub fn add_image_to_opf(doc: &Document, href: &str, id: &str) -> Result<()> {
 /// case is taken once, as a filesystem that ignores case holds it once.
 ///
 /// `chapters` are those the steps after the image step rewrite references
-/// in, and so are the SVG documents and stylesheets read here.
+/// in, and so are the SVG documents and stylesheets read here. Once `stop`
+/// is set, it stops before the next of them it would read, with
+/// [`Error::Stopped`].
 pub fn undeclared_images(
     root: &Path,
     opf_dir: &Path,
     opf: &Document,
     chapters: &[&Path],
     content: &ContentFiles,
+    stop: &AtomicBool,
 ) -> Result<Vec<PathBuf>> {
     let fold = |path: &Path| path.to_string_lossy().to_lowercase();
     let mut taken: HashSet<String> = manifest_items(opf)?
@@ -570,6 +579,7 @@ pub fn undeclared_images(
 
     let mut named = BTreeSet::new();
     for &path in chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         named_files(
@@ -581,11 +591,13 @@ pub fn undeclared_images(
     }
     // One that is not well-formed is left as it is, its references too.
     for path in content.svg.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         if let Ok(doc) = xml::parse_file(path) {
             named_files(&doc, root, path.parent().unwrap_or(opf_dir), &mut named)?;
         }
     }
     for path in content.css.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         let css = crate::css::read_stylesheet(path)?;
         let base = path.parent().unwrap_or(opf_dir);
         named.extend(
@@ -1031,13 +1043,16 @@ pub fn show_reshaped_pages(path: &Path, reshaped: &ReshapedPages) -> Result<usiz
 /// fit, and one in a chapter styled by a stylesheet too large to read: see
 /// [`free_images`].
 ///
-/// `chapters` are read as the steps after the image step read them.
+/// `chapters` are read as the steps after the image step read them. Once
+/// `stop` is set, it stops before the next file it would read, with
+/// [`Error::Stopped`].
 pub fn fixed_shape_images(
     root: &Path,
     opf_dir: &Path,
     opf: &Document,
     chapters: &[&Path],
     content: &ContentFiles,
+    stop: &AtomicBool,
 ) -> Result<HashSet<PathBuf>> {
     let mut fixed = HashSet::new();
     let mut stylesheets = Stylesheets::new(root);
@@ -1045,10 +1060,12 @@ pub fn fixed_shape_images(
 
     // What a stylesheet shows, it shows in a box it sizes.
     for path in content.css.iter().filter(|path| path.is_file()) {
+        Error::if_stopped(stop)?;
         stylesheets.at(path)?;
     }
 
     for &path in chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let content = html::parse_content(&bytes)?;
         let base = path.parent().unwrap_or(opf_dir);
@@ -1740,6 +1757,19 @@ pub fn fix_svg_covers(root: &Path, opf_dir: &Path, doc: &Document) -> Result<usi
 /// its fix-up function was an empty stub, so a book with a broken TOC kept it.
 /// Here a broken TOC is regenerated, which is what that comment intended.
 pub fn fix_toc(root: &Path, opf_dir: &Path, doc: &Document) -> Result<TocOutcome> {
+    fix_toc_until(root, opf_dir, doc, &AtomicBool::new(false))
+}
+
+/// [`fix_toc`], which once `stop` is set stops before the next chapter it
+/// would read for its title, with [`Error::Stopped`]. A book with no usable
+/// NCX, as an EPUB 3 book with only a navigation document has, has every
+/// chapter read.
+pub(crate) fn fix_toc_until(
+    root: &Path,
+    opf_dir: &Path,
+    doc: &Document,
+    stop: &AtomicBool,
+) -> Result<TocOutcome> {
     let spine = spine_hrefs(doc)?;
     if spine.is_empty() {
         return Ok(TocOutcome::Skipped("Empty spine".into()));
@@ -1764,7 +1794,7 @@ pub fn fix_toc(root: &Path, opf_dir: &Path, doc: &Document) -> Result<TocOutcome
     }
 
     let ncx_dir = ncx_path.parent().unwrap_or(root);
-    let chapters = extract_chapters(root, opf_dir, ncx_dir, &spine);
+    let chapters = extract_chapters(root, opf_dir, ncx_dir, &spine, stop)?;
     if chapters.is_empty() {
         return Ok(TocOutcome::Skipped(
             "TOC left alone: no chapter lies inside the book".into(),
@@ -2393,35 +2423,40 @@ fn ncx_is_usable(root: &Path, ncx_path: &Path) -> Result<bool> {
 ///
 /// The spine's hrefs are relative to the OPF, in `opf_dir`; each chapter's is
 /// rewritten relative to `ncx_dir`, where the NCX naming it goes. A chapter
-/// outside the book is left out.
+/// outside the book is left out. Once `stop` is set, it stops before the next
+/// chapter it would read, with [`Error::Stopped`].
 fn extract_chapters(
     root: &Path,
     opf_dir: &Path,
     ncx_dir: &Path,
     spine: &[(String, String)],
-) -> Vec<Chapter> {
-    spine
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (_, href))| {
-            let (file, fragment) = match href.split_once('#') {
-                Some((file, fragment)) => (file, Some(fragment)),
-                None => (href.as_str(), None),
-            };
-            let path = resolve_href(root, opf_dir, &decode(file))?;
+    stop: &AtomicBool,
+) -> Result<Vec<Chapter>> {
+    let mut chapters = Vec::new();
+    for (index, (_, href)) in spine.iter().enumerate() {
+        Error::if_stopped(stop)?;
+        let (file, fragment) = match href.split_once('#') {
+            Some((file, fragment)) => (file, Some(fragment)),
+            None => (href.as_str(), None),
+        };
+        let Some(path) = resolve_href(root, opf_dir, &decode(file)) else {
+            continue;
+        };
 
-            let mut href = relative_href(root, ncx_dir, &path)?;
-            if let Some(fragment) = fragment {
-                href.push('#');
-                href.push_str(fragment);
-            }
+        let Some(mut href) = relative_href(root, ncx_dir, &path) else {
+            continue;
+        };
+        if let Some(fragment) = fragment {
+            href.push('#');
+            href.push_str(fragment);
+        }
 
-            Some(Chapter {
-                title: chapter_title(&path).unwrap_or_else(|| format!("Chapter {}", index + 1)),
-                href,
-            })
-        })
-        .collect()
+        chapters.push(Chapter {
+            title: chapter_title(&path).unwrap_or_else(|| format!("Chapter {}", index + 1)),
+            href,
+        });
+    }
+    Ok(chapters)
 }
 
 /// The path that leads from the directory `from` to `to`, both resolved inside
@@ -2564,6 +2599,34 @@ fn escape_xml_attribute(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Told to stop, making a table of contents from the chapters' titles
+    /// stops before the next chapter it would read, and makes none.
+    #[test]
+    fn making_a_toc_stops_once_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("one.xhtml"),
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body/></html>"#,
+        )
+        .unwrap();
+        let opf = xml::parse_strict(
+            br#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <manifest><item id="one" href="one.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="one"/></spine>
+</package>"#,
+        )
+        .unwrap();
+
+        let told = fix_toc_until(root, root, &opf, &AtomicBool::new(true));
+        assert!(matches!(told, Err(Error::Stopped)), "{told:?}");
+        assert!(!root.join("toc.ncx").exists());
+
+        // Left alone, it makes one.
+        let left = fix_toc_until(root, root, &opf, &AtomicBool::new(false));
+        assert!(matches!(left, Ok(TocOutcome::Generated(1))), "{left:?}");
+    }
 
     /// A pseudo-attribute's references are decoded as XML has a reader decode
     /// them, each once; what does not read as one is left as it is.

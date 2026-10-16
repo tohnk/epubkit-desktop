@@ -2,9 +2,12 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use epubkit_core::pipeline::{process_epub, ProcessingOptions, ProcessingReport};
+use epubkit_core::pipeline::{
+    process_epub, process_epub_stoppable, ProcessingOptions, ProcessingReport,
+};
 use epubkit_core::{metadata, package, structure, xml, Error};
 
 /// A book exercising every step: two chapters (one malformed, with store
@@ -104,6 +107,98 @@ fn produces_a_valid_epub() {
 
     let validation = package::validate_epub(&output).unwrap();
     assert!(validation.is_valid(), "problems: {:?}", validation.problems);
+}
+
+/// A run told to stop stops at its next step, an image not begun among them,
+/// and writes no book. Nothing could stop one but ending the program, which
+/// left its staging file beside where the book was going, and the whole book
+/// unpacked in the temporary directory. Told while the book was packed, the
+/// last step, the run wrote it all the same, having said it was stopping.
+#[test]
+fn a_run_told_to_stop_stops_at_its_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.epub");
+    let output = dir.path().join("out.epub");
+    write_demo_epub(&input);
+
+    // Before the book is unpacked, before its images, after them, and as it
+    // is packed.
+    for stop_at in [2, 15, 66, 95] {
+        let stop = AtomicBool::new(false);
+        let mut reached = Vec::new();
+        let result = process_epub_stoppable(
+            &input,
+            &output,
+            &ProcessingOptions::default(),
+            |percent, _| {
+                reached.push(percent);
+                if percent == stop_at {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            &stop,
+        );
+
+        assert!(
+            matches!(result, Err(Error::Stopped)),
+            "{stop_at}: {result:?}"
+        );
+        assert_eq!(reached.last(), Some(&stop_at), "{reached:?}");
+        assert!(!output.exists(), "{stop_at}");
+    }
+}
+
+/// What a run looks for in the book before its images stops once told, as
+/// its own steps do: the stylesheets the documents reach, the images the
+/// manifest leaves out, and those Light Novel mode must leave their shape.
+/// Each reads every chapter, and stops before the next.
+///
+/// The book has a chapter and nothing else to look through. Given a
+/// stylesheet too, a helper that went on through its chapters was stopped at
+/// the stylesheet, and passed: Light Novel mode's looks at the stylesheets
+/// first, and so was never told to stop in its chapters at all.
+#[test]
+fn looking_through_the_book_stops_once_told() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let input = root.join("in.epub");
+    common::write_minimal_epub(&input);
+    package::extract_epub(&input, root).unwrap();
+    let opf_dir = root.join("OEBPS");
+    let opf = xml::parse_file(&opf_dir.join("content.opf")).unwrap();
+    let content = structure::find_content_files(root, &opf_dir, &opf).unwrap();
+    let chapters: Vec<&Path> = content.xhtml.iter().map(PathBuf::as_path).collect();
+    assert_eq!(chapters.len(), 1);
+
+    // Told to stop, each stops; left alone, each finishes.
+    for told in [true, false] {
+        let stop = AtomicBool::new(told);
+        for (helper, result) in [
+            (
+                "reachable_stylesheets",
+                structure::reachable_stylesheets(root, &opf_dir, &chapters, &stop).map(drop),
+            ),
+            (
+                "undeclared_images",
+                structure::undeclared_images(root, &opf_dir, &opf, &chapters, &content, &stop)
+                    .map(drop),
+            ),
+            (
+                "fixed_shape_images",
+                structure::fixed_shape_images(root, &opf_dir, &opf, &chapters, &content, &stop)
+                    .map(drop),
+            ),
+        ] {
+            if told {
+                assert!(
+                    matches!(result, Err(Error::Stopped)),
+                    "{helper}: {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{helper}: {result:?}");
+            }
+        }
+    }
 }
 
 #[test]

@@ -13,7 +13,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, PoisonError};
 
 use crate::memory::MemoryBudget;
@@ -277,8 +277,36 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     input_path: &Path,
     output_path: &Path,
     options: &ProcessingOptions,
-    mut progress: P,
+    progress: P,
 ) -> Result<ProcessingReport> {
+    process_epub_stoppable(
+        input_path,
+        output_path,
+        options,
+        progress,
+        &AtomicBool::new(false),
+    )
+}
+
+/// [`process_epub`], which once `stop` is set stops at its next step, or
+/// within one before the next document, image or file it would begin, with
+/// [`Error::Stopped`]. It writes no book, even one packed by then, and what it
+/// made meanwhile goes with it. A step over every chapter of a long book took
+/// seconds, and a quit from the Dock gives a run ten.
+pub fn process_epub_stoppable<P: FnMut(u8, &str)>(
+    input_path: &Path,
+    output_path: &Path,
+    options: &ProcessingOptions,
+    mut progress: P,
+    stop: &AtomicBool,
+) -> Result<ProcessingReport> {
+    // Each step the run reports is a point it can stop at.
+    let mut step = |percent: u8, message: &str| {
+        Error::if_stopped(stop)?;
+        progress(percent, message);
+        Ok(())
+    };
+
     let mut report = ProcessingReport {
         original_size: fs::metadata(input_path)
             .map_err(|e| Error::io(input_path, e))?
@@ -292,7 +320,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         metadata::check_template(&options.filename.template)?;
     }
 
-    progress(2, "Checking for DRM...");
+    step(2, "Checking for DRM...")?;
     if package::has_drm(input_path)? {
         return Err(Error::DrmProtected);
     }
@@ -300,10 +328,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     let work = tempfile::tempdir().map_err(|e| Error::io(input_path, e))?;
     let work_dir = work.path();
 
-    progress(5, "Extracting EPUB...");
-    package::extract_epub(input_path, work_dir)?;
+    step(5, "Extracting EPUB...")?;
+    package::extract_epub_until(input_path, work_dir, stop)?;
 
-    progress(8, "Parsing structure...");
+    step(8, "Parsing structure...")?;
     let opf_relative = package::find_opf_path(work_dir)?;
     let opf_path = work_dir.join(&opf_relative);
     let opf_dir = opf_path
@@ -314,7 +342,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // Parsed once; every step below mutates this same document.
     let opf = xml::parse_file(&opf_path)?;
 
-    progress(10, "Reading metadata...");
+    step(10, "Reading metadata...")?;
     if !options.metadata_edits.is_empty() {
         metadata::update_metadata(&opf, &options.metadata_edits)?;
     }
@@ -334,7 +362,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // A chapter nothing can parse, an empty file say, is left exactly as it
     // was rather than sinking the book; every later step works only on the
     // chapters that did parse.
-    progress(12, "Repairing HTML...");
+    step(12, "Repairing HTML...")?;
     let backend = html::LibxmlRepair::new();
     let mut chapters: Vec<&Path> = Vec::new();
     // Whether the run leaves a document exactly as it is that it has not
@@ -343,6 +371,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     let mut left_unread = !content.too_large.is_empty();
     report.documents_too_large = content.too_large.len();
     for path in &content.xhtml {
+        Error::if_stopped(stop)?;
         if !path.is_file() {
             continue;
         }
@@ -371,7 +400,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     let reachable = {
         let mut documents: Vec<&Path> = chapters.clone();
         documents.extend(svg_documents(&content));
-        structure::reachable_stylesheets(work_dir, &opf_dir, &documents)?
+        structure::reachable_stylesheets(work_dir, &opf_dir, &documents, stop)?
     };
     left_unread |= reachable.too_large;
 
@@ -379,15 +408,16 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // Light Novel mode reshapes an image only where it is shown as a page of
     // its own, so first it looks at how each is shown.
     let keep_shape = if options.light_novel_mode {
-        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content)?
+        structure::fixed_shape_images(work_dir, &opf_dir, &opf, &chapters, &content, stop)?
     } else {
         HashSet::new()
     };
-    progress(15, "Processing images...");
+    step(15, "Processing images...")?;
     // Every image the manifest declares, whatever its name or media type, but
     // for SVG, which is drawn and stays as it is; then those the book shows
     // that the manifest leaves out.
-    let undeclared = structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content)?;
+    let undeclared =
+        structure::undeclared_images(work_dir, &opf_dir, &opf, &chapters, &content, stop)?;
     let mut rasters: Vec<PathBuf> = content
         .images
         .iter()
@@ -412,7 +442,8 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         options,
         &keep_shape,
         &mut report,
-        &mut progress,
+        &mut step,
+        stop,
     )?;
     report.images_total += kept.len();
     report.images_unconverted += kept.len();
@@ -424,21 +455,23 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         ));
     }
 
-    progress(66, "Fixing SVG covers...");
+    step(66, "Fixing SVG covers...")?;
     report.svg_covers_fixed = structure::fix_svg_covers(work_dir, &opf_dir, &opf)?;
 
-    progress(68, "Updating references...");
+    step(68, "Updating references...")?;
     let rename_map = structure::build_rename_map(&converted.renames);
     if !rename_map.is_empty() {
         // Indexed once, not for each document.
         let renames = structure::Renames::new(work_dir, &opf_dir, &rename_map);
         structure::update_opf(&opf, &renames)?;
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             structure::update_xhtml_references(path, &renames)?;
         }
         // An SVG document names images as a chapter does. One that is not
         // well-formed is left as it is.
         for path in svg_documents(&content) {
+            Error::if_stopped(stop)?;
             structure::update_svg_references(path, &renames).ok();
         }
         // Every stylesheet the manifest lists, and every one a document
@@ -452,6 +485,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
                 .map(PathBuf::as_path),
         );
         for path in stylesheets {
+            Error::if_stopped(stop)?;
             if path.is_file() {
                 structure::update_css_references(path, &renames)?;
             }
@@ -479,10 +513,11 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // A rotated image or a split spread no longer has the shape its pages
     // describe, and a split one has pages no page shows yet.
     if !converted.reshaped.is_empty() {
-        progress(72, "Showing reshaped pages...");
+        step(72, "Showing reshaped pages...")?;
         structure::declare_reshaped_pages(&opf, &converted.reshaped)?;
         let reshaped = structure::ReshapedPages::new(work_dir, &opf_dir, &converted.reshaped);
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             structure::show_reshaped_pages(path, &reshaped)?;
         }
     }
@@ -490,14 +525,16 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     // What a document left unread uses cannot be known, so no rule is known
     // to be unused.
     if options.remove_unused_css && !left_unread {
-        progress(76, "Removing unused CSS...");
+        step(76, "Removing unused CSS...")?;
         let mut used = css::UsedSelectors::default();
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             used.merge(&css::collect_used_selectors(&bytes)?);
         }
         // An SVG document can use a stylesheet's rules as much as a chapter.
         for path in svg_documents(&content) {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             if let Ok(used_here) = css::collect_used_selectors(&bytes) {
                 used.merge(&used_here);
@@ -505,6 +542,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         }
 
         for path in &content.css {
+            Error::if_stopped(stop)?;
             if !path.is_file() {
                 continue;
             }
@@ -518,9 +556,10 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     if options.remove_fonts && !content.fonts.is_empty() {
-        progress(80, "Removing embedded fonts...");
+        step(80, "Removing embedded fonts...")?;
 
         for path in &content.css {
+            Error::if_stopped(stop)?;
             if !path.is_file() {
                 continue;
             }
@@ -533,6 +572,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
         // A chapter may declare a font in a <style> of its own.
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             let (cleaned, removed) = css::remove_embedded_fonts_from_styles(&bytes)?;
             if removed > 0 {
@@ -552,8 +592,9 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         package::forget_missing_encrypted_files(work_dir)?;
     }
 
-    progress(82, "Normalizing content...");
+    step(82, "Normalizing content...")?;
     for &path in &chapters {
+        Error::if_stopped(stop)?;
         let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
         let (cleaned, removed) = html::normalize_whitespace(&bytes)?;
         report.blank_elements_removed += removed;
@@ -562,7 +603,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
     }
 
     if options.text_cleanup {
-        progress(85, "Cleaning text content...");
+        step(85, "Cleaning text content...")?;
         let text_options = TextCleanOptions {
             normalize_quotes: options.normalize_quotes,
             language: metadata::extract_metadata(&opf)?.language,
@@ -570,6 +611,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         };
 
         for &path in &chapters {
+            Error::if_stopped(stop)?;
             let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
             let (cleaned, file_report) = crate::text::clean_text_content(&bytes, &text_options)?;
             if file_report.total_fixes() > 0 {
@@ -581,22 +623,29 @@ pub fn process_epub<P: FnMut(u8, &str)>(
 
     // --- package document --------------------------------------------------
     if options.clean_metadata {
-        progress(87, "Cleaning metadata...");
+        step(87, "Cleaning metadata...")?;
         report.metadata_items_stripped = metadata::strip_store_metadata(&opf)?;
     }
 
-    progress(90, "Checking TOC...");
-    let toc = structure::fix_toc(work_dir, &opf_dir, &opf)?;
+    step(90, "Checking TOC...")?;
+    let toc = structure::fix_toc_until(work_dir, &opf_dir, &opf, stop)?;
     report.toc_status = toc.describe();
 
     // Every OPF edit lands in one write, rather than the reference's dozen.
     xml::write_file(&opf, &opf_path, true)?;
 
-    progress(93, "Cleaning up...");
+    step(93, "Cleaning up...")?;
     report.os_artifacts_removed = package::remove_os_artifacts(work_dir)?;
 
-    progress(95, "Repackaging EPUB...");
-    package::package_epub(work_dir, output_path)?;
+    step(95, "Repackaging EPUB...")?;
+    // Told to stop as the book is packed, or once it is, the run keeps no book
+    // either: it said it was stopping, and wrote the book all the same.
+    let packed = package::package_epub_until(work_dir, output_path, stop);
+    if matches!(packed, Err(Error::Stopped)) || (packed.is_ok() && stop.load(Ordering::Relaxed)) {
+        let _ = fs::remove_file(output_path);
+        return Err(Error::Stopped);
+    }
+    packed?;
 
     let original = input_path
         .file_name()
@@ -607,6 +656,7 @@ pub fn process_epub<P: FnMut(u8, &str)>(
         .map_err(|e| Error::io(output_path, e))?
         .len();
 
+    // The book is written and named: too late to stop.
     progress(100, "Complete");
     Ok(report)
 }
@@ -657,14 +707,19 @@ struct ConvertedImages {
 /// is then done with each, naming, writing, deleting its source, reporting,
 /// is done in manifest order, so that a book converts the same however its
 /// threads ran.
-fn convert_images<P: FnMut(u8, &str)>(
+///
+/// Once `stop` is set, no image is begun, and the step stops at the first one
+/// in order that was not done.
+#[allow(clippy::too_many_arguments)]
+fn convert_images<S: FnMut(u8, &str) -> Result<()>>(
     images: &[PathBuf],
     root: &Path,
     opf_dir: &Path,
     options: &ProcessingOptions,
     keep_shape: &HashSet<PathBuf>,
     report: &mut ProcessingReport,
-    progress: &mut P,
+    step: &mut S,
+    stop: &AtomicBool,
 ) -> Result<ConvertedImages> {
     const START: f64 = 15.0;
     const SPAN: f64 = 45.0;
@@ -710,6 +765,7 @@ fn convert_images<P: FnMut(u8, &str)>(
     in_order_in_parallel(
         &jobs,
         |job| -> Result<Converted> {
+            Error::if_stopped(stop)?;
             // Set aside before the file is read, so a thread waiting its turn
             // holds nothing; and an image that would need more than all
             // there is to set aside is left as it is. Reading its header to
@@ -726,6 +782,8 @@ fn convert_images<P: FnMut(u8, &str)>(
                 return Ok(Converted::TooLarge(needed));
             }
             let _held = IMAGE_MEMORY.hold(needed);
+            // Told to stop while it waited its turn.
+            Error::if_stopped(stop)?;
             // Decoded in a worker held to `needed` bytes, where workers are on,
             // so an image crafted to make a decoder allocate wildly cannot. The
             // worker reads the file itself, so the parent keeps no second copy.
@@ -741,7 +799,9 @@ fn convert_images<P: FnMut(u8, &str)>(
         },
         |finished| {
             let percent = START + SPAN * (finished as f64 / jobs.len() as f64);
-            progress(
+            // A run told to stop says nothing more; it stops at the first
+            // image in order that it did not convert.
+            let _ = step(
                 percent as u8,
                 &format!("Processing image {finished}/{}...", jobs.len()),
             );

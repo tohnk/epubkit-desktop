@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -41,6 +42,10 @@ pub enum Error {
     #[error("this EPUB is DRM-protected; remove the DRM first (e.g. with DeDRM and Calibre)")]
     DrmProtected,
 
+    /// The run was told to stop, and took what it had made with it.
+    #[error("stopped before it was finished")]
+    Stopped,
+
     #[error(
         "{} is too large to read: {} MB, where a document may be {} MB",
         path.display(),
@@ -56,5 +61,15 @@ impl Error {
             path: path.as_ref().to_path_buf(),
             source,
         }
+    }
+
+    /// [`Error::Stopped`] once `stop` is set. A run checks it before each
+    /// step, and within one before each document, image or file it would
+    /// begin, so a stop waits on no more than one of them.
+    pub(crate) fn if_stopped(stop: &AtomicBool) -> Result<()> {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Stopped);
+        }
+        Ok(())
     }
 }

@@ -3,6 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use epubkit_core::structure::{
@@ -2000,7 +2001,8 @@ fn stylesheets_a_document_reaches_are_found_by_their_encoded_names() {
 "#,
     );
 
-    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    let reachable =
+        reachable_stylesheets(root, root, &[chapter.as_path()], &AtomicBool::new(false)).unwrap();
     for sheet in [&hash, &literal, &instruction] {
         assert!(
             reachable.readable.contains(sheet),
@@ -2031,7 +2033,8 @@ fn a_stylesheet_a_style_element_imports_is_reached() {
 "#,
     );
 
-    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    let reachable =
+        reachable_stylesheets(root, root, &[chapter.as_path()], &AtomicBool::new(false)).unwrap();
     for sheet in [&quoted, &url] {
         assert!(
             reachable.readable.contains(sheet),
@@ -2067,7 +2070,8 @@ fn a_stylesheet_instruction_href_with_character_references_is_reached() {
 "#,
     );
 
-    let reachable = reachable_stylesheets(root, root, &[chapter.as_path()]).unwrap();
+    let reachable =
+        reachable_stylesheets(root, root, &[chapter.as_path()], &AtomicBool::new(false)).unwrap();
     for sheet in [&decimal, &hex, &once, &zeros] {
         assert!(
             reachable.readable.contains(sheet),
@@ -2136,7 +2140,7 @@ fn an_instruction_full_of_ampersands_is_read_in_linear_time() {
     );
 
     let reachable = common::finishes_within(Duration::from_secs(5), move || {
-        reachable_stylesheets(&root, &root, &[chapter.as_path()]).unwrap()
+        reachable_stylesheets(&root, &root, &[chapter.as_path()], &AtomicBool::new(false)).unwrap()
     });
     assert!(reachable.readable.is_empty());
 }

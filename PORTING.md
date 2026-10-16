@@ -103,6 +103,72 @@ pinned by tests:
   an option added to one and not the other fails the build rather than quietly
   doing nothing. The filename buttons and the template fields the page lists
   are checked against the core the same way.
+- Every command the page's script invokes must be registered in `lib.rs`;
+  one that is not is refused only when called, and its button does nothing.
+  `the_page_invokes_only_commands_the_app_registers` checks the two files
+  against each other, and `the_page_listens_for_the_events_the_app_emits`
+  holds the events the app emits to those the page listens for: renamed on
+  one side only, a run's progress would stand still and no result would show.
+  So, too, `the_page_invokes_each_command_with_the_arguments_it_takes` holds
+  the arguments of each call to the command's parameters, camelCased as
+  Tauri looks for them; `the_page_reads_only_what_the_app_sends` holds each
+  field the page reads or sets on a result, a book, an event or the settings
+  to the ones the app serializes, a result's camelCased sizes among them, but
+  for the two the page adds to a book itself; and
+  `the_page_has_every_element_its_script_looks_up` holds the script's ids to
+  the page's.
+
+A run of books can be stopped. Stop, beside Processing, stops the book being
+made, which is not written, and begins no other, each then saying it was
+stopped; closed or quit during a run, the window says "Stopping, then
+closing…", stops the run, and goes once it has, the app with it: closing
+its one window ends the app, run or no run. The system's Quit, Cmd+Q's,
+ended the app with no exit request to put off, tao handling only
+`applicationWillTerminate`, so on macOS the menu's Quit is the window's own;
+ended any other way, quit from the Dock say, the app still waits up to ten
+seconds for a run to stop. Nothing stopped a run but ending the program,
+which left the run's staging file in the folder the books were going to and
+the book unpacked in the temporary directory. The footer says how far a run
+has got, "Optimizing book 3 of 10…", and what it came to, "9 optimized, 1
+failed", where it read "Ready" throughout; while the run lasts, nothing else
+takes the footer from it but an error. Each book's result shows as it
+finishes, not once the last is done, and Start again, beneath the results,
+waits for the run to end: it emptied the list and hid the run. A book whose
+run panics fails on its own: the panic went up through the run of every book
+dropped with it.
+
+A folder dropped on the window, or chosen with "choose a folder", gives the
+books in it and in the folders in it, linked in or not, leaving out what is
+hidden, as the `._` file macOS writes beside each book on an SD card is; it
+did nothing. A book reached twice, as itself and through a link, is listed
+once. A folder that cannot be looked in is named, where it was passed
+over and a drop of only such a folder read "Nothing to add"; a link to
+nothing, a book on a card no longer in its reader say, is passed over. Looking
+through what was dropped can be stopped once it takes more than a moment, a
+home folder say, and then lists none of what it found. More than 16 books are read 16 at a time: each 16 show as
+they are read, the footer counts them, and a Stop beneath it ends the read,
+keeping what was read. Covers are decoded only as they come near the view,
+but each one's thumbnail, some 75 KB, is held from the start: a drop of
+thousands of books holds hundreds of megabytes. A book dropped again while it is still
+being read is listed once, not twice, and Start again drops a read under way,
+which listed its books again a moment later. Emptying a book's title or
+author field leaves the book its own, which the field, and the card, then
+show. The Flatpak has no filesystem access: whether the file transfer portal
+passes a dropped folder has not been tried, but the file chooser portal
+gives "choose a folder" the folder chosen.
+
+A stop is kept to while the book is packed, the last step, as at any other:
+the run went on to write the book there, having said it was stopping. Within
+a step, it is kept to before the next document the run would read, image it
+would convert, or file it would unpack or pack, not at the step's end: a
+step over every chapter of a long book took seconds, up to 1.7 on a Bible of
+1196 documents, and a quit from the Dock gives a run ten. Making a table of
+contents from the chapters' titles is such a step, for a book with no usable
+NCX. The one walk left unchecked, through the unpacked book for the files an
+operating system leaves, reads no document: 3 ms on that Bible, far less
+than the stop then spends deleting the same files. A run is over however it
+ends, a panic past every book's own catch too, which left it running, so
+that the window waited on it to close.
 
 ## Using the CLI
 
@@ -115,6 +181,12 @@ cargo run -p epubkit-cli -- optimize  book.epub
 cargo run -p epubkit-cli -- optimize  book.epub --filename-template '{series} {series_index} - {title}'
 cargo run -p epubkit-cli -- settings  show
 ```
+
+Ctrl-C, or being told to end, stops a run at its next step; the run takes
+what it was making with it, and the program exits with 130. A second Ctrl-C
+ends it there and then, as the first did, leaving the staging file and the
+unpacked book behind. `info` names a book as a run would, by the saved
+naming, where it named every book Author - Title.
 
 ## Settings
 
@@ -139,8 +211,12 @@ every preset change. How finished books are named is kept apart the same way:
 it is about the user's library, not about any one way of processing.
 
 On the CLI, saved settings are the base and the flags are overrides: each
-`--no-*` flag can only turn something off, so an option nobody mentioned keeps
-whatever it had. `--filename` and `--filename-template` are remembered too.
+option has a pair, `--grayscale` and `--no-grayscale` and so on, the later
+given winning, and an option nobody mentioned keeps whatever it had. The flags
+only turned options off, Light Novel mode only on, and contrast boost not at
+all, so one `--no-grayscale`, remembered, took grayscale from every run after
+it, the window's too, with no flag to give it back but a preset, which reset
+everything else. `--filename` and `--filename-template` are remembered too.
 Metadata edits (`--title`, `--author`) are about one book and are never
 persisted. `--quality` is refused outside 20 to 95, the range the window's
 slider allows; any byte was taken, and remembered, so `--quality 9` meant as
@@ -167,6 +243,11 @@ loads in three seconds found one or the other; now none do. A settings file
 that is a link to one elsewhere, there yet or not, is saved where it points,
 and a saved file is as readable as it was: a new one as any file its owner
 makes, one already there as it was made.
+
+Saved whole, a change the command line made while the window was open was
+undone at the window's next save. The window reads the settings again
+whenever it comes back to the front, once any change of its own still waiting
+is written.
 
 ## Validating against the reference
 

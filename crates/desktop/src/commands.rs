@@ -5,16 +5,17 @@
 //! `epubkit-core` so the CLI and the window cannot drift apart.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use epubkit_core::memory::MemoryBudget;
 use epubkit_core::metadata::{self, MetadataEdits};
-use epubkit_core::pipeline::{process_epub, ProcessingReport};
+use epubkit_core::pipeline::{process_epub_stoppable, ProcessingReport};
 use epubkit_core::settings::Settings;
 use epubkit_core::{image, package, preview, worker, Error};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// Commands report failure as a string; the page has no use for a typed error.
 type Response<T> = Result<T, String>;
@@ -141,6 +142,112 @@ impl BookInfo {
     }
 }
 
+/// The books among what was dropped on the window: each EPUB itself, and
+/// those in each folder and the folders in it, linked in or not, folder by
+/// folder in the order a listing gives them, each once; a link back up the
+/// tree is not followed. What is hidden is left out, a folder or a file: on a
+/// drive it does not format, an SD card say, macOS writes a `._` file beside
+/// each book, and it too ends in `.epub`.
+///
+/// Runs on a blocking worker: a library takes a while to walk. Stops, with
+/// what it found so far, once [`stop_finding`] is called.
+#[tauri::command]
+pub async fn find_books(paths: Vec<String>) -> Response<Found> {
+    let walk = FINDING.load(Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        find_books_until(&paths, || FINDING.load(Ordering::SeqCst) != walk)
+    })
+    .await
+    .map_err(to_message)
+}
+
+/// Moved on to stop each walk through a drop under way.
+static FINDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Stop looking through what was dropped: each walk under way stops at the
+/// next thing it would look at.
+#[tauri::command]
+pub fn stop_finding() {
+    FINDING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// [`find_books`], stopping, with what it found so far, at the first thing it
+/// would look at once `stopped` says so.
+pub fn find_books_until(paths: &[String], stopped: impl Fn() -> bool) -> Found {
+    let is_epub = |path: &Path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+    };
+    let hidden = |entry: &walkdir::DirEntry| {
+        entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+    };
+    // A book reached twice, as itself and through a link to it or to its
+    // folder, is listed once, as it was first reached: listed twice, it was
+    // made twice. Its name stays the one it was reached by, which a book
+    // named after the file it came from is named by.
+    let mut reached = std::collections::HashSet::new();
+    let mut first = |path: &Path| {
+        reached.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    };
+
+    let mut found = Found::default();
+    for path in paths.iter().map(Path::new) {
+        if stopped() {
+            break;
+        }
+        if path.is_dir() {
+            let entries = walkdir::WalkDir::new(path)
+                .follow_links(true)
+                .sort_by(|a, b| {
+                    let name = |entry: &walkdir::DirEntry| {
+                        entry.file_name().to_string_lossy().to_lowercase()
+                    };
+                    name(a).cmp(&name(b))
+                })
+                .into_iter()
+                .filter_entry(|entry| !hidden(entry));
+            for entry in entries {
+                if stopped() {
+                    return found;
+                }
+                match entry {
+                    Ok(entry) => {
+                        if is_epub(entry.path()) && entry.path().is_file() && first(entry.path()) {
+                            found.books.push(entry.path().to_string_lossy().to_string());
+                        }
+                    }
+                    // A folder shut to the app is named. A link back up
+                    // the tree, or to nothing, a book on a card no longer
+                    // in its reader say, is no folder to look in.
+                    Err(error)
+                        if error.io_error().map(std::io::Error::kind)
+                            == Some(std::io::ErrorKind::PermissionDenied) =>
+                    {
+                        found
+                            .unreadable
+                            .push(error.path().unwrap_or(path).to_string_lossy().to_string())
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else if is_epub(path) && path.is_file() && first(path) {
+            found.books.push(path.to_string_lossy().to_string());
+        }
+    }
+    found
+}
+
+/// What was dropped on the window holds.
+#[derive(Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Found {
+    /// The books, in the order they were found.
+    pub books: Vec<String>,
+    /// The folders that could not be looked in. Left out with nothing said,
+    /// a drop of only such a folder read as one with no books in it.
+    pub unreadable: Vec<String>,
+}
+
 /// Read metadata and a cover thumbnail for each dropped book.
 ///
 /// Runs on a blocking worker: a command without `async` runs on the main
@@ -150,7 +257,11 @@ pub async fn inspect_books(paths: Vec<String>) -> Response<Vec<BookInfo>> {
     // Making each cover's thumbnail is most of the time a drop takes, so the
     // books are read a few at a time.
     tauri::async_runtime::spawn_blocking(move || {
-        map_in_parallel(&paths, |path| inspect_one(Path::new(path)))
+        map_in_parallel(&paths, |path| {
+            let path = Path::new(path);
+            unless_it_panics(|| inspect_one(path))
+                .unwrap_or_else(|message| BookInfo::failed(path, message))
+        })
     })
     .await
     .map_err(to_message)
@@ -242,17 +353,18 @@ pub struct Job {
     pub author: Option<String>,
 }
 
+/// How far a book's run has got, as the page is told it.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Progress {
-    path: String,
-    index: usize,
-    total: usize,
-    percent: u8,
-    message: String,
+pub struct Progress {
+    pub path: String,
+    pub index: usize,
+    pub total: usize,
+    pub percent: u8,
+    pub message: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcome {
     pub path: String,
@@ -260,6 +372,160 @@ pub struct Outcome {
     pub summary: String,
     pub report: Option<ProcessingReport>,
     pub error: Option<String>,
+    /// Not made because the run was stopped, whether partway through the
+    /// book or before it was begun. `error` says which.
+    pub stopped: bool,
+}
+
+impl Outcome {
+    fn failed(job: &Job, error: impl std::fmt::Display) -> Self {
+        Self {
+            path: job.path.clone(),
+            output: None,
+            summary: String::new(),
+            report: None,
+            error: Some(error.to_string()),
+            stopped: false,
+        }
+    }
+
+    fn stopped(job: &Job, why: impl std::fmt::Display) -> Self {
+        Self {
+            stopped: true,
+            ..Self::failed(job, why)
+        }
+    }
+}
+
+/// Whether books are being optimized, and what has been asked of the run.
+pub struct RunState {
+    /// Set to stop the run under way at its next step.
+    stop: AtomicBool,
+    /// Set while books are being optimized.
+    running: AtomicBool,
+    /// Set when the window was closed during a run, to close once it stops.
+    close_when_stopped: AtomicBool,
+}
+
+impl RunState {
+    pub const fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            close_when_stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// A run begins, forgetting any stop told to the last one. Gives the flag
+    /// that stops it.
+    pub fn begin(&self) -> &AtomicBool {
+        self.stop.store(false, Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
+        &self.stop
+    }
+
+    /// Stop the run under way.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the window, asked to close, must wait. During a run it stops
+    /// the run, and closes once that has stopped, so the run takes the files
+    /// it was making with it, as it cannot if the program simply ends. Asked
+    /// again meanwhile, it closes there and then.
+    pub fn stop_before_closing(&self) -> bool {
+        if self.running.load(Ordering::SeqCst)
+            && !self.close_when_stopped.swap(true, Ordering::SeqCst)
+        {
+            self.stop();
+            return true;
+        }
+        false
+    }
+
+    /// Stop the run under way, if there is one, and wait up to `patience` for
+    /// it to have stopped, and taken the files it was making with it. Gives
+    /// whether it has.
+    pub fn stop_and_wait(&self, patience: Duration) -> bool {
+        if !self.running.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.stop();
+        let given_up = Instant::now() + patience;
+        while self.running.load(Ordering::SeqCst) {
+            if Instant::now() >= given_up {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// The run is over: whether the window is to close now, as it was asked
+    /// to during the run. The run is marked over first, so that the close
+    /// this asks for is not taken for one during a run, and put off again.
+    pub fn end(&self) -> bool {
+        self.running.store(false, Ordering::SeqCst);
+        self.close_when_stopped.swap(false, Ordering::SeqCst)
+    }
+
+    /// Do `work`, given the flag that stops it, on a blocking worker as the
+    /// run. Gives what it came to, and whether the window is to close now.
+    ///
+    /// The run begins before the work is handed to a worker, not once one
+    /// takes it up, and is over once the work is done however it ends: a
+    /// panic past every book's own catch left it running, so that the window
+    /// waited on it to close.
+    pub async fn run<T: Send + 'static>(
+        &'static self,
+        work: impl FnOnce(&'static AtomicBool) -> T + Send + 'static,
+    ) -> (Result<T, String>, bool) {
+        let stop = self.begin();
+        let done = tauri::async_runtime::spawn_blocking(move || work(stop)).await;
+        (done.map_err(to_message), self.end())
+    }
+}
+
+impl Default for RunState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The window's run.
+static RUN: RunState = RunState::new();
+
+/// Stop the run under way: the book being made is not written, and no other
+/// is begun.
+#[tauri::command]
+pub fn stop_run() {
+    RUN.stop();
+}
+
+/// Whether the window, asked to close, must wait for the run to stop: see
+/// [`RunState::stop_before_closing`]. When it must, the page is told, so it
+/// says the window will go once the run has stopped; it said nothing, and a
+/// second close, taken for impatience, ended the program there and then.
+pub fn stop_before_closing<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if RUN.stop_before_closing() {
+        let _ = app.emit("closing", ());
+        return true;
+    }
+    false
+}
+
+/// For an app ending with no say in it, quit from the Dock say: stop the run
+/// under way, and wait for it, a while, to take its files with it. A run that
+/// has not stopped by then is left to end with the app, and leaves its
+/// staging file and the book unpacked behind it; with no window left to say
+/// so in, it is said where a terminal that started the app will show it.
+pub fn stop_before_exiting() {
+    if !RUN.stop_and_wait(Duration::from_secs(10)) {
+        eprintln!(
+            "epubkit: the run had not stopped when the app ended; \
+             its unfinished files may be left behind"
+        );
+    }
 }
 
 /// Optimize a list of books into `destination`, streaming progress as it goes.
@@ -274,45 +540,76 @@ pub async fn optimize_books(
     destination: String,
     settings: Settings,
 ) -> Response<Vec<Outcome>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let destination = PathBuf::from(destination);
-        let total = jobs.len();
-        let mut outcomes = Vec::with_capacity(total);
-
-        for (index, job) in jobs.iter().enumerate() {
-            let emit = |percent: u8, message: &str| {
-                let _ = app.emit(
-                    "progress",
-                    Progress {
-                        path: job.path.clone(),
-                        index,
-                        total,
-                        percent,
-                        message: message.to_string(),
-                    },
-                );
-            };
-
-            let outcome = optimize_one(job, &destination, &settings, emit);
-
-            let _ = app.emit("finished", outcome.clone());
-            outcomes.push(outcome);
-        }
-
-        Ok(outcomes)
-    })
-    .await
-    .map_err(to_message)?
+    let page = app.clone();
+    let (outcomes, close) = RUN
+        .run(move |stop| {
+            let total = jobs.len();
+            optimize_all(
+                &jobs,
+                Path::new(&destination),
+                &settings,
+                stop,
+                |index, percent, message| {
+                    let _ = page.emit(
+                        "progress",
+                        Progress {
+                            path: jobs[index].path.clone(),
+                            index,
+                            total,
+                            percent,
+                            message: message.to_string(),
+                        },
+                    );
+                },
+                |outcome| {
+                    let _ = page.emit("finished", outcome.clone());
+                },
+            )
+        })
+        .await;
+    if close {
+        app.exit(0);
+    }
+    outcomes
 }
 
-/// Optimize one book into `destination`, as [`optimize_books`] does for each.
+/// Optimize each of `jobs` into `destination`, as [`optimize_books`] does,
+/// telling `progress` how the book at each index goes and `finished` how
+/// each went. A book that fails does not stop the rest. Once `stop` is set,
+/// the book being made is not written and no other is begun, and each says
+/// it was stopped.
 ///
 /// Apart so it can be tested without a window.
+pub fn optimize_all(
+    jobs: &[Job],
+    destination: &Path,
+    settings: &Settings,
+    stop: &AtomicBool,
+    mut progress: impl FnMut(usize, u8, &str),
+    mut finished: impl FnMut(&Outcome),
+) -> Vec<Outcome> {
+    let mut outcomes = Vec::with_capacity(jobs.len());
+    for (index, job) in jobs.iter().enumerate() {
+        let outcome = if stop.load(Ordering::SeqCst) {
+            Outcome::stopped(job, "not begun: the run was stopped")
+        } else {
+            let progress = |percent: u8, message: &str| progress(index, percent, message);
+            optimize_one(job, destination, settings, progress, stop)
+        };
+        finished(&outcome);
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+/// Optimize one book into `destination`, as [`optimize_all`] does each,
+/// stopping once `stop` is set.
 pub fn optimize_one(
     job: &Job,
     destination: &Path,
     settings: &Settings,
     progress: impl FnMut(u8, &str),
+    stop: &AtomicBool,
 ) -> Outcome {
     let input = PathBuf::from(&job.path);
     let options = settings.processing_options(MetadataEdits {
@@ -321,31 +618,28 @@ pub fn optimize_one(
         language: None,
     });
 
-    let failed = |error: String| Outcome {
-        path: job.path.clone(),
-        output: None,
-        summary: String::new(),
-        report: None,
-        error: Some(error),
-    };
-
     // The output name comes from the book's metadata, which is not known until
     // the run finishes — so write beside the destination and move the book
     // into place once the report says what to call it. The staging file is
     // this run's own, and goes with it unless the book is published.
     let staging = match metadata::staging_file(destination) {
         Ok(staging) => staging,
-        Err(error) => return failed(error.to_string()),
+        Err(error) => return Outcome::failed(job, error),
     };
 
-    let report = match process_epub(&input, staging.path(), &options, progress) {
-        Ok(report) => report,
-        Err(error) => return failed(error.to_string()),
+    let run = unless_it_panics(|| {
+        process_epub_stoppable(&input, staging.path(), &options, progress, stop)
+    });
+    let report = match run {
+        Ok(Ok(report)) => report,
+        Ok(Err(Error::Stopped)) => return Outcome::stopped(job, Error::Stopped),
+        Ok(Err(error)) => return Outcome::failed(job, error),
+        Err(panic) => return Outcome::failed(job, panic),
     };
 
     let final_path = match metadata::publish(staging, &destination.join(&report.output_filename)) {
         Ok(path) => path,
-        Err(error) => return failed(error.to_string()),
+        Err(error) => return Outcome::failed(job, error),
     };
 
     Outcome {
@@ -354,10 +648,25 @@ pub fn optimize_one(
         summary: report.summary(),
         report: Some(report),
         error: None,
+        stopped: false,
     }
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// What `work` gives, or if it panics, what went wrong. A panic is a bug, but
+/// one book's: it went up through every book read or run with it, and the
+/// window learned of none of them.
+fn unless_it_panics<R>(work: impl FnOnce() -> R) -> Result<R, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).map_err(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        format!("internal error: {message}")
+    })
+}
 
 fn file_name(path: &Path) -> String {
     path.file_name()

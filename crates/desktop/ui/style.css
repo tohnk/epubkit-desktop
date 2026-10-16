@@ -220,6 +220,20 @@ h2 {
     margin-top: 4px;
 }
 
+.link-btn {
+    padding: 0;
+    font: inherit;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.link-btn:hover {
+    color: var(--text);
+}
+
 /* File List */
 .file-list {
     margin-top: 16px;
@@ -680,6 +694,25 @@ h2 {
     background: var(--error);
 }
 
+.progress-bar.stopped {
+    background: var(--text-muted);
+}
+
+.section-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.ghost-btn.stop-btn {
+    flex: none;
+    padding: 5px 14px;
+}
+
+.ghost-btn.footer-btn {
+    margin-top: 10px;
+}
+
 .progress-message {
     font-size: 13px;
     color: var(--text-secondary);
@@ -705,6 +738,14 @@ h2 {
 
 .result-card.error {
     border-color: var(--error);
+}
+
+.result-card.stopped {
+    border-color: var(--border-hover);
+}
+
+.result-card.stopped .file-error {
+    color: var(--text-secondary);
 }
 
 .result-header {
