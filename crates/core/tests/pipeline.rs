@@ -151,31 +151,54 @@ fn a_run_told_to_stop_stops_at_its_next_step() {
 /// What a run looks for in the book before its images stops once told, as
 /// its own steps do: the stylesheets the documents reach, the images the
 /// manifest leaves out, and those Light Novel mode must leave their shape.
-/// Each reads every chapter.
+/// Each reads every chapter, and stops before the next.
+///
+/// The book has a chapter and nothing else to look through. Given a
+/// stylesheet too, a helper that went on through its chapters was stopped at
+/// the stylesheet, and passed: Light Novel mode's looks at the stylesheets
+/// first, and so was never told to stop in its chapters at all.
 #[test]
 fn looking_through_the_book_stops_once_told() {
     let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("in.epub");
-    write_demo_epub(&input);
-    package::extract_epub(&input, dir.path()).unwrap();
-    let opf_dir = dir.path().join("OEBPS");
+    let root = dir.path();
+    let input = root.join("in.epub");
+    common::write_minimal_epub(&input);
+    package::extract_epub(&input, root).unwrap();
+    let opf_dir = root.join("OEBPS");
     let opf = xml::parse_file(&opf_dir.join("content.opf")).unwrap();
-    let content = structure::find_content_files(dir.path(), &opf_dir, &opf).unwrap();
+    let content = structure::find_content_files(root, &opf_dir, &opf).unwrap();
     let chapters: Vec<&Path> = content.xhtml.iter().map(PathBuf::as_path).collect();
-    let stop = AtomicBool::new(true);
+    assert_eq!(chapters.len(), 1);
 
-    assert!(matches!(
-        structure::reachable_stylesheets(dir.path(), &opf_dir, &chapters, &stop),
-        Err(Error::Stopped)
-    ));
-    assert!(matches!(
-        structure::undeclared_images(dir.path(), &opf_dir, &opf, &chapters, &content, &stop),
-        Err(Error::Stopped)
-    ));
-    assert!(matches!(
-        structure::fixed_shape_images(dir.path(), &opf_dir, &opf, &chapters, &content, &stop),
-        Err(Error::Stopped)
-    ));
+    // Told to stop, each stops; left alone, each finishes.
+    for told in [true, false] {
+        let stop = AtomicBool::new(told);
+        for (helper, result) in [
+            (
+                "reachable_stylesheets",
+                structure::reachable_stylesheets(root, &opf_dir, &chapters, &stop).map(drop),
+            ),
+            (
+                "undeclared_images",
+                structure::undeclared_images(root, &opf_dir, &opf, &chapters, &content, &stop)
+                    .map(drop),
+            ),
+            (
+                "fixed_shape_images",
+                structure::fixed_shape_images(root, &opf_dir, &opf, &chapters, &content, &stop)
+                    .map(drop),
+            ),
+        ] {
+            if told {
+                assert!(
+                    matches!(result, Err(Error::Stopped)),
+                    "{helper}: {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{helper}: {result:?}");
+            }
+        }
+    }
 }
 
 #[test]
