@@ -113,10 +113,12 @@ fn a_run_told_to_stop_partway_through_a_step_stops_within_it() {
         .unwrap();
     }
 
-    // Every step that takes a while, a twenty-fifth of the run or more:
-    // those that go through the book chapter by chapter. Found, not listed,
-    // so that a step that comes to take a while is held to this as well:
-    // listed, the steps given a stop were the steps tested.
+    // Every step that takes a twenty-fifth of this book's run or more, found
+    // rather than listed, so that a step that comes to take as long on this
+    // book is timed as well. Only that long is a stop timed well apart from
+    // the deleting it does. A step quick on this book is not timed, however
+    // long it takes on another: making a table of contents, say, which a
+    // test of its own stops directly.
     let run = began[began.len() - 1].1 - began[0].1;
     let long: Vec<(u8, Duration)> = began
         .windows(2)
